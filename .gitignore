@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+user_data/
+.tmp/
+error.log
+.probe_mirror_speed.py

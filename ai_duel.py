@@ -1,0 +1,509 @@
+import random
+import re
+import time
+from pathlib import Path
+from typing import Callable, Optional
+
+from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
+
+
+# 目标网站
+CHATGPT_URL = "https://chatgpt.com/"
+GEMINI_URL = "https://gemini.google.com/app"
+
+# 反机械化随机延迟
+ACTION_DELAY_MIN = 1.5
+ACTION_DELAY_MAX = 3.5
+
+# 轮询参数
+POLL_SECONDS = 1.0
+MAX_WAIT_SECONDS = 600
+
+
+def log(msg: str) -> None:
+    print(f"[INFO] {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"[WARN] {msg}")
+
+
+def jitter(phase: str = "") -> None:
+    """每次关键动作前后加入随机延时。"""
+    delay = random.uniform(ACTION_DELAY_MIN, ACTION_DELAY_MAX)
+    if phase:
+        log(f"{phase}，随机等待 {delay:.2f}s")
+    time.sleep(delay)
+
+
+def normalize_text(text: Optional[str]) -> str:
+    return (text or "").replace("\u200b", "").strip()
+
+
+def pick_visible(locator: Locator, prefer_last: bool = True) -> Optional[Locator]:
+    """在一个 Locator 集合中挑出可见元素，默认优先最后一个（通常是底部输入框）。"""
+    try:
+        count = locator.count()
+    except Exception:
+        return None
+
+    if count <= 0:
+        return None
+
+    indexes = range(count - 1, -1, -1) if prefer_last else range(count)
+    for i in indexes:
+        node = locator.nth(i)
+        try:
+            if node.is_visible(timeout=300):
+                return node
+        except Exception:
+            continue
+    return None
+
+
+def safe_is_enabled(locator: Optional[Locator]) -> bool:
+    if locator is None:
+        return False
+    try:
+        return locator.is_enabled(timeout=300)
+    except Exception:
+        return False
+
+
+def find_chatgpt_input(page: Page) -> Optional[Locator]:
+    """
+    ChatGPT 输入框选择策略：
+    1) 优先官方稳定 ID/结构
+    2) 再尝试 role='textbox'
+    严禁依赖随机 hash class。
+    """
+    candidates = [
+        page.locator("textarea#prompt-textarea"),
+        page.locator("form textarea"),
+        page.locator("div#prompt-textarea[contenteditable='true']"),
+        page.get_by_role("textbox"),
+    ]
+    for locator in candidates:
+        node = pick_visible(locator, prefer_last=True)
+        if node is not None:
+            return node
+    return None
+
+
+def find_gemini_input(page: Page) -> Optional[Locator]:
+    """
+    Gemini 输入框常见形态：rich-textarea / contenteditable / textbox。
+    这里做多候选兜底，避免单点失效。
+    """
+    candidates = [
+        page.locator("rich-textarea [contenteditable='true']"),
+        page.locator("div[contenteditable='true'][aria-label*='prompt' i]"),
+        page.locator("div[contenteditable='true'][aria-label*='输入']"),
+        page.get_by_role("textbox"),
+        page.locator("textarea"),
+    ]
+    for locator in candidates:
+        node = pick_visible(locator, prefer_last=True)
+        if node is not None:
+            return node
+    return None
+
+
+def wait_for_login(page: Page, site_name: str) -> None:
+    """
+    人工干预登录检查：
+    - 持续探测输入框（textarea 或 contenteditable / textbox）
+    - 如果找不到，循环提示用户手动登录并关闭弹窗
+    - 找到输入框后才继续
+    """
+    log(f"{site_name} 开始登录状态检测...")
+    last_warn = 0.0
+    while True:
+        input_box = find_chatgpt_input(page) if site_name == "ChatGPT" else find_gemini_input(page)
+        if input_box is not None:
+            log(f"{site_name} 检测到输入框，登录检查通过。")
+            return
+
+        now = time.time()
+        if now - last_warn > 6:
+            warn("检测到未登录或有弹窗，请手动登录并关闭所有欢迎弹窗...")
+            last_warn = now
+        time.sleep(2)
+
+
+def find_chatgpt_send_button(page: Page) -> Optional[Locator]:
+    candidates = [
+        page.locator("button[data-testid='send-button']"),
+        page.get_by_role("button", name=re.compile(r"send|发送", re.I)),
+        page.locator("form button[type='submit']"),
+    ]
+    for locator in candidates:
+        node = pick_visible(locator, prefer_last=True)
+        if node is not None:
+            return node
+    return None
+
+
+def find_chatgpt_stop_button(page: Page) -> Optional[Locator]:
+    candidates = [
+        page.locator("button[data-testid='stop-button']"),
+        page.get_by_role("button", name=re.compile(r"stop generating|停止生成|stop", re.I)),
+        page.locator("button[aria-label*='Stop']"),
+    ]
+    for locator in candidates:
+        node = pick_visible(locator, prefer_last=True)
+        if node is not None:
+            return node
+    return None
+
+
+def find_chatgpt_continue_button(page: Page) -> Optional[Locator]:
+    candidates = [
+        page.get_by_role("button", name=re.compile(r"continue generating|继续生成", re.I)),
+        page.locator("button:has-text('Continue generating')"),
+        page.locator("button:has-text('继续生成')"),
+    ]
+    for locator in candidates:
+        node = pick_visible(locator, prefer_last=False)
+        if node is not None:
+            return node
+    return None
+
+
+def find_gemini_send_button(page: Page) -> Optional[Locator]:
+    candidates = [
+        page.get_by_role("button", name=re.compile(r"send|发送", re.I)),
+        page.locator("button[aria-label*='Send']"),
+        page.locator("button[aria-label*='发送']"),
+        page.locator("button[mattooltip*='Send']"),
+    ]
+    for locator in candidates:
+        node = pick_visible(locator, prefer_last=True)
+        if node is not None:
+            return node
+    return None
+
+
+def find_gemini_stop_button(page: Page) -> Optional[Locator]:
+    candidates = [
+        page.get_by_role("button", name=re.compile(r"stop generating|停止生成|stop", re.I)),
+        page.locator("button[aria-label*='Stop']"),
+        page.locator("button[aria-label*='停止']"),
+        page.locator("button:has-text('Stop')"),
+    ]
+    for locator in candidates:
+        node = pick_visible(locator, prefer_last=True)
+        if node is not None:
+            return node
+    return None
+
+
+def clear_and_fill_input(page: Page, input_box: Locator, content: str, site_name: str) -> None:
+    """
+    同时兼容 textarea 和 contenteditable：
+    - textarea/input 直接 fill
+    - contenteditable 用 Ctrl+A + Backspace + insert_text
+    """
+    jitter(f"{site_name} 聚焦输入框前")
+    input_box.click(timeout=5000)
+    jitter(f"{site_name} 聚焦输入框后")
+
+    is_contenteditable = bool(input_box.evaluate("el => el.isContentEditable"))
+    tag_name = input_box.evaluate("el => el.tagName.toLowerCase()")
+
+    if tag_name in ("textarea", "input") and not is_contenteditable:
+        input_box.fill(content, timeout=15000)
+    else:
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+        page.keyboard.insert_text(content)
+
+    jitter(f"{site_name} 输入完成后")
+
+
+def send_message(page: Page, site_name: str, content: str) -> None:
+    """发送消息：填充输入框后优先点击发送按钮，失败时 Enter 兜底。"""
+    text = normalize_text(content)
+    if not text:
+        raise ValueError(f"{site_name} 待发送内容为空")
+
+    # 避免超长文本触发 UI 性能问题
+    max_chars = 12000
+    if len(text) > max_chars:
+        warn(f"{site_name} 文本长度 {len(text)} 超过 {max_chars}，已截断")
+        text = text[:max_chars]
+
+    input_box = find_chatgpt_input(page) if site_name == "ChatGPT" else find_gemini_input(page)
+    if input_box is None:
+        raise RuntimeError(f"{site_name} 未找到输入框，无法发送")
+
+    log(f"正在发送给 {site_name} ...")
+    clear_and_fill_input(page, input_box, text, site_name)
+
+    send_button = find_chatgpt_send_button(page) if site_name == "ChatGPT" else find_gemini_send_button(page)
+    jitter(f"{site_name} 发送前")
+    if safe_is_enabled(send_button):
+        send_button.click(timeout=8000)
+        jitter(f"{site_name} 点击发送后")
+    else:
+        page.keyboard.press("Enter")
+        jitter(f"{site_name} Enter 发送后")
+
+
+def count_chatgpt_assistant_messages(page: Page) -> int:
+    return page.locator("div[data-message-author-role='assistant']").count()
+
+
+def count_gemini_responses(page: Page) -> int:
+    """
+    Gemini 回答节点并非长期固定，这里做多候选统计，取较大值。
+    """
+    selectors = [
+        "main model-response",
+        "model-response",
+        "main message-content",
+        "message-content",
+        "main div[data-response-id]",
+    ]
+    counts = []
+    for sel in selectors:
+        try:
+            counts.append(page.locator(sel).count())
+        except Exception:
+            continue
+    return max(counts) if counts else 0
+
+
+def extract_chatgpt_last_reply(page: Page) -> str:
+    """
+    按要求读取最后一条 ChatGPT assistant 回复。
+    """
+    replies = page.locator("div[data-message-author-role='assistant']")
+    n = replies.count()
+    if n <= 0:
+        return ""
+    return normalize_text(replies.nth(n - 1).inner_text())
+
+
+def extract_gemini_last_reply(page: Page) -> str:
+    """
+    Gemini 最后一条回复提取：
+    逐个候选结构逆序扫描，拿到最后一个非空文本。
+    """
+    selectors = [
+        "main model-response",
+        "model-response",
+        "main message-content",
+        "message-content",
+        "main div[data-response-id]",
+    ]
+
+    for sel in selectors:
+        loc = page.locator(sel)
+        count = loc.count()
+        if count <= 0:
+            continue
+        for i in range(count - 1, -1, -1):
+            node = loc.nth(i)
+            try:
+                if not node.is_visible(timeout=300):
+                    continue
+                text = normalize_text(node.inner_text())
+                if text:
+                    return text
+            except Exception:
+                continue
+    return ""
+
+
+def read_stable_text(reader: Callable[[], str], site_name: str, rounds: int = 12) -> str:
+    """
+    文本稳定性检查（防止流式输出中途截断）：
+    1) 读取一次文本 A
+    2) sleep(1) 后读取文本 B
+    3) 如果 len(A) == len(B) 且非空，认为已稳定
+    4) 不稳定则继续最多 rounds 次
+    """
+    log(f"正在读取 {site_name} 回复...")
+    text_a = normalize_text(reader())
+    for i in range(rounds):
+        time.sleep(1)
+        text_b = normalize_text(reader())
+        log(f"{site_name} 稳定性检查 {i + 1}/{rounds}: len {len(text_a)} -> {len(text_b)}")
+        if text_b and len(text_a) == len(text_b):
+            return text_b
+        text_a = text_b
+    warn(f"{site_name} 在限定轮次内仍可能输出中，返回最后一次结果")
+    return text_a
+
+
+def wait_chatgpt_generation_done(page: Page, previous_count: int, timeout_s: int = MAX_WAIT_SECONDS) -> None:
+    """
+    ChatGPT 生成结束判断（核心逻辑）：
+    - 仅靠 wait_for_timeout 不可靠，因此通过 UI 状态组合判定：
+      1) 如果出现 Stop 按钮，说明仍在生成
+      2) 观察到 Stop 消失 + Send 恢复可见，并且 assistant 消息数增加
+      3) 连续命中多次（stable_hits）才判定结束，防止按钮抖动误判
+    - 特例：如果出现 Continue generating，会自动点击并继续等待
+    """
+    log("等待 ChatGPT 生成完成（Stop/Send 状态机）...")
+    begin = time.time()
+    started = False
+    stable_hits = 0
+
+    while time.time() - begin < timeout_s:
+        continue_btn = find_chatgpt_continue_button(page)
+        if safe_is_enabled(continue_btn):
+            warn("检测到 Continue generating，自动点击继续")
+            jitter("点击 Continue generating 前")
+            continue_btn.click(timeout=8000)
+            jitter("点击 Continue generating 后")
+            started = True
+            stable_hits = 0
+            time.sleep(POLL_SECONDS)
+            continue
+
+        current_count = count_chatgpt_assistant_messages(page)
+        stop_btn = find_chatgpt_stop_button(page)
+        send_btn = find_chatgpt_send_button(page)
+        stop_visible = stop_btn is not None
+        send_visible = send_btn is not None
+
+        if current_count > previous_count:
+            started = True
+
+        if stop_visible:
+            started = True
+            stable_hits = 0
+        elif started and send_visible and current_count > previous_count:
+            stable_hits += 1
+        else:
+            stable_hits = 0
+
+        if started and stable_hits >= 3:
+            log("ChatGPT 判定生成完成")
+            return
+
+        time.sleep(POLL_SECONDS)
+
+    raise TimeoutError("等待 ChatGPT 生成超时")
+
+
+def wait_gemini_generation_done(page: Page, previous_count: int, timeout_s: int = MAX_WAIT_SECONDS) -> None:
+    """
+    Gemini 生成结束判断（核心逻辑）：
+    - 观察 Stop 按钮与 Send 状态变化
+    - 只有在“回答条数增长”后，才允许进入完成判定
+    - 使用 stable_hits 连续命中避免瞬态误判
+    """
+    log("等待 Gemini 生成完成（Stop/Send 状态机）...")
+    begin = time.time()
+    started = False
+    stable_hits = 0
+
+    while time.time() - begin < timeout_s:
+        current_count = count_gemini_responses(page)
+        stop_btn = find_gemini_stop_button(page)
+        send_btn = find_gemini_send_button(page)
+
+        stop_visible = stop_btn is not None
+        send_visible = send_btn is not None
+
+        if current_count > previous_count:
+            started = True
+
+        if stop_visible:
+            started = True
+            stable_hits = 0
+        elif started and current_count > previous_count and (send_visible or not stop_visible):
+            stable_hits += 1
+        else:
+            stable_hits = 0
+
+        if started and stable_hits >= 3:
+            log("Gemini 判定生成完成")
+            return
+
+        time.sleep(POLL_SECONDS)
+
+    raise TimeoutError("等待 Gemini 生成超时")
+
+
+def run_duel_loop() -> None:
+    user_data_dir = str(Path("./user_data").resolve())
+    Path(user_data_dir).mkdir(parents=True, exist_ok=True)
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            headless=False,
+            viewport={"width": 1920, "height": 1080},
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context.set_default_timeout(15000)
+
+        page_chatgpt = context.pages[0] if context.pages else context.new_page()
+        page_gemini = context.new_page()
+
+        log("打开 ChatGPT 页面...")
+        page_chatgpt.goto(CHATGPT_URL, wait_until="domcontentloaded")
+        log("打开 Gemini 页面...")
+        page_gemini.goto(GEMINI_URL, wait_until="domcontentloaded")
+
+        # 阶段一：人工登录等待
+        page_chatgpt.bring_to_front()
+        wait_for_login(page_chatgpt, "ChatGPT")
+        page_gemini.bring_to_front()
+        wait_for_login(page_gemini, "Gemini")
+
+        # 初始化：给 ChatGPT 第一条消息
+        seed_message = "你好，请开始你的论述。"
+        log(f"初始化发送 -> ChatGPT: {seed_message}")
+        chatgpt_prev = count_chatgpt_assistant_messages(page_chatgpt)
+        send_message(page_chatgpt, "ChatGPT", seed_message)
+
+        round_index = 1
+        while True:
+            log(f"========== 回合 {round_index} ==========")
+
+            # A: 等待并读取 ChatGPT
+            wait_chatgpt_generation_done(page_chatgpt, chatgpt_prev)
+            chatgpt_reply = read_stable_text(lambda: extract_chatgpt_last_reply(page_chatgpt), "ChatGPT")
+            if not chatgpt_reply:
+                warn("ChatGPT 回复为空，使用兜底语句继续")
+                chatgpt_reply = "请继续你的论述。"
+
+            # A -> B
+            gemini_prev = count_gemini_responses(page_gemini)
+            log("正在发送给 Gemini...")
+            send_message(page_gemini, "Gemini", chatgpt_reply)
+
+            # B: 等待并读取 Gemini
+            wait_gemini_generation_done(page_gemini, gemini_prev)
+            gemini_reply = read_stable_text(lambda: extract_gemini_last_reply(page_gemini), "Gemini")
+            if not gemini_reply:
+                warn("Gemini 回复为空，使用兜底语句继续")
+                gemini_reply = "我没有接收到你的完整回复，请重述一次并更具体。"
+
+            # B -> A
+            chatgpt_prev = count_chatgpt_assistant_messages(page_chatgpt)
+            log("正在发送给 ChatGPT...")
+            send_message(page_chatgpt, "ChatGPT", gemini_reply)
+
+            round_index += 1
+
+
+def main() -> None:
+    try:
+        run_duel_loop()
+    except KeyboardInterrupt:
+        print("\n[EXIT] 收到 Ctrl+C，脚本已停止。")
+    except PlaywrightTimeoutError as exc:
+        print(f"[ERROR] Playwright 超时: {exc}")
+    except Exception as exc:
+        print(f"[ERROR] 脚本异常: {exc}")
+
+
+if __name__ == "__main__":
+    main()
