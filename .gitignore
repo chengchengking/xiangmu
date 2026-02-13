@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 user_data/
+user_data.bak-*/
 .tmp/
 .vscode/
 error.log

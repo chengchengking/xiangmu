@@ -252,7 +252,9 @@ def send_message(page: Page, site_name: str, content: str) -> None:
 
 
 def count_chatgpt_assistant_messages(page: Page) -> int:
-    return page.locator("div[data-message-author-role='assistant']").count()
+    # 兼容 ChatGPT DOM 变更：有时 assistant 节点不一定是 div（可能是 article/section 等）。
+    # 这里优先用属性选择器，避免被标签类型卡住。
+    return page.locator("[data-message-author-role='assistant']").count()
 
 
 def count_gemini_responses(page: Page) -> int:
@@ -279,7 +281,7 @@ def extract_chatgpt_last_reply(page: Page) -> str:
     """
     按要求读取最后一条 ChatGPT assistant 回复。
     """
-    replies = page.locator("div[data-message-author-role='assistant']")
+    replies = page.locator("[data-message-author-role='assistant']")
     n = replies.count()
     if n <= 0:
         return ""
@@ -351,6 +353,13 @@ def wait_chatgpt_generation_done(page: Page, previous_count: int, timeout_s: int
     begin = time.time()
     started = False
     stable_hits = 0
+    last_len: Optional[int] = None
+    len_stable_hits = 0
+    last_status_log = 0.0
+
+    # 兜底：有些情况下 assistant 数量计数不稳定（虚拟列表/DOM 变化），
+    # 因此额外记录“发送前最后一条 assistant 文本”，用“文本变化”判断是否出现新回复。
+    prev_last_text = normalize_text(extract_chatgpt_last_reply(page))
 
     while time.time() - begin < timeout_s:
         continue_btn = find_chatgpt_continue_button(page)
@@ -369,19 +378,49 @@ def wait_chatgpt_generation_done(page: Page, previous_count: int, timeout_s: int
         send_btn = find_chatgpt_send_button(page)
         stop_visible = stop_btn is not None
         send_visible = send_btn is not None
+        send_enabled = safe_is_enabled(send_btn)
 
-        if current_count > previous_count:
+        # 新回复判定：assistant 数量增加 或 最后一条 assistant 文本发生变化（且非空）
+        last_text = normalize_text(extract_chatgpt_last_reply(page))
+        has_new_assistant = (current_count > previous_count) or (last_text and last_text != prev_last_text)
+
+        if stop_visible or has_new_assistant:
             started = True
 
         if stop_visible:
-            started = True
             stable_hits = 0
-        elif started and send_visible and current_count > previous_count:
+        elif started and send_visible and has_new_assistant:
             stable_hits += 1
         else:
             stable_hits = 0
 
-        if started and stable_hits >= 3:
+        # 文本长度稳定性：避免 Stop 消失的瞬间误判（尤其在 UI 抖动/流式输出末尾）
+        if has_new_assistant and last_text:
+            cur_len = len(last_text)
+            if last_len is not None and cur_len == last_len:
+                len_stable_hits += 1
+            else:
+                len_stable_hits = 0
+            last_len = cur_len
+
+        # 定期打点输出状态，避免用户误以为卡死
+        now = time.time()
+        if now - last_status_log > 5:
+            log(
+                "ChatGPT 状态: "
+                f"assistant_count={current_count} prev={previous_count} "
+                f"has_new_assistant={has_new_assistant} "
+                f"stop_visible={stop_visible} send_visible={send_visible} send_enabled={send_enabled} "
+                f"stable_hits={stable_hits} len_stable_hits={len_stable_hits}"
+            )
+            last_status_log = now
+
+        # 完成条件（组合判断）：
+        # 1) 必须已经开始（出现 stop 或出现新 assistant 迹象）
+        # 2) stop 不可见
+        # 3) 已确认出现新 assistant（数量增长或文本变化）
+        # 4) 最后一条文本长度连续稳定 2 次以上，避免还在流式追加
+        if started and (not stop_visible) and has_new_assistant and len_stable_hits >= 2 and stable_hits >= 2:
             log("ChatGPT 判定生成完成")
             return
 
