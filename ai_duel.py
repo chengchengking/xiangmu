@@ -1,5 +1,7 @@
+import os
 import random
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -22,11 +24,47 @@ MAX_WAIT_SECONDS = 600
 
 
 def log(msg: str) -> None:
-    print(f"[INFO] {msg}")
+    print(f"[INFO] {msg}", flush=True)
 
 
 def warn(msg: str) -> None:
-    print(f"[WARN] {msg}")
+    print(f"[WARN] {msg}", flush=True)
+
+
+def disable_windows_console_quickedit() -> None:
+    """
+    Windows 传统控制台有个坑：用鼠标在控制台里“选中文本”会进入 QuickEdit/标记模式，
+    此时控制台输出会被暂停，看起来像脚本“卡住”了（其实脚本还在跑）。
+
+    这里默认禁用 QuickEdit，避免误触；如需保留 QuickEdit，可设置环境变量：
+    - AI_DUEL_QUICKEDIT=1
+    """
+    if os.name != "nt":
+        return
+    if os.environ.get("AI_DUEL_QUICKEDIT", "").strip() == "1":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        STD_INPUT_HANDLE = -10
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        ENABLE_EXTENDED_FLAGS = 0x0080
+
+        h = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        if not h or h == wintypes.HANDLE(-1).value:
+            return
+
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+            return
+
+        new_mode = mode.value | ENABLE_EXTENDED_FLAGS
+        new_mode &= ~ENABLE_QUICK_EDIT_MODE
+        kernel32.SetConsoleMode(h, new_mode)
+    except Exception:
+        return
 
 
 def jitter(phase: str = "") -> None:
@@ -75,20 +113,64 @@ def find_chatgpt_input(page: Page) -> Optional[Locator]:
     """
     ChatGPT 输入框选择策略：
     1) 优先官方稳定 ID/结构
-    2) 再尝试 role='textbox'
     严禁依赖随机 hash class。
     """
     candidates = [
         page.locator("textarea#prompt-textarea"),
-        page.locator("form textarea"),
+        page.locator("textarea[data-testid='prompt-textarea']"),
         page.locator("div#prompt-textarea[contenteditable='true']"),
-        page.get_by_role("textbox"),
+        page.locator("div[data-testid='prompt-textarea'][contenteditable='true']"),
+        # placeholder 在中英文环境都有可能出现，作为兜底，但避免使用过于宽泛的 textbox 选择器
+        page.get_by_placeholder(re.compile(r"message|发送消息|发消息|向.*发送消息", re.I)),
+        page.locator("form textarea#prompt-textarea"),
     ]
     for locator in candidates:
         node = pick_visible(locator, prefer_last=True)
         if node is not None:
             return node
     return None
+
+
+def ensure_input_ready(page: Page, site_name: str) -> Locator:
+    """
+    发送前兜底：如果输入框消失（UI 卡住/只读页面/欢迎弹窗遮挡），尝试自动恢复：
+    - Esc 关闭弹窗
+    - reload
+    - goto 站点入口页
+    """
+    finder = find_chatgpt_input if site_name == "ChatGPT" else find_gemini_input
+    url = CHATGPT_URL if site_name == "ChatGPT" else GEMINI_URL
+
+    input_box = finder(page)
+    if input_box is not None:
+        return input_box
+
+    warn(f"{site_name} 未检测到对话输入框，尝试自动恢复（Esc / 刷新 / 重新打开入口页）...")
+    for attempt in range(1, 4):
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+        try:
+            if attempt == 1:
+                page.reload(wait_until="domcontentloaded")
+            else:
+                page.goto(url, wait_until="domcontentloaded")
+        except Exception as exc:
+            warn(f"{site_name} 自动恢复动作失败: {exc}")
+
+        time.sleep(2)
+        input_box = finder(page)
+        if input_box is not None:
+            log(f"{site_name} 输入框已恢复")
+            return input_box
+
+    raise RuntimeError(
+        f"{site_name} 对话输入框不可用。"
+        "可能原因：只读分享页/页面未渲染完成/风控或人机验证/弹窗遮挡。"
+        "请手动刷新页面或点“新聊天”，确认输入框出现后再继续。"
+    )
 
 
 def find_gemini_input(page: Page) -> Optional[Locator]:
@@ -234,9 +316,7 @@ def send_message(page: Page, site_name: str, content: str) -> None:
         warn(f"{site_name} 文本长度 {len(text)} 超过 {max_chars}，已截断")
         text = text[:max_chars]
 
-    input_box = find_chatgpt_input(page) if site_name == "ChatGPT" else find_gemini_input(page)
-    if input_box is None:
-        raise RuntimeError(f"{site_name} 未找到输入框，无法发送")
+    input_box = ensure_input_ready(page, site_name)
 
     log(f"正在发送给 {site_name} ...")
     clear_and_fill_input(page, input_box, text, site_name)
@@ -538,6 +618,7 @@ def run_duel_loop() -> None:
 
 def main() -> None:
     try:
+        disable_windows_console_quickedit()
         run_duel_loop()
     except KeyboardInterrupt:
         print("\n[EXIT] 收到 Ctrl+C，脚本已停止。")
