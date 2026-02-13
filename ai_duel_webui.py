@@ -231,6 +231,7 @@ HTML_PAGE = r"""<!doctype html>
         </div>
 
         <div class="pill" id="statusPill">status: <span id="statusText">starting</span></div>
+        <div class="pill" id="unseenPill">未读：ChatGPT 0 | Gemini 0</div>
 
         <div class="row">
           <button id="pauseBtn">暂停</button>
@@ -279,11 +280,14 @@ HTML_PAGE = r"""<!doctype html>
       let lastId = 0;
       let paused = false;
       let total = 0;
+      const allMessages = [];
+      const unseen = { chatgpt: 0, gemini: 0 };
 
       const chat = document.getElementById('chat');
       const conn = document.getElementById('conn');
       const dot = document.getElementById('dot');
       const statusText = document.getElementById('statusText');
+      const unseenPill = document.getElementById('unseenPill');
       const pauseBtn = document.getElementById('pauseBtn');
       const stopBtn = document.getElementById('stopBtn');
       const sendBtn = document.getElementById('sendBtn');
@@ -299,6 +303,22 @@ HTML_PAGE = r"""<!doctype html>
         if (x === 'you' || x === 'user' || x.includes('用户')) return 'you';
         if (x.includes('system') || x.includes('系统')) return 'system';
         return '';
+      }
+
+      function currentFilter() {
+        const t = (target.value || 'next').toLowerCase();
+        if (t === 'chatgpt') return { chatgpt: true, gemini: false };
+        if (t === 'gemini') return { chatgpt: false, gemini: true };
+        // next/both: show all
+        return { chatgpt: true, gemini: true };
+      }
+
+      function matchesFilter(m) {
+        const f = currentFilter();
+        if (m.speaker === 'System' || m.speaker === 'You') return true;
+        if (m.speaker === 'ChatGPT') return !!f.chatgpt;
+        if (m.speaker === 'Gemini') return !!f.gemini;
+        return true;
       }
 
       function appendMessage(m) {
@@ -326,6 +346,18 @@ HTML_PAGE = r"""<!doctype html>
         div.appendChild(meta);
         div.appendChild(text);
         chat.appendChild(div);
+      }
+
+      function updateUnseenPill() {
+        unseenPill.textContent = `未读：ChatGPT ${unseen.chatgpt} | Gemini ${unseen.gemini}`;
+      }
+
+      function rerender() {
+        chat.innerHTML = '';
+        for (const m of allMessages) {
+          if (matchesFilter(m)) appendMessage(m);
+        }
+        scrollToBottom();
       }
 
       function scrollToBottom() {
@@ -360,11 +392,19 @@ HTML_PAGE = r"""<!doctype html>
             dot.className = 'dot ok';
             conn.textContent = 'ok';
             for (const m of msgs) {
-              appendMessage(m);
+              allMessages.push(m);
+              if (matchesFilter(m)) {
+                appendMessage(m);
+              } else if (m.speaker === 'ChatGPT') {
+                unseen.chatgpt += 1;
+              } else if (m.speaker === 'Gemini') {
+                unseen.gemini += 1;
+              }
               lastId = Math.max(lastId, m.id || lastId);
               total++;
             }
             countPill.textContent = String(total);
+            updateUnseenPill();
             scrollToBottom();
           } else {
             dot.className = 'dot ok';
@@ -408,11 +448,22 @@ HTML_PAGE = r"""<!doctype html>
       });
 
       sendBtn.addEventListener('click', send);
+      target.addEventListener('change', () => {
+        const f = currentFilter();
+        if (f.chatgpt) unseen.chatgpt = 0;
+        if (f.gemini) unseen.gemini = 0;
+        updateUnseenPill();
+        rerender();
+      });
       clearBtn.addEventListener('click', () => {
         chat.innerHTML = '';
         lastId = 0;
         total = 0;
+        allMessages.length = 0;
+        unseen.chatgpt = 0;
+        unseen.gemini = 0;
         countPill.textContent = '0';
+        updateUnseenPill();
       });
 
       input.addEventListener('keydown', (ev) => {
@@ -422,6 +473,7 @@ HTML_PAGE = r"""<!doctype html>
         }
       });
 
+      updateUnseenPill();
       poll();
     </script>
   </body>
@@ -592,6 +644,39 @@ def _compose_user_message_with_context(context: str, user_text: str) -> str:
         return base
     return f"{context}\n\n我现在要说：\n{base}".strip()
 
+def _compose_shadow_sync_message(source_site: str, user_text: str, source_reply: str) -> str:
+    """
+    把“当前主对话模型”的这一轮（用户 + 主模型回复）同步给另一个模型，让它在后台生成自己的回复。
+
+    重点：
+    - 用户当前不一定会立刻看到这个模型的回复（UI 会隐藏/延后显示），因此提示模型不要假设用户已读。
+    - 同时要求回复尽量简洁、要点化，减少后续“上下文补齐/截断”的痛点。
+    """
+    user_text = core.normalize_text(user_text)
+    source_reply = core.normalize_text(source_reply)
+
+    # 这段提示词是“用户消息”的一部分（网页端无法注入 system prompt），尽量短且可控。
+    sys_hint = "\n".join(
+        [
+            "【系统提示（旁听同步）】",
+            "- 你现在处于“隐藏回复”模式：你的回复不会立刻展示给用户，用户稍后才会查看。",
+            "- 用户可能尚未阅读你之前的回复：不要用“如我上面所说”等依赖已读的指代；如需引用，请简要重述关键点。",
+            "- 回复请尽量精炼：先 1 句话结论，再列 3-6 个要点。",
+            "- 不要在回复中提及“隐藏/旁听/未读”等元信息，直接正常回答即可。",
+        ]
+    ).strip()
+
+    body = "\n\n".join(
+        [
+            sys_hint,
+            f"下面是用户与 {source_site} 的最新对话：",
+            _format_user(user_text),
+            _format_forward(source_site, source_reply),
+            "请你现在给用户的回复：",
+        ]
+    ).strip()
+    return body
+
 
 def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
     core.disable_windows_console_quickedit()
@@ -643,11 +728,110 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
 
         next_site = "ChatGPT"
         pending_text: Optional[str] = _format_user(seed_message)
+        pending_upto_mid = seed_mid  # pending_text 对应的群聊消息 id（用于已同步游标）
+        pending_user_plain = seed_message  # 仅用于“单聊时后台同步给另一模型”的提示词拼接
+        shadow_sync_to: Optional[str] = None  # 单聊模式下：主模型回复后，把这一轮同步给哪一边
         auto_duel = True  # 仅当目标为“发给下一位”时，才持续把回复转发给另一边
         # 记录每个模型“已经看过”的群聊消息 id，用于切换目标时自动补上下文
         seen_upto: dict[str, int] = {"ChatGPT": 0, "Gemini": 0}
         # 种子消息会先发给 ChatGPT，因此先把它标记为 ChatGPT 已见
         seen_upto["ChatGPT"] = seed_mid
+
+        # 后台同步队列：当你“只跟 A 聊”时，把 (用户+主模型回复) 的这一轮同步给 B，让 B 也持续跟上上下文。
+        # B 的回复会写入消息流，但前端会根据 target 下拉框进行过滤（即：你不选 B 时看不到）。
+        shadow_queue: dict[str, list[tuple[str, int]]] = {"ChatGPT": [], "Gemini": []}  # (text, upto_mid)
+        shadow_inflight: dict[str, Optional[dict[str, Any]]] = {"ChatGPT": None, "Gemini": None}
+
+        def pump_shadow_once() -> bool:
+            """
+            空闲时做一次“后台同步”推进：
+            - 优先尝试收割已完成的后台回复
+            - 然后再发送一条排队中的同步消息（一次只处理一个动作，避免长时间占用主循环）
+            """
+            # 1) Try collect (non-blocking checks first; only read stable text when likely done)
+            for site in ("ChatGPT", "Gemini"):
+                infl = shadow_inflight.get(site)
+                if not infl:
+                    continue
+
+                page = page_chatgpt if site == "ChatGPT" else page_gemini
+
+                try:
+                    if site == "ChatGPT":
+                        cont = core.find_chatgpt_continue_button(page)
+                        if core.safe_is_enabled(cont):
+                            core.warn("后台同步：检测到 ChatGPT Continue generating，自动点击继续")
+                            core.jitter("后台同步点击 Continue generating 前")
+                            cont.click(timeout=8000)
+                            core.jitter("后台同步点击 Continue generating 后")
+                            return True
+
+                        stop_visible = core.find_chatgpt_stop_button(page) is not None
+                        if stop_visible:
+                            continue
+
+                        prev_count = int(infl.get("prev_count") or 0)
+                        prev_last = str(infl.get("prev_last") or "")
+                        cur_count = core.count_chatgpt_assistant_messages(page)
+                        last_text = core.normalize_text(core.extract_chatgpt_last_reply(page))
+                        has_new = (cur_count > prev_count) or (last_text and last_text != prev_last)
+                        if not has_new:
+                            continue
+
+                        reply = core.read_stable_text(lambda: core.extract_chatgpt_last_reply(page), "ChatGPT", rounds=6)
+                        state.add_message("ChatGPT", reply or "（ChatGPT 回复为空或提取失败）")
+                        shadow_inflight[site] = None
+                        return True
+
+                    else:
+                        stop_visible = core.find_gemini_stop_button(page) is not None
+                        if stop_visible:
+                            continue
+
+                        prev_count = int(infl.get("prev_count") or 0)
+                        cur_count = core.count_gemini_responses(page)
+                        if cur_count <= prev_count:
+                            continue
+
+                        reply = core.read_stable_text(lambda: core.extract_gemini_last_reply(page), "Gemini", rounds=6)
+                        state.add_message("Gemini", reply or "（Gemini 回复为空或提取失败）")
+                        shadow_inflight[site] = None
+                        return True
+                except Exception:
+                    # 后台同步失败不应阻塞主流程；保留 inflight，后续再试
+                    continue
+
+            # 2) Try send one queued shadow sync message
+            for site in ("ChatGPT", "Gemini"):
+                if shadow_inflight.get(site) is not None:
+                    continue
+                q = shadow_queue.get(site) or []
+                if not q:
+                    continue
+
+                text, upto_mid = q.pop(0)
+                page = page_chatgpt if site == "ChatGPT" else page_gemini
+                try:
+                    if site == "ChatGPT":
+                        prev_count = core.count_chatgpt_assistant_messages(page)
+                        prev_last = core.normalize_text(core.extract_chatgpt_last_reply(page))
+                        core.send_message(page, "ChatGPT", text)
+                        shadow_inflight[site] = {"prev_count": prev_count, "prev_last": prev_last, "sent_at": time.time()}
+                    else:
+                        prev_count = core.count_gemini_responses(page)
+                        core.send_message(page, "Gemini", text)
+                        shadow_inflight[site] = {"prev_count": prev_count, "sent_at": time.time()}
+
+                    # 同步消息已成功发出，则认为该模型已“看到”截至 upto_mid 的群聊内容
+                    seen_upto[site] = max(seen_upto.get(site, 0), int(upto_mid or 0))
+                    return True
+                except Exception:
+                    # 发不出去就塞回队首，避免丢失
+                    q.insert(0, (text, upto_mid))
+                    shadow_queue[site] = q
+                    continue
+
+            return False
 
         while not state.should_stop():
             if state.is_paused():
@@ -666,55 +850,47 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                 user_text = str(item.get("text") or "")
                 to = str(item.get("to") or "next").strip().lower()
                 user_mid = state.add_message("You", user_text)
+                pending_upto_mid = user_mid
+                pending_user_plain = user_text
+                shadow_sync_to = None
 
                 if to == "chatgpt":
                     next_site = "ChatGPT"
                     auto_duel = False
                     pending_text = _format_user(user_text)
+                    shadow_sync_to = "Gemini"
                 elif to == "gemini":
                     next_site = "Gemini"
                     auto_duel = False
                     pending_text = _format_user(user_text)
+                    shadow_sync_to = "ChatGPT"
                 elif to == "both":
                     # “广播”语义：把用户消息发给两边，让两边各自回复一次，然后停在这里等待下一条用户消息。
                     # 这样更像“群聊”，也能显著减少自动互怼带来的高频请求（更稳、更不容易触发风控）。
                     auto_duel = False
-                    # 对每个目标分别补上下文
-                    ctx_a, cur_a = _build_context_bundle(
-                        state,
-                        target_site="ChatGPT",
-                        after_id=seen_upto["ChatGPT"],
-                        upto_id=user_mid - 1,
-                    )
-                    ctx_b, cur_b = _build_context_bundle(
-                        state,
-                        target_site="Gemini",
-                        after_id=seen_upto["Gemini"],
-                        upto_id=user_mid - 1,
-                    )
-                    broadcast_text_a = _compose_user_message_with_context(ctx_a, user_text)
-                    broadcast_text_b = _compose_user_message_with_context(ctx_b, user_text)
+                    broadcast_text = _format_user(user_text)
 
                     try:
                         state.set_status("broadcast: sending user -> ChatGPT + Gemini")
                         prev_a = core.count_chatgpt_assistant_messages(page_chatgpt)
                         prev_b = core.count_gemini_responses(page_gemini)
-                        core.send_message(page_chatgpt, "ChatGPT", broadcast_text_a)
-                        core.send_message(page_gemini, "Gemini", broadcast_text_b)
+                        core.send_message(page_chatgpt, "ChatGPT", broadcast_text)
+                        core.send_message(page_gemini, "Gemini", broadcast_text)
                         # 两边都已看到截至 user_mid 的群聊消息
-                        seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], user_mid, cur_a)
-                        seen_upto["Gemini"] = max(seen_upto["Gemini"], user_mid, cur_b)
+                        seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], user_mid)
+                        seen_upto["Gemini"] = max(seen_upto["Gemini"], user_mid)
 
                         state.set_status("broadcast: waiting ChatGPT")
                         core.wait_chatgpt_generation_done(page_chatgpt, prev_a)
                         reply_a = core.read_stable_text(lambda: core.extract_chatgpt_last_reply(page_chatgpt), "ChatGPT")
-                        state.add_message("ChatGPT", reply_a or "（ChatGPT 回复为空或提取失败）")
-                        # ChatGPT 自己的回复，Gemini 还没看过，seen_upto 不在这里更新
+                        mid_a = state.add_message("ChatGPT", reply_a or "（ChatGPT 回复为空或提取失败）")
+                        seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], mid_a)
 
                         state.set_status("broadcast: waiting Gemini")
                         core.wait_gemini_generation_done(page_gemini, prev_b)
                         reply_b = core.read_stable_text(lambda: core.extract_gemini_last_reply(page_gemini), "Gemini")
-                        state.add_message("Gemini", reply_b or "（Gemini 回复为空或提取失败）")
+                        mid_b = state.add_message("Gemini", reply_b or "（Gemini 回复为空或提取失败）")
+                        seen_upto["Gemini"] = max(seen_upto["Gemini"], mid_b)
                     except Exception as exc:
                         tb = traceback.format_exc(limit=10)
                         state.add_message("System", f"广播异常：{exc}\n{tb}")
@@ -733,6 +909,9 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                 drained += 1
 
             if pending_text is None:
+                # 空闲时推进一次后台同步，尽量让另一边“持续跟上”上下文，但不打断你的主对话节奏
+                if pump_shadow_once():
+                    continue
                 state.set_status("waiting user input")
                 time.sleep(0.25)
                 continue
@@ -742,64 +921,68 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                 if next_site == "ChatGPT":
                     state.set_status("ChatGPT generating")
                     prev = core.count_chatgpt_assistant_messages(page_chatgpt)
-                    # 如果当前 pending_text 是用户消息（而不是转发），并且 ChatGPT 长时间没参与，
-                    # 自动补齐 Gemini 对话上下文。
-                    if pending_text.startswith("【用户】"):
-                        last_id = state.last_id()
-                        ctx, cur = _build_context_bundle(state, "ChatGPT", seen_upto["ChatGPT"], last_id - 1)
-                        if ctx:
-                            # 从 pending_text 里取回用户正文（去掉【用户】头）
-                            user_body = pending_text.split("\n", 1)[1] if "\n" in pending_text else pending_text
-                            pending_to_send = _compose_user_message_with_context(ctx, user_body)
-                            seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], cur, last_id)
-                        else:
-                            pending_to_send = pending_text
-                            seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], last_id)
-                    else:
-                        pending_to_send = pending_text
-                        # 转发消息也算 ChatGPT 已见
-                        seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], state.last_id())
-
-                    core.send_message(page_chatgpt, "ChatGPT", pending_to_send)
+                    # 如果 ChatGPT 还在处理“后台同步消息”，先等它完成再发新消息，避免输入框/按钮状态异常。
+                    infl = shadow_inflight.get("ChatGPT")
+                    if infl is not None:
+                        core.warn("ChatGPT 仍在后台生成上一条同步消息，先等待完成以保证上下文一致...")
+                        prev0 = int(infl.get("prev_count") or 0)
+                        core.wait_chatgpt_generation_done(page_chatgpt, prev0)
+                        extra = core.read_stable_text(
+                            lambda: core.extract_chatgpt_last_reply(page_chatgpt), "ChatGPT", rounds=6
+                        )
+                        state.add_message("ChatGPT", extra or "（ChatGPT 回复为空或提取失败）")
+                        shadow_inflight["ChatGPT"] = None
+                    core.send_message(page_chatgpt, "ChatGPT", pending_text)
+                    seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], int(pending_upto_mid or 0))
                     core.wait_chatgpt_generation_done(page_chatgpt, prev)
                     reply = core.read_stable_text(lambda: core.extract_chatgpt_last_reply(page_chatgpt), "ChatGPT")
                     if not reply:
                         reply = "（ChatGPT 回复为空或提取失败）"
                     reply_mid = state.add_message("ChatGPT", reply)
+                    seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], reply_mid)
                     if auto_duel:
                         pending_text = _format_forward("ChatGPT", reply)
+                        pending_upto_mid = reply_mid
                         next_site = "Gemini"
                         # Gemini 下一轮会收到这条转发
                     else:
+                        # 单聊模式：把这一轮同步给另一边，但不展示它的回复（前端会按 target 过滤）
+                        if shadow_sync_to:
+                            shadow_queue[shadow_sync_to].append(
+                                (_compose_shadow_sync_message("ChatGPT", pending_user_plain, reply), reply_mid)
+                            )
+                        shadow_sync_to = None
                         pending_text = None
                         state.set_status("waiting user input")
                 else:
                     state.set_status("Gemini generating")
                     prev = core.count_gemini_responses(page_gemini)
-                    if pending_text.startswith("【用户】"):
-                        last_id = state.last_id()
-                        ctx, cur = _build_context_bundle(state, "Gemini", seen_upto["Gemini"], last_id - 1)
-                        if ctx:
-                            user_body = pending_text.split("\n", 1)[1] if "\n" in pending_text else pending_text
-                            pending_to_send = _compose_user_message_with_context(ctx, user_body)
-                            seen_upto["Gemini"] = max(seen_upto["Gemini"], cur, last_id)
-                        else:
-                            pending_to_send = pending_text
-                            seen_upto["Gemini"] = max(seen_upto["Gemini"], last_id)
-                    else:
-                        pending_to_send = pending_text
-                        seen_upto["Gemini"] = max(seen_upto["Gemini"], state.last_id())
-
-                    core.send_message(page_gemini, "Gemini", pending_to_send)
+                    infl = shadow_inflight.get("Gemini")
+                    if infl is not None:
+                        core.warn("Gemini 仍在后台生成上一条同步消息，先等待完成以保证上下文一致...")
+                        prev0 = int(infl.get("prev_count") or 0)
+                        core.wait_gemini_generation_done(page_gemini, prev0)
+                        extra = core.read_stable_text(lambda: core.extract_gemini_last_reply(page_gemini), "Gemini", rounds=6)
+                        state.add_message("Gemini", extra or "（Gemini 回复为空或提取失败）")
+                        shadow_inflight["Gemini"] = None
+                    core.send_message(page_gemini, "Gemini", pending_text)
+                    seen_upto["Gemini"] = max(seen_upto["Gemini"], int(pending_upto_mid or 0))
                     core.wait_gemini_generation_done(page_gemini, prev)
                     reply = core.read_stable_text(lambda: core.extract_gemini_last_reply(page_gemini), "Gemini")
                     if not reply:
                         reply = "（Gemini 回复为空或提取失败）"
                     reply_mid = state.add_message("Gemini", reply)
+                    seen_upto["Gemini"] = max(seen_upto["Gemini"], reply_mid)
                     if auto_duel:
                         pending_text = _format_forward("Gemini", reply)
+                        pending_upto_mid = reply_mid
                         next_site = "ChatGPT"
                     else:
+                        if shadow_sync_to:
+                            shadow_queue[shadow_sync_to].append(
+                                (_compose_shadow_sync_message("Gemini", pending_user_plain, reply), reply_mid)
+                            )
+                        shadow_sync_to = None
                         pending_text = None
                         state.set_status("waiting user input")
             except Exception as exc:
