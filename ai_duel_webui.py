@@ -17,6 +17,7 @@ import time
 import traceback
 import urllib.parse
 import webbrowser
+import argparse
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -663,11 +664,14 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
 
 def main() -> None:
     try:
-        run_webui_duel()
+        parser = argparse.ArgumentParser(description="ChatGPT + Gemini 互怼的本地 Web UI（含群主插话）")
+        parser.add_argument("--host", default=DEFAULT_HOST, help=f"监听地址（默认 {DEFAULT_HOST}）")
+        parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"监听端口（默认 {DEFAULT_PORT}）")
+        args = parser.parse_args()
+        run_webui_duel(host=args.host, port=args.port)
     except KeyboardInterrupt:
         print("\n[EXIT] Ctrl+C")
 
 
 if __name__ == "__main__":
     main()
-
