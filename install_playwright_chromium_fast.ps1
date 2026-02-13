@@ -1,6 +1,8 @@
-param(
+﻿param(
     [int]$ProbeBytes = 2097152,
-    [int]$ProbeTimeoutSec = 25
+    [int]$ProbeTimeoutSec = 25,
+    [int]$InstallRetries = 3,
+    [int]$BackoffBaseSec = 8
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,52 +15,6 @@ function Write-WarnMsg([string]$msg) {
     Write-Host "[WARN] $msg" -ForegroundColor Yellow
 }
 
-$probeScriptPath = Join-Path $PSScriptRoot ".probe_mirror_speed.py"
-$probeScriptLines = @(
-    "import json",
-    "import ssl",
-    "import sys",
-    "import time",
-    "import urllib.request",
-    "",
-    "url = sys.argv[1]",
-    "probe_bytes = int(sys.argv[2])",
-    "timeout_sec = int(sys.argv[3])",
-    "",
-    "req = urllib.request.Request(",
-    "    url,",
-    "    headers={",
-    "        'Range': f'bytes=0-{probe_bytes - 1}',",
-    "        'User-Agent': 'Mozilla/5.0',",
-    "    },",
-    ")",
-    "",
-    "start = time.time()",
-    "try:",
-    "    with urllib.request.urlopen(req, timeout=timeout_sec, context=ssl.create_default_context()) as resp:",
-    "        data = resp.read()",
-    "        elapsed = max(time.time() - start, 0.001)",
-    "        mbps = (len(data) / 1048576.0) / elapsed",
-    "        print(json.dumps({",
-    "            'ok': True,",
-    "            'status': int(getattr(resp, 'status', 200)),",
-    "            'bytes': len(data),",
-    "            'seconds': round(elapsed, 2),",
-    "            'mbps': round(mbps, 2),",
-    "            'error': '',",
-    "        }))",
-    "except Exception as exc:",
-    "    print(json.dumps({",
-    "        'ok': False,",
-    "        'status': 0,",
-    "        'bytes': 0,",
-    "        'seconds': 0,",
-    "        'mbps': 0,",
-    "        'error': str(exc),",
-    "    }))"
-)
-$probeScriptLines | Set-Content -Path $probeScriptPath -Encoding ASCII
-
 function Test-DownloadSpeed {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
@@ -66,7 +22,8 @@ function Test-DownloadSpeed {
         [Parameter(Mandatory = $true)][int]$TimeoutSec
     )
 
-    $jsonLine = python $probeScriptPath $Url $Bytes $TimeoutSec
+    $rangeEnd = $Bytes - 1
+    $metrics = & curl.exe -L --range "0-$rangeEnd" -o NUL -s -S --max-time $TimeoutSec -w "http_code=%{http_code} size=%{size_download} time=%{time_total} speed=%{speed_download}`n" $Url 2>&1
     if ($LASTEXITCODE -ne 0) {
         return [PSCustomObject]@{
             Url     = $Url
@@ -75,19 +32,121 @@ function Test-DownloadSpeed {
             Bytes   = 0
             Seconds = 0
             MBps    = 0
-            Error   = "python probe exited with code $LASTEXITCODE"
+            Error   = ($metrics | Out-String).Trim()
         }
     }
 
-    $probe = $jsonLine | ConvertFrom-Json
+    $line = ($metrics | Select-Object -Last 1).Trim()
+    if ($line -notmatch "http_code=(\d+)\s+size=(\d+)\s+time=([0-9.]+)\s+speed=([0-9.]+)") {
+        return [PSCustomObject]@{
+            Url     = $Url
+            Ok      = $false
+            Status  = 0
+            Bytes   = 0
+            Seconds = 0
+            MBps    = 0
+            Error   = "Unable to parse curl metrics: $line"
+        }
+    }
+
+    $httpCode = [int]$Matches[1]
+    $dlBytes = [int64]$Matches[2]
+    $sec = [double]$Matches[3]
+    $speedBps = [double]$Matches[4]
+    $mbps = if ($sec -gt 0) { ($speedBps / 1048576.0) } else { 0.0 }
+    $ok = ($httpCode -ge 200 -and $httpCode -lt 300 -and $dlBytes -gt 0 -and $mbps -gt 0)
+    $errorMsg = ""
+    if (-not $ok) {
+        $errorMsg = "http_code=$httpCode size=$dlBytes time=$sec speed_bps=$speedBps"
+    }
+
     return [PSCustomObject]@{
         Url     = $Url
-        Ok      = [bool]$probe.ok
-        Status  = [int]$probe.status
-        Bytes   = [int]$probe.bytes
-        Seconds = [double]$probe.seconds
-        MBps    = [double]$probe.mbps
-        Error   = [string]$probe.error
+        Ok      = $ok
+        Status  = $httpCode
+        Bytes   = $dlBytes
+        Seconds = $sec
+        MBps    = [Math]::Round($mbps, 2)
+        Error   = $errorMsg
+    }
+}
+
+function Stop-StalePlaywrightInstallers {
+    try {
+        $candidates = Get-CimInstance Win32_Process | Where-Object {
+            $_.Name -in @("python.exe", "node.exe") -and $_.CommandLine -and $_.CommandLine -match "playwright" -and $_.CommandLine -match "install"
+        }
+        foreach ($p in $candidates) {
+            Write-WarnMsg "Stopping stale installer process pid=$($p.ProcessId) name=$($p.Name)"
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        Write-WarnMsg "Unable to inspect/stop stale installer processes: $($_.Exception.Message)"
+    }
+}
+
+function Remove-StaleLockAndTemp {
+    $msPlaywrightDir = Join-Path $env:LOCALAPPDATA "ms-playwright"
+    $lockPath = Join-Path $msPlaywrightDir "__dirlock"
+    if (Test-Path $lockPath) {
+        Write-WarnMsg "Found stale lock file. Removing: $lockPath"
+        Remove-Item -Recurse -Force $lockPath -ErrorAction SilentlyContinue
+    }
+
+    # 清理过旧的临时下载目录，避免堆积（不会影响正在下载的目录）
+    try {
+        $tempRoot = $env:TEMP
+        Get-ChildItem -Path $tempRoot -Directory -Filter "playwright-download-*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-6) } |
+        ForEach-Object {
+            Write-Info "Removing old temp dir: $($_.FullName)"
+            Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        Write-WarnMsg "Temp cleanup skipped: $($_.Exception.Message)"
+    }
+}
+
+function Invoke-PlaywrightInstallWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$Args,
+        [Parameter(Mandatory = $true)][int]$Retries,
+        [Parameter(Mandatory = $true)][int]$BackoffBaseSec
+    )
+
+    for ($i = 1; $i -le $Retries; $i++) {
+        Stop-StalePlaywrightInstallers
+        Remove-StaleLockAndTemp
+
+        Write-Info "Running: python -m playwright $Args (attempt $i/$Retries)"
+        Clear-Variable -Name tee -ErrorAction SilentlyContinue
+        python -m playwright @($Args.Split(" ")) 2>&1 | Tee-Object -Variable tee
+        $code = $LASTEXITCODE
+        $text = ($tee | Out-String)
+
+        if ($code -eq 0) {
+            return
+        }
+
+        $isStreamDisconnect = ($text -match "stream disconnected before completion" -or $text -match "error decoding response body")
+        $isTransient = $isStreamDisconnect -or
+            ($text -match "ECONNRESET" -or $text -match "timed out" -or $text -match "server closed connection" -or $text -match "size mismatch" -or $text -match "Download failure")
+
+        if (-not $isTransient -or $i -ge $Retries) {
+            throw "playwright install failed (exit=$code) after attempt $i/$Retries"
+        }
+
+        $sleepSec = [Math]::Min(300, $BackoffBaseSec * [Math]::Pow(2, ($i - 1)))
+        if ($isStreamDisconnect) {
+            # 用户指定的特例：出现该错误时，等待时间加长
+            $sleepSec = [Math]::Min(600, $sleepSec * 2)
+        }
+        $jitter = Get-Random -Minimum 1 -Maximum 6
+        $sleepSec = [int]($sleepSec + $jitter)
+        Write-WarnMsg "Transient download error detected. Sleeping ${sleepSec}s then retrying..."
+        Start-Sleep -Seconds $sleepSec
     }
 }
 
@@ -111,9 +170,15 @@ try {
     }
     $relativePath = $Matches[1]
 
+    # 可选镜像：
+    # - 清华 TUNA 通常不提供该 Chrome for Testing 压缩包（常见为 403），但这里仍然加入探测，方便直观看到不可用原因
+    # - npmmirror 提供 chrome-for-testing 的国内镜像（速度通常更快）
     $mirrorHosts = @(
+        "https://npmmirror.com/mirrors/chrome-for-testing",
+        "https://cdn.npmmirror.com/binaries/chrome-for-testing",
         "https://storage.googleapis.com/chrome-for-testing-public",
-        "https://cdn.playwright.dev/chrome-for-testing-public"
+        "https://cdn.playwright.dev/chrome-for-testing-public",
+        "https://mirrors.tuna.tsinghua.edu.cn/chrome-for-testing-public"
     )
 
     $testUrls = $mirrorHosts | ForEach-Object { "$_/$relativePath" }
@@ -136,36 +201,35 @@ try {
         throw "All mirrors failed during probe."
     }
 
+    # 由于 testUrls 是由 mirrorHosts + relativePath 直接拼接出来的，
+    # 这里用字符串截取还原 host，避免路径格式差异导致误判。
     $bestHost = $best.Url.Substring(0, $best.Url.Length - $relativePath.Length - 1)
     Write-Info "Selected fastest mirror host: $bestHost"
 
-    $lockPath = "C:\Users\aChen\AppData\Local\ms-playwright\__dirlock"
-    if (Test-Path $lockPath) {
-        Write-WarnMsg "Found stale lock file. Removing: $lockPath"
-        Remove-Item -Recurse -Force $lockPath
-    }
+    Stop-StalePlaywrightInstallers
+    Remove-StaleLockAndTemp
 
-    $env:HTTP_PROXY = ""
-    $env:HTTPS_PROXY = ""
-    $env:ALL_PROXY = ""
-    $env:PIP_NO_INDEX = "0"
+    # Playwright 下载 socket 超时（默认 30s 对慢网络不友好）
+    $env:PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT = "300000"
+
+    # 让 ffmpeg/winldd 等小组件也走国内镜像（npmmirror）
+    $env:PLAYWRIGHT_DOWNLOAD_HOST = "https://cdn.npmmirror.com/binaries/playwright"
+
     $env:PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST = $bestHost
 
     Write-Info "Installing chromium with --no-shell using selected mirror..."
-    python -m playwright install chromium --no-shell
-    if ($LASTEXITCODE -ne 0) {
-        Write-WarnMsg "Mirror install failed, retrying with default host..."
+    try {
+        Invoke-PlaywrightInstallWithRetry -Args "install chromium --no-shell" -Retries $InstallRetries -BackoffBaseSec $BackoffBaseSec
+    }
+    catch {
+        Write-WarnMsg "Mirror install failed, retrying once with default host..."
         Remove-Item Env:\PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST -ErrorAction SilentlyContinue
-        python -m playwright install chromium --no-shell
-        if ($LASTEXITCODE -ne 0) {
-            throw "Default host install failed as well."
-        }
+        Invoke-PlaywrightInstallWithRetry -Args "install chromium --no-shell" -Retries 1 -BackoffBaseSec $BackoffBaseSec
     }
 
     Write-Info "Chromium installation completed."
 }
 finally {
-    if (Test-Path $probeScriptPath) {
-        Remove-Item -Force $probeScriptPath -ErrorAction SilentlyContinue
-    }
+    # no-op
 }
+
