@@ -11,8 +11,10 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
+import subprocess
 import threading
 import time
 import traceback
@@ -77,6 +79,51 @@ def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _open_webui_window(url: str) -> None:
+    """
+    尽量以“独立窗口”的方式打开 UI（Chrome/Edge 的 --app 模式），避免淹没在一堆浏览器标签页里。
+    找不到浏览器可执行文件时，回退到系统默认浏览器。
+    """
+
+    if os.name == "nt":
+        pf = os.environ.get("PROGRAMFILES") or ""
+        pfx86 = os.environ.get("PROGRAMFILES(X86)") or ""
+        local = os.environ.get("LOCALAPPDATA") or ""
+
+        candidates = [
+            # Chrome
+            os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(pfx86, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(local, "Google", "Chrome", "Application", "chrome.exe"),
+            # Edge
+            os.path.join(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(pfx86, "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(local, "Microsoft", "Edge", "Application", "msedge.exe"),
+        ]
+
+        for exe in candidates:
+            try:
+                if exe and Path(exe).exists():
+                    subprocess.Popen(  # noqa: S603
+                        [
+                            exe,
+                            f"--app={url}",
+                            "--new-window",
+                            "--window-size=1440,900",
+                            "--window-position=60,40",
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    return
+            except Exception:
+                continue
+
+    try:
+        webbrowser.open_new_tab(url)
+    except Exception:
+        pass
+
 @dataclass
 class UiMessage:
     id: int
@@ -95,7 +142,10 @@ class SharedState:
         self._stop: bool = False
         self._rules: str = DEFAULT_RULES
         self._rules_version: int = 1
+        # session_started: Playwright 已成功启动并通过登录检查，可以开始群聊。
         self._session_started: bool = False
+        # start_requested: 前端点了「启动」，后台正在启动 Playwright（或准备启动）。
+        self._start_requested: bool = False
         self._selected_keys: list[str] = list(DEFAULT_SELECTED_KEYS)
         self._start_event = threading.Event()
         self.inbox: "queue.Queue[dict[str, Any]]" = queue.Queue()
@@ -124,6 +174,7 @@ class SharedState:
                 "paused": self._paused,
                 "stop": self._stop,
                 "session_started": self._session_started,
+                "start_requested": self._start_requested,
                 "selected_keys": list(self._selected_keys),
             }
 
@@ -152,9 +203,11 @@ class SharedState:
                 item = dict(s)
                 item["selected"] = bool(item.get("key") in selected)
                 item["session_started"] = self._session_started
+                item["start_requested"] = self._start_requested
                 slots.append(item)
             return {
                 "session_started": self._session_started,
+                "start_requested": self._start_requested,
                 "selected_keys": list(self._selected_keys),
                 "slots": slots,
             }
@@ -172,16 +225,29 @@ class SharedState:
         if not cleaned:
             cleaned = list(DEFAULT_SELECTED_KEYS)
         with self._lock:
-            if not self._session_started:
+            if not self._session_started and not self._start_requested:
                 self._selected_keys = cleaned
         return self.get_models()
 
-    def start_session(self) -> dict[str, Any]:
+    def request_session_start(self) -> dict[str, Any]:
+        # 仅“请求启动”，不直接置 session_started=True。
         with self._lock:
-            if not self._session_started:
-                self._session_started = True
+            if self._session_started:
+                return self.get_models()
+            self._start_requested = True
         self._start_event.set()
         return self.get_models()
+
+    def mark_session_started(self) -> None:
+        with self._lock:
+            self._session_started = True
+            self._start_requested = False
+
+    def reset_session(self) -> None:
+        with self._lock:
+            self._session_started = False
+            self._start_requested = False
+        self._start_event.clear()
 
     def wait_for_session_start(self, timeout_s: int = 3600) -> bool:
         return self._start_event.wait(timeout=timeout_s)
@@ -572,6 +638,7 @@ HTML_PAGE = r"""<!doctype html>
       const unseen = { chatgpt: 0, gemini: 0 };
       let newBelow = 0;
       let sessionStarted = false;
+      let startRequested = false;
       let modelSlots = [];
       let selectedKeys = new Set();
 
@@ -695,7 +762,7 @@ HTML_PAGE = r"""<!doctype html>
 
           btn.addEventListener('click', async () => {
             if (!enabled) return;
-            if (!sessionStarted) {
+            if (!sessionStarted && !startRequested) {
               // 选择阶段：点击表示“启用/禁用”
               if (selectedKeys.has(key)) selectedKeys.delete(key);
               else selectedKeys.add(key);
@@ -712,7 +779,7 @@ HTML_PAGE = r"""<!doctype html>
             }
 
             // 启动后：点击用于切换“查看焦点”（不改变启用集合）
-            applyTargetForKey(key);
+            if (sessionStarted) applyTargetForKey(key);
           });
 
           modelList.appendChild(btn);
@@ -725,11 +792,20 @@ HTML_PAGE = r"""<!doctype html>
         try {
           const data = await apiGet('/api/models');
           sessionStarted = !!(data && data.session_started);
+          startRequested = !!(data && data.start_requested);
           const keys = (data && data.selected_keys) ? data.selected_keys : [];
           selectedKeys = new Set((keys || []).map(x => String(x).toLowerCase()));
           modelSlots = (data && data.slots) ? data.slots : [];
           renderModels();
-          if (startSessionBtn) startSessionBtn.style.display = sessionStarted ? 'none' : 'inline-block';
+          if (startSessionBtn) {
+            if (sessionStarted) {
+              startSessionBtn.style.display = 'none';
+            } else {
+              startSessionBtn.style.display = 'inline-block';
+              startSessionBtn.disabled = !!startRequested;
+              startSessionBtn.textContent = startRequested ? '启动中' : '启动';
+            }
+          }
           setUiEnabled(sessionStarted);
         } catch (e) {
           // ignore
@@ -899,10 +975,12 @@ HTML_PAGE = r"""<!doctype html>
           statusText.textContent = state.status || '';
           paused = !!state.paused;
           pauseBtn.textContent = paused ? '继续' : '暂停';
-          if (typeof state.session_started !== 'undefined') {
+          if (typeof state.session_started !== 'undefined' || typeof state.start_requested !== 'undefined') {
             const started = !!state.session_started;
-            if (started !== sessionStarted) {
+            const requested = !!state.start_requested;
+            if (started !== sessionStarted || requested !== startRequested) {
               sessionStarted = started;
+              startRequested = requested;
               // 会话状态发生变化时，刷新模型栏与控件状态
               loadModels();
             }
@@ -981,7 +1059,7 @@ HTML_PAGE = r"""<!doctype html>
 
       if (startSessionBtn) {
         startSessionBtn.addEventListener('click', async () => {
-          if (sessionStarted) return;
+          if (sessionStarted || startRequested) return;
           startSessionBtn.disabled = true;
           const oldText = startSessionBtn.textContent;
           startSessionBtn.textContent = '启动中';
@@ -990,7 +1068,6 @@ HTML_PAGE = r"""<!doctype html>
             await loadModels();
           } catch (e) {
             alert('启动失败：' + e);
-          } finally {
             startSessionBtn.disabled = false;
             startSessionBtn.textContent = oldText;
           }
@@ -1145,7 +1222,7 @@ class _Handler(BaseHTTPRequestHandler):
                     status=400,
                 )
                 return
-            payload = self.state.start_session()
+            payload = self.state.request_session_start()
             self._send_json({"ok": True, **payload})
             return
 
@@ -1297,10 +1374,7 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
     state.set_status(f"webui ready: {url}")
     state.add_message("System", f"Web UI 已启动：{url}")
 
-    try:
-        webbrowser.open_new_tab(url)
-    except Exception:
-        pass
+    _open_webui_window(url)
 
     # 先启动 UI，再等待你在 UI 左侧选择模型并点击“启动”，然后才打开对应网页
     state.add_message("System", "请先在最左侧选择要使用的模型槽位，然后点击「启动」。")
@@ -1351,6 +1425,9 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
         page_gemini.bring_to_front()
         core.wait_for_login(page_gemini, "Gemini")
         state.add_message("System", "Gemini 登录检查通过（检测到输入框）")
+
+        # 到这里为止：两边网页都已打开且通过登录检查，可以正式开始群聊（放开 WebUI 输入框）。
+        state.mark_session_started()
 
         next_site = "ChatGPT"
         # 不再自动发送“你好，请开始你的论述。”：
