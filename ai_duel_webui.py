@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import threading
 import time
 import traceback
@@ -31,8 +32,23 @@ import ai_duel as core
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 MAX_MESSAGES = 1500
-MAX_CONTEXT_CHARS = 6000
-MAX_CONTEXT_ITEMS = 24  # 仅取最近 N 条记录，避免一次性塞太多上下文
+
+# “对话规则”会被作为用户消息的一部分发送到网页端模型（无法真正注入 system prompt）。
+# 目标：更短、更结构化、更偏向推理而非“搜索答案式”复述。
+DEFAULT_RULES = """【对话规则】
+- 禁止联网搜索/禁止引用外链/禁止贴来源；仅基于你自身的知识与推理回答。
+- 先给 1 句结论（<= 20 字），再给 3-6 条要点（每条 <= 20 字）。
+- 必须给 1 个反例/边界条件，避免空泛。
+- 最后给 1 个追问，推动更深一步讨论。
+- 总长度尽量 <= 260 字。
+- 末尾追加一段【转发摘要】（<= 120 字），供另一模型阅读（用于对话接续，不要写元信息）。
+""".strip()
+
+# 每轮轻量提醒：避免模型“跑偏”回长文/检索式回答
+RULES_REMINDER = "【提醒】按规则：短结论+要点+反例+追问；不要联网搜索/外链；末尾带【转发摘要】。"
+
+# 转发给另一模型的内容长度上限（过长会导致输入卡顿，也会让对话越来越发散）
+FORWARD_MAX_CHARS = 900
 
 
 def _now_iso() -> str:
@@ -55,6 +71,8 @@ class SharedState:
         self._status: str = "starting"
         self._paused: bool = False
         self._stop: bool = False
+        self._rules: str = DEFAULT_RULES
+        self._rules_version: int = 1
         self.inbox: "queue.Queue[dict[str, Any]]" = queue.Queue()
 
     def add_message(self, speaker: str, text: str) -> int:
@@ -101,6 +119,19 @@ class SharedState:
                 for m in self._messages
                 if m.id > after_id
             ]
+
+    def get_rules(self) -> dict[str, Any]:
+        with self._lock:
+            return {"rules": self._rules, "version": self._rules_version}
+
+    def set_rules(self, rules: str) -> None:
+        rules = (rules or "").strip()
+        # 防止 UI 一不小心塞入超长文本把输入框撑爆
+        if len(rules) > 6000:
+            rules = rules[:6000] + "\n...(已截断)"
+        with self._lock:
+            self._rules = rules
+            self._rules_version += 1
 
     def last_id(self) -> int:
         with self._lock:
@@ -247,6 +278,18 @@ HTML_PAGE = r"""<!doctype html>
           </select>
         </div>
 
+        <details id="rulesBox">
+          <summary class="pill">对话规则（两边共享，可改）</summary>
+          <textarea id="rulesInput" placeholder="在这里写规则（会作为用户消息的一部分发送给模型）..."></textarea>
+          <div class="row">
+            <button id="saveRulesBtn">应用规则</button>
+          </div>
+          <div class="hint">
+            <div>- 规则会在下一轮发送给两边（自动重新注入）。</div>
+            <div>- 过长会被截断，建议保持简短。</div>
+          </div>
+        </details>
+
         <textarea id="input" placeholder="在这里插话（群主发言）..."></textarea>
         <div class="row">
           <button id="sendBtn" class="primary">发送</button>
@@ -293,6 +336,8 @@ HTML_PAGE = r"""<!doctype html>
       const stopBtn = document.getElementById('stopBtn');
       const sendBtn = document.getElementById('sendBtn');
       const clearBtn = document.getElementById('clearBtn');
+      const rulesInput = document.getElementById('rulesInput');
+      const saveRulesBtn = document.getElementById('saveRulesBtn');
       const input = document.getElementById('input');
       const target = document.getElementById('target');
       const countPill = document.getElementById('countPill');
@@ -381,6 +426,17 @@ HTML_PAGE = r"""<!doctype html>
         return await r.json();
       }
 
+      async function loadRules() {
+        try {
+          const data = await apiGet('/api/rules');
+          if (data && typeof data.rules === 'string') {
+            rulesInput.value = data.rules;
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+
       async function poll() {
         try {
           const state = await apiGet('/api/state');
@@ -448,6 +504,15 @@ HTML_PAGE = r"""<!doctype html>
         }
       });
 
+      saveRulesBtn.addEventListener('click', async () => {
+        try {
+          await apiPost('/api/rules', { rules: rulesInput.value || '' });
+          alert('规则已应用（下一轮生效）');
+        } catch (e) {
+          alert('应用失败：' + e);
+        }
+      });
+
       sendBtn.addEventListener('click', send);
       target.addEventListener('change', () => {
         const f = currentFilter();
@@ -475,6 +540,7 @@ HTML_PAGE = r"""<!doctype html>
       });
 
       updateUnseenPill();
+      loadRules();
       poll();
     </script>
   </body>
@@ -534,6 +600,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(self.state.get_messages_after(after_id))
             return
 
+        if parsed.path == "/api/rules":
+            self._send_json(self.state.get_rules())
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:  # noqa: N802
@@ -563,6 +633,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
             return
 
+        if parsed.path == "/api/rules":
+            rules = str(data.get("rules") or "")
+            self.state.set_rules(rules)
+            self._send_json({"ok": True, **self.state.get_rules()})
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
@@ -588,62 +664,35 @@ def _format_user(text: str) -> str:
     # 给模型看的“群主插话”，明确这是用户说的
     return f"【用户】\n{text}".strip()
 
-
-def _other(site: str) -> str:
-    return "Gemini" if site == "ChatGPT" else "ChatGPT"
-
-
-def _build_context_bundle(
-    state: SharedState,
-    target_site: str,
-    after_id: int,
-    upto_id: int,
-) -> tuple[str, int]:
+def _pick_forward_payload(full_reply: str) -> str:
     """
-    当你长时间只跟 A 聊，突然切到 B 时，为了让 B “知道之前聊了什么”，需要把 A 的对话摘要/记录补给 B。
-
-    注意：网页端没有“系统提示词”注入能力，所以这里采用“把上下文作为用户消息的一部分”方式。
+    互怼转发时不直接把“整段长回复”扔给对方（会越来越长，且很难抓重点）。
+    优先从回复里提取【转发摘要】；没有则做一个保守截取。
     """
-    other = _other(target_site)
-    msgs = state.get_messages_range(after_id, upto_id)
-    msgs = [m for m in msgs if m.get("speaker") in ("You", other)]
-    if not msgs:
-        return "", after_id
+    text = core.normalize_text(full_reply)
+    if not text:
+        return ""
 
-    # 只取最后 N 条，避免上下文过长
-    if len(msgs) > MAX_CONTEXT_ITEMS:
-        msgs = msgs[-MAX_CONTEXT_ITEMS:]
+    # 取最后一个【转发摘要】（模型有时会重复输出）
+    matches = list(re.finditer(r"【转发摘要】\s*[:：]?\s*", text))
+    if matches:
+        start = matches[-1].end()
+        tail = text[start:].strip()
+        # 遇到下一个“【xxx】”段落就截断，避免把正文又带进去
+        parts = re.split(r"\n\s*【[^】]{1,12}】", tail, maxsplit=1)
+        summary = (parts[0] if parts else tail).strip()
+        if summary:
+            if len(summary) > FORWARD_MAX_CHARS:
+                return summary[:FORWARD_MAX_CHARS] + "\n...(省略)"
+            return summary
 
-    lines: list[str] = []
-    for m in msgs:
-        speaker = str(m.get("speaker") or "")
-        text = core.normalize_text(str(m.get("text") or ""))
-        if not text:
-            continue
-        # 控制每条长度，避免单条超长（尤其是模型长回复）
-        if len(text) > 1200:
-            text = text[:1200] + "\n...(已截断)"
-        prefix = "用户" if speaker == "You" else other
-        lines.append(f"- {prefix}: {text}")
+    # fallback：抓前几行要点/结论
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    compact = "\n".join(lines[:10]).strip()
+    if len(compact) > FORWARD_MAX_CHARS:
+        return compact[:FORWARD_MAX_CHARS] + "\n...(省略)"
+    return compact
 
-    bundle = "\n".join(lines).strip()
-    if not bundle:
-        return "", after_id
-
-    # 全局长度控制
-    if len(bundle) > MAX_CONTEXT_CHARS:
-        bundle = bundle[-MAX_CONTEXT_CHARS:]
-
-    new_cursor = max(int(m.get("id") or 0) for m in msgs)
-    header = f"下面是我与 {other} 的最近对话记录（供你补齐上下文）：\n"
-    return header + bundle, new_cursor
-
-
-def _compose_user_message_with_context(context: str, user_text: str) -> str:
-    base = _format_user(user_text)
-    if not context:
-        return base
-    return f"{context}\n\n我现在要说：\n{base}".strip()
 
 def _compose_shadow_sync_message(source_site: str, user_text: str, source_reply: str) -> str:
     """
@@ -662,6 +711,7 @@ def _compose_shadow_sync_message(source_site: str, user_text: str, source_reply:
             "【系统提示（旁听同步）】",
             "- 你现在处于“隐藏回复”模式：你的回复不会立刻展示给用户，用户稍后才会查看。",
             "- 用户可能尚未阅读你之前的回复：不要用“如我上面所说”等依赖已读的指代；如需引用，请简要重述关键点。",
+            "- 禁止联网搜索/禁止引用外链；仅基于你自身的知识与推理回答。",
             "- 回复请尽量精炼：先 1 句话结论，再列 3-6 个要点。",
             "- 不要在回复中提及“隐藏/旁听/未读”等元信息，直接正常回答即可。",
         ]
@@ -737,6 +787,23 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
         seen_upto: dict[str, int] = {"ChatGPT": 0, "Gemini": 0}
         # 种子消息会先发给 ChatGPT，因此先把它标记为 ChatGPT 已见
         seen_upto["ChatGPT"] = seed_mid
+
+        # 规则注入：记录每个站点最后一次注入的 rules version，避免每条都重复长规则
+        rules_version_sent: dict[str, int] = {"ChatGPT": 0, "Gemini": 0}
+
+        def _with_rules(site: str, msg: str) -> str:
+            info = state.get_rules()
+            rules = str(info.get("rules") or "").strip()
+            version = int(info.get("version") or 0)
+            body = (msg or "").strip()
+            if not body:
+                return ""
+            if not rules:
+                return body
+            if version > rules_version_sent.get(site, 0):
+                rules_version_sent[site] = version
+                return f"{rules}\n\n{body}".strip()
+            return f"{RULES_REMINDER}\n\n{body}".strip()
 
         # 后台同步队列：当你“只跟 A 聊”时，把 (用户+主模型回复) 的这一轮同步给 B，让 B 也持续跟上上下文。
         # B 的回复会写入消息流，但前端会根据 target 下拉框进行过滤（即：你不选 B 时看不到）。
@@ -875,8 +942,8 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                         state.set_status("broadcast: sending user -> ChatGPT + Gemini")
                         prev_a = core.count_chatgpt_assistant_messages(page_chatgpt)
                         prev_b = core.count_gemini_responses(page_gemini)
-                        core.send_message(page_chatgpt, "ChatGPT", broadcast_text)
-                        core.send_message(page_gemini, "Gemini", broadcast_text)
+                        core.send_message(page_chatgpt, "ChatGPT", _with_rules("ChatGPT", broadcast_text))
+                        core.send_message(page_gemini, "Gemini", _with_rules("Gemini", broadcast_text))
                         # 两边都已看到截至 user_mid 的群聊消息
                         seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], user_mid)
                         seen_upto["Gemini"] = max(seen_upto["Gemini"], user_mid)
@@ -933,7 +1000,7 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                         )
                         state.add_message("ChatGPT", extra or "（ChatGPT 回复为空或提取失败）")
                         shadow_inflight["ChatGPT"] = None
-                    core.send_message(page_chatgpt, "ChatGPT", pending_text)
+                    core.send_message(page_chatgpt, "ChatGPT", _with_rules("ChatGPT", pending_text))
                     seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], int(pending_upto_mid or 0))
                     core.wait_chatgpt_generation_done(page_chatgpt, prev)
                     reply = core.read_stable_text(lambda: core.extract_chatgpt_last_reply(page_chatgpt), "ChatGPT")
@@ -942,7 +1009,7 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                     reply_mid = state.add_message("ChatGPT", reply)
                     seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], reply_mid)
                     if auto_duel:
-                        pending_text = _format_forward("ChatGPT", reply)
+                        pending_text = _format_forward("ChatGPT", _pick_forward_payload(reply))
                         pending_upto_mid = reply_mid
                         next_site = "Gemini"
                         # Gemini 下一轮会收到这条转发
@@ -950,7 +1017,12 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                         # 单聊模式：把这一轮同步给另一边，但不展示它的回复（前端会按 target 过滤）
                         if shadow_sync_to:
                             shadow_queue[shadow_sync_to].append(
-                                (_compose_shadow_sync_message("ChatGPT", pending_user_plain, reply), reply_mid)
+                                (
+                                    _compose_shadow_sync_message(
+                                        "ChatGPT", pending_user_plain, _pick_forward_payload(reply) or reply
+                                    ),
+                                    reply_mid,
+                                )
                             )
                         shadow_sync_to = None
                         pending_text = None
@@ -966,7 +1038,7 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                         extra = core.read_stable_text(lambda: core.extract_gemini_last_reply(page_gemini), "Gemini", rounds=6)
                         state.add_message("Gemini", extra or "（Gemini 回复为空或提取失败）")
                         shadow_inflight["Gemini"] = None
-                    core.send_message(page_gemini, "Gemini", pending_text)
+                    core.send_message(page_gemini, "Gemini", _with_rules("Gemini", pending_text))
                     seen_upto["Gemini"] = max(seen_upto["Gemini"], int(pending_upto_mid or 0))
                     core.wait_gemini_generation_done(page_gemini, prev)
                     reply = core.read_stable_text(lambda: core.extract_gemini_last_reply(page_gemini), "Gemini")
@@ -975,13 +1047,18 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                     reply_mid = state.add_message("Gemini", reply)
                     seen_upto["Gemini"] = max(seen_upto["Gemini"], reply_mid)
                     if auto_duel:
-                        pending_text = _format_forward("Gemini", reply)
+                        pending_text = _format_forward("Gemini", _pick_forward_payload(reply))
                         pending_upto_mid = reply_mid
                         next_site = "ChatGPT"
                     else:
                         if shadow_sync_to:
                             shadow_queue[shadow_sync_to].append(
-                                (_compose_shadow_sync_message("Gemini", pending_user_plain, reply), reply_mid)
+                                (
+                                    _compose_shadow_sync_message(
+                                        "Gemini", pending_user_plain, _pick_forward_payload(reply) or reply
+                                    ),
+                                    reply_mid,
+                                )
                             )
                         shadow_sync_to = None
                         pending_text = None
