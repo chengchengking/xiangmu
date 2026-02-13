@@ -31,6 +31,8 @@ import ai_duel as core
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 MAX_MESSAGES = 1500
+MAX_CONTEXT_CHARS = 6000
+MAX_CONTEXT_ITEMS = 24  # 仅取最近 N 条记录，避免一次性塞太多上下文
 
 
 def _now_iso() -> str:
@@ -98,6 +100,18 @@ class SharedState:
                 {"id": m.id, "ts": m.ts, "speaker": m.speaker, "text": m.text}
                 for m in self._messages
                 if m.id > after_id
+            ]
+
+    def last_id(self) -> int:
+        with self._lock:
+            return self._next_id - 1
+
+    def get_messages_range(self, after_id: int, upto_id: int) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                {"id": m.id, "ts": m.ts, "speaker": m.speaker, "text": m.text}
+                for m in self._messages
+                if m.id > after_id and m.id <= upto_id
             ]
 
 
@@ -526,6 +540,59 @@ def _other(site: str) -> str:
     return "Gemini" if site == "ChatGPT" else "ChatGPT"
 
 
+def _build_context_bundle(
+    state: SharedState,
+    target_site: str,
+    after_id: int,
+    upto_id: int,
+) -> tuple[str, int]:
+    """
+    当你长时间只跟 A 聊，突然切到 B 时，为了让 B “知道之前聊了什么”，需要把 A 的对话摘要/记录补给 B。
+
+    注意：网页端没有“系统提示词”注入能力，所以这里采用“把上下文作为用户消息的一部分”方式。
+    """
+    other = _other(target_site)
+    msgs = state.get_messages_range(after_id, upto_id)
+    msgs = [m for m in msgs if m.get("speaker") in ("You", other)]
+    if not msgs:
+        return "", after_id
+
+    # 只取最后 N 条，避免上下文过长
+    if len(msgs) > MAX_CONTEXT_ITEMS:
+        msgs = msgs[-MAX_CONTEXT_ITEMS:]
+
+    lines: list[str] = []
+    for m in msgs:
+        speaker = str(m.get("speaker") or "")
+        text = core.normalize_text(str(m.get("text") or ""))
+        if not text:
+            continue
+        # 控制每条长度，避免单条超长（尤其是模型长回复）
+        if len(text) > 1200:
+            text = text[:1200] + "\n...(已截断)"
+        prefix = "用户" if speaker == "You" else other
+        lines.append(f"- {prefix}: {text}")
+
+    bundle = "\n".join(lines).strip()
+    if not bundle:
+        return "", after_id
+
+    # 全局长度控制
+    if len(bundle) > MAX_CONTEXT_CHARS:
+        bundle = bundle[-MAX_CONTEXT_CHARS:]
+
+    new_cursor = max(int(m.get("id") or 0) for m in msgs)
+    header = f"下面是我与 {other} 的最近对话记录（供你补齐上下文）：\n"
+    return header + bundle, new_cursor
+
+
+def _compose_user_message_with_context(context: str, user_text: str) -> str:
+    base = _format_user(user_text)
+    if not context:
+        return base
+    return f"{context}\n\n我现在要说：\n{base}".strip()
+
+
 def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
     core.disable_windows_console_quickedit()
 
@@ -572,11 +639,15 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
         state.add_message("System", "Gemini 登录检查通过（检测到输入框）")
 
         seed_message = "你好，请开始你的论述。"
-        state.add_message("You", seed_message)
+        seed_mid = state.add_message("You", seed_message)
 
         next_site = "ChatGPT"
         pending_text: Optional[str] = _format_user(seed_message)
         auto_duel = True  # 仅当目标为“发给下一位”时，才持续把回复转发给另一边
+        # 记录每个模型“已经看过”的群聊消息 id，用于切换目标时自动补上下文
+        seen_upto: dict[str, int] = {"ChatGPT": 0, "Gemini": 0}
+        # 种子消息会先发给 ChatGPT，因此先把它标记为 ChatGPT 已见
+        seen_upto["ChatGPT"] = seed_mid
 
         while not state.should_stop():
             if state.is_paused():
@@ -594,31 +665,51 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
 
                 user_text = str(item.get("text") or "")
                 to = str(item.get("to") or "next").strip().lower()
-                state.add_message("You", user_text)
+                user_mid = state.add_message("You", user_text)
 
                 if to == "chatgpt":
                     next_site = "ChatGPT"
                     auto_duel = False
+                    pending_text = _format_user(user_text)
                 elif to == "gemini":
                     next_site = "Gemini"
                     auto_duel = False
+                    pending_text = _format_user(user_text)
                 elif to == "both":
                     # “广播”语义：把用户消息发给两边，让两边各自回复一次，然后停在这里等待下一条用户消息。
                     # 这样更像“群聊”，也能显著减少自动互怼带来的高频请求（更稳、更不容易触发风控）。
                     auto_duel = False
-                    broadcast_text = _format_user(user_text)
+                    # 对每个目标分别补上下文
+                    ctx_a, cur_a = _build_context_bundle(
+                        state,
+                        target_site="ChatGPT",
+                        after_id=seen_upto["ChatGPT"],
+                        upto_id=user_mid - 1,
+                    )
+                    ctx_b, cur_b = _build_context_bundle(
+                        state,
+                        target_site="Gemini",
+                        after_id=seen_upto["Gemini"],
+                        upto_id=user_mid - 1,
+                    )
+                    broadcast_text_a = _compose_user_message_with_context(ctx_a, user_text)
+                    broadcast_text_b = _compose_user_message_with_context(ctx_b, user_text)
 
                     try:
                         state.set_status("broadcast: sending user -> ChatGPT + Gemini")
                         prev_a = core.count_chatgpt_assistant_messages(page_chatgpt)
                         prev_b = core.count_gemini_responses(page_gemini)
-                        core.send_message(page_chatgpt, "ChatGPT", broadcast_text)
-                        core.send_message(page_gemini, "Gemini", broadcast_text)
+                        core.send_message(page_chatgpt, "ChatGPT", broadcast_text_a)
+                        core.send_message(page_gemini, "Gemini", broadcast_text_b)
+                        # 两边都已看到截至 user_mid 的群聊消息
+                        seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], user_mid, cur_a)
+                        seen_upto["Gemini"] = max(seen_upto["Gemini"], user_mid, cur_b)
 
                         state.set_status("broadcast: waiting ChatGPT")
                         core.wait_chatgpt_generation_done(page_chatgpt, prev_a)
                         reply_a = core.read_stable_text(lambda: core.extract_chatgpt_last_reply(page_chatgpt), "ChatGPT")
                         state.add_message("ChatGPT", reply_a or "（ChatGPT 回复为空或提取失败）")
+                        # ChatGPT 自己的回复，Gemini 还没看过，seen_upto 不在这里更新
 
                         state.set_status("broadcast: waiting Gemini")
                         core.wait_gemini_generation_done(page_gemini, prev_b)
@@ -634,10 +725,11 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
 
                     drained += 1
                     continue
+                else:
+                    # 默认：发给下一位（维持互怼的“单线程”节奏）
+                    auto_duel = True
+                    pending_text = _format_user(user_text)
 
-                # 默认：发给下一位（维持互怼的“单线程”节奏）
-                auto_duel = True
-                pending_text = _format_user(user_text)
                 drained += 1
 
             if pending_text is None:
@@ -650,27 +742,60 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                 if next_site == "ChatGPT":
                     state.set_status("ChatGPT generating")
                     prev = core.count_chatgpt_assistant_messages(page_chatgpt)
-                    core.send_message(page_chatgpt, "ChatGPT", pending_text)
+                    # 如果当前 pending_text 是用户消息（而不是转发），并且 ChatGPT 长时间没参与，
+                    # 自动补齐 Gemini 对话上下文。
+                    if pending_text.startswith("【用户】"):
+                        last_id = state.last_id()
+                        ctx, cur = _build_context_bundle(state, "ChatGPT", seen_upto["ChatGPT"], last_id - 1)
+                        if ctx:
+                            # 从 pending_text 里取回用户正文（去掉【用户】头）
+                            user_body = pending_text.split("\n", 1)[1] if "\n" in pending_text else pending_text
+                            pending_to_send = _compose_user_message_with_context(ctx, user_body)
+                            seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], cur, last_id)
+                        else:
+                            pending_to_send = pending_text
+                            seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], last_id)
+                    else:
+                        pending_to_send = pending_text
+                        # 转发消息也算 ChatGPT 已见
+                        seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], state.last_id())
+
+                    core.send_message(page_chatgpt, "ChatGPT", pending_to_send)
                     core.wait_chatgpt_generation_done(page_chatgpt, prev)
                     reply = core.read_stable_text(lambda: core.extract_chatgpt_last_reply(page_chatgpt), "ChatGPT")
                     if not reply:
                         reply = "（ChatGPT 回复为空或提取失败）"
-                    state.add_message("ChatGPT", reply)
+                    reply_mid = state.add_message("ChatGPT", reply)
                     if auto_duel:
                         pending_text = _format_forward("ChatGPT", reply)
                         next_site = "Gemini"
+                        # Gemini 下一轮会收到这条转发
                     else:
                         pending_text = None
                         state.set_status("waiting user input")
                 else:
                     state.set_status("Gemini generating")
                     prev = core.count_gemini_responses(page_gemini)
-                    core.send_message(page_gemini, "Gemini", pending_text)
+                    if pending_text.startswith("【用户】"):
+                        last_id = state.last_id()
+                        ctx, cur = _build_context_bundle(state, "Gemini", seen_upto["Gemini"], last_id - 1)
+                        if ctx:
+                            user_body = pending_text.split("\n", 1)[1] if "\n" in pending_text else pending_text
+                            pending_to_send = _compose_user_message_with_context(ctx, user_body)
+                            seen_upto["Gemini"] = max(seen_upto["Gemini"], cur, last_id)
+                        else:
+                            pending_to_send = pending_text
+                            seen_upto["Gemini"] = max(seen_upto["Gemini"], last_id)
+                    else:
+                        pending_to_send = pending_text
+                        seen_upto["Gemini"] = max(seen_upto["Gemini"], state.last_id())
+
+                    core.send_message(page_gemini, "Gemini", pending_to_send)
                     core.wait_gemini_generation_done(page_gemini, prev)
                     reply = core.read_stable_text(lambda: core.extract_gemini_last_reply(page_gemini), "Gemini")
                     if not reply:
                         reply = "（Gemini 回复为空或提取失败）"
-                    state.add_message("Gemini", reply)
+                    reply_mid = state.add_message("Gemini", reply)
                     if auto_duel:
                         pending_text = _format_forward("Gemini", reply)
                         next_site = "ChatGPT"
