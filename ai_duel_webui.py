@@ -213,7 +213,7 @@ HTML_PAGE = r"""<!doctype html>
         padding: 10px 12px; outline: none;
       }
       .hint { font-size: 12px; color: var(--muted); line-height: 1.5; }
-      .main { display: flex; flex-direction: column; height: 100%; }
+      .main { display: flex; flex-direction: column; height: 100%; min-width: 0; }
       .topbar {
         padding: 14px 18px;
         border-bottom: 1px solid var(--border);
@@ -223,34 +223,120 @@ HTML_PAGE = r"""<!doctype html>
         justify-content: space-between;
       }
       .status { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+      .chatWrap { position: relative; flex: 1; min-height: 0; }
       .chat {
-        flex: 1;
-        padding: 18px;
+        position: absolute;
+        inset: 0;
+        padding: 18px 18px 26px;
         overflow: auto;
+        scroll-behavior: smooth;
+        background:
+          radial-gradient(900px 520px at 12% 12%, rgba(34, 197, 94, 0.10), transparent 62%),
+          radial-gradient(900px 520px at 88% 24%, rgba(59, 130, 246, 0.10), transparent 65%),
+          repeating-linear-gradient(0deg, rgba(148, 163, 184, 0.05) 0 1px, transparent 1px 22px),
+          repeating-linear-gradient(90deg, rgba(148, 163, 184, 0.04) 0 1px, transparent 1px 22px);
       }
-      .msg {
+
+      .jump {
+        position: absolute;
+        right: 18px;
+        bottom: 18px;
+        z-index: 5;
+        border-radius: 999px;
+        padding: 8px 10px;
+        font-size: 12px;
+        background: rgba(15,23,42,0.88);
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        box-shadow: 0 16px 40px rgba(0,0,0,0.25);
+      }
+      .jump.hidden { display: none; }
+
+      .msg-row { display: flex; align-items: flex-end; gap: 10px; margin: 10px 0; }
+      .msg-row.you { justify-content: flex-end; }
+      .msg-row.system { justify-content: center; }
+
+      .avatar {
+        width: 34px;
+        height: 34px;
+        border-radius: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 800;
+        font-size: 13px;
+        color: rgba(255,255,255,0.95);
+        box-shadow: 0 16px 40px rgba(0,0,0,0.25);
+        flex: 0 0 auto;
+        user-select: none;
+      }
+      .avatar.you { background: linear-gradient(180deg, rgba(96,165,250,0.95), rgba(37,99,235,0.90)); }
+      .avatar.chatgpt { background: linear-gradient(180deg, rgba(34,197,94,0.95), rgba(16,185,129,0.88)); }
+      .avatar.gemini { background: linear-gradient(180deg, rgba(245,158,11,0.95), rgba(251,191,36,0.86)); }
+      .avatar.system { background: linear-gradient(180deg, rgba(167,139,250,0.95), rgba(139,92,246,0.88)); }
+
+      .bubble {
+        max-width: 780px;
         border: 1px solid var(--border);
-        background: rgba(17,24,38,0.40);
-        border-radius: 14px;
-        padding: 12px 14px;
-        margin: 0 0 12px 0;
-        max-width: 980px;
-        box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+        background: rgba(17,24,38,0.62);
+        border-radius: 16px;
+        padding: 10px 12px;
+        box-shadow: 0 18px 48px rgba(0,0,0,0.25);
       }
-      .meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-      .who { font-weight: 600; font-size: 13px; }
-      .ts { font-size: 12px; color: var(--muted); }
-      .text { margin-top: 8px; white-space: pre-wrap; line-height: 1.55; font-size: 13px; }
-      .who.you { color: #60a5fa; }
-      .who.chatgpt { color: #22c55e; }
-      .who.gemini { color: #f59e0b; }
-      .who.system { color: #a78bfa; }
-      .footer {
+      .msg-row.you .bubble { background: rgba(96,165,250,0.16); border-color: rgba(96,165,250,0.28); }
+      .msg-row.chatgpt .bubble { border-color: rgba(34,197,94,0.28); }
+      .msg-row.gemini .bubble { border-color: rgba(245,158,11,0.28); }
+      .msg-row.system .bubble { background: rgba(148,163,184,0.10); border-color: rgba(148,163,184,0.24); text-align: center; }
+
+      .bubble-meta { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+      .name { font-weight: 750; font-size: 12px; letter-spacing: 0.2px; }
+      .name.you { color: #93c5fd; }
+      .name.chatgpt { color: #34d399; }
+      .name.gemini { color: #fbbf24; }
+      .name.system { color: #c4b5fd; }
+      .time { font-size: 11px; color: var(--muted); white-space: nowrap; }
+      .bubble-text { margin-top: 6px; white-space: pre-wrap; line-height: 1.55; font-size: 14px; }
+      .sysTime { margin-top: 6px; font-size: 11px; color: var(--muted); }
+
+      .msg-row.continued .avatar { visibility: hidden; }
+      .msg-row.continued .name { display: none; }
+
+      .composer {
         border-top: 1px solid var(--border);
-        background: rgba(15,23,42,0.55);
-        padding: 10px 18px;
+        background: rgba(15,23,42,0.60);
+        padding: 12px 18px 14px;
+        display: grid;
+        grid-template-columns: 1fr 140px;
+        gap: 12px;
+        align-items: end;
+      }
+      .composer textarea {
+        width: 100%;
+        min-height: 58px;
+        max-height: 180px;
+        resize: none;
+        padding: 12px 12px;
+        border-radius: 14px;
+        font-size: 14px;
+        line-height: 1.5;
+      }
+      .composerActions { display: flex; flex-direction: column; gap: 10px; }
+      .composerHint {
+        grid-column: 1 / -1;
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
         font-size: 12px;
         color: var(--muted);
+      }
+      .kbd {
+        display: inline-block;
+        padding: 2px 7px;
+        border-radius: 8px;
+        border: 1px solid rgba(148,163,184,0.28);
+        background: rgba(17,24,38,0.55);
+        color: rgba(229,231,235,0.95);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+        font-size: 11px;
       }
       code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
     </style>
@@ -292,12 +378,6 @@ HTML_PAGE = r"""<!doctype html>
           </div>
         </details>
 
-        <textarea id="input" placeholder="在这里插话（群主发言）..."></textarea>
-        <div class="row">
-          <button id="sendBtn" class="primary">发送</button>
-          <button id="clearBtn">清屏</button>
-        </div>
-
         <div class="hint">
           <div>说明：</div>
           <div>- 页面只汇总文本，不会嵌入 chatgpt.com / gemini.google.com（跨域限制）。</div>
@@ -307,20 +387,31 @@ HTML_PAGE = r"""<!doctype html>
         </div>
       </aside>
 
-      <main class="main">
-        <div class="topbar">
-          <div class="status">
-            <span>消息流</span>
-            <span class="pill" id="countPill">0</span>
+       <main class="main">
+         <div class="topbar">
+           <div class="status">
+             <span>消息流</span>
+             <span class="pill" id="countPill">0</span>
+           </div>
+           <div class="hint">刷新间隔 800ms，长对话建议定期清屏</div>
+         </div>
+        <div class="chatWrap">
+          <div id="chat" class="chat"></div>
+          <button id="jumpBtn" class="jump hidden" title="回到最新">↓ 新消息</button>
+        </div>
+        <div class="composer">
+          <textarea id="input" placeholder="在这里插话（群主发言）..."></textarea>
+          <div class="composerActions">
+            <button id="sendBtn" class="primary">发送</button>
+            <button id="clearBtn">清屏</button>
           </div>
-          <div class="hint">刷新间隔 800ms，长对话建议定期清屏</div>
+          <div class="composerHint">
+            <div>快捷键：<span class="kbd">Enter</span> 发送，<span class="kbd">Shift+Enter</span> 换行</div>
+            <div>上滑看历史时，不会强制拉回底部</div>
+          </div>
         </div>
-        <div id="chat" class="chat"></div>
-        <div class="footer">
-          快捷键：<code>Ctrl+Enter</code> 发送
-        </div>
-      </main>
-    </div>
+       </main>
+     </div>
 
     <script>
       let lastId = 0;
@@ -328,8 +419,10 @@ HTML_PAGE = r"""<!doctype html>
       let total = 0;
       const allMessages = [];
       const unseen = { chatgpt: 0, gemini: 0 };
+      let newBelow = 0;
 
       const chat = document.getElementById('chat');
+      const jumpBtn = document.getElementById('jumpBtn');
       const conn = document.getElementById('conn');
       const dot = document.getElementById('dot');
       const statusText = document.getElementById('statusText');
@@ -344,6 +437,14 @@ HTML_PAGE = r"""<!doctype html>
       const target = document.getElementById('target');
       const countPill = document.getElementById('countPill');
 
+      function avatarText(cls) {
+        if (cls === 'you') return '你';
+        if (cls === 'chatgpt') return 'C';
+        if (cls === 'gemini') return 'G';
+        if (cls === 'system') return '!';
+        return '?';
+      }
+
       function speakerClass(s) {
         const x = (s || '').toLowerCase();
         if (x.includes('chatgpt')) return 'chatgpt';
@@ -351,6 +452,23 @@ HTML_PAGE = r"""<!doctype html>
         if (x === 'you' || x === 'user' || x.includes('用户')) return 'you';
         if (x.includes('system') || x.includes('系统')) return 'system';
         return '';
+      }
+
+      function isNearBottom() {
+        const threshold = 140;
+        const remain = chat.scrollHeight - (chat.scrollTop + chat.clientHeight);
+        return remain < threshold;
+      }
+
+      function updateJump() {
+        if (!jumpBtn) return;
+        if (newBelow > 0 && !isNearBottom()) {
+          jumpBtn.classList.remove('hidden');
+          jumpBtn.textContent = `↓ ${newBelow} 条新消息`;
+        } else {
+          jumpBtn.classList.add('hidden');
+          newBelow = 0;
+        }
       }
 
       function currentFilter() {
@@ -370,30 +488,71 @@ HTML_PAGE = r"""<!doctype html>
       }
 
       function appendMessage(m) {
-        const div = document.createElement('div');
-        div.className = 'msg';
+        const cls = speakerClass(m.speaker);
+        const row = document.createElement('div');
+        row.className = 'msg-row ' + (cls || '');
+        row.dataset.speaker = m.speaker || '';
+
+        const prev = chat.lastElementChild;
+        if (prev && prev.dataset && prev.dataset.speaker === row.dataset.speaker && cls !== 'system') {
+          row.classList.add('continued');
+        }
+
+        if (cls === 'system') {
+          row.className = 'msg-row system';
+          const bubble = document.createElement('div');
+          bubble.className = 'bubble system';
+          const text = document.createElement('div');
+          text.className = 'bubble-text';
+          text.textContent = m.text;
+          const time = document.createElement('div');
+          time.className = 'sysTime';
+          time.textContent = m.ts;
+          bubble.appendChild(text);
+          bubble.appendChild(time);
+          row.appendChild(bubble);
+          chat.appendChild(row);
+          return;
+        }
+
+        const avatar = document.createElement('div');
+        avatar.className = 'avatar ' + (cls || '');
+        avatar.textContent = avatarText(cls);
+
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
 
         const meta = document.createElement('div');
-        meta.className = 'meta';
+        meta.className = 'bubble-meta';
 
-        const who = document.createElement('div');
-        who.className = 'who ' + speakerClass(m.speaker);
-        who.textContent = m.speaker;
+        const name = document.createElement('div');
+        name.className = 'name ' + (cls || '');
+        name.textContent = m.speaker;
 
-        const ts = document.createElement('div');
-        ts.className = 'ts';
-        ts.textContent = m.ts;
+        const time = document.createElement('div');
+        time.className = 'time';
+        time.textContent = m.ts;
 
-        meta.appendChild(who);
-        meta.appendChild(ts);
+        meta.appendChild(name);
+        meta.appendChild(time);
 
         const text = document.createElement('div');
-        text.className = 'text';
+        text.className = 'bubble-text';
         text.textContent = m.text;
 
-        div.appendChild(meta);
-        div.appendChild(text);
-        chat.appendChild(div);
+        bubble.appendChild(meta);
+        bubble.appendChild(text);
+
+        if (cls === 'you') {
+          row.classList.add('you');
+          row.appendChild(bubble);
+          row.appendChild(avatar);
+        } else {
+          row.appendChild(avatar);
+          row.appendChild(bubble);
+        }
+
+        chat.appendChild(row);
       }
 
       function updateUnseenPill() {
@@ -402,14 +561,18 @@ HTML_PAGE = r"""<!doctype html>
 
       function rerender() {
         chat.innerHTML = '';
+        newBelow = 0;
+        updateJump();
         for (const m of allMessages) {
           if (matchesFilter(m)) appendMessage(m);
         }
         scrollToBottom();
       }
 
-      function scrollToBottom() {
-        chat.scrollTop = chat.scrollHeight;
+      function scrollToBottom(smooth=false) {
+        chat.scrollTo({ top: chat.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+        newBelow = 0;
+        updateJump();
       }
 
       async function apiGet(url) {
@@ -450,10 +613,13 @@ HTML_PAGE = r"""<!doctype html>
           if (Array.isArray(msgs) && msgs.length) {
             dot.className = 'dot ok';
             conn.textContent = 'ok';
+            const stick = isNearBottom();
+            let appended = 0;
             for (const m of msgs) {
               allMessages.push(m);
               if (matchesFilter(m)) {
                 appendMessage(m);
+                appended += 1;
               } else if (m.speaker === 'ChatGPT') {
                 unseen.chatgpt += 1;
               } else if (m.speaker === 'Gemini') {
@@ -464,7 +630,14 @@ HTML_PAGE = r"""<!doctype html>
             }
             countPill.textContent = String(total);
             updateUnseenPill();
-            scrollToBottom();
+            if (appended > 0) {
+              if (stick) {
+                scrollToBottom();
+              } else {
+                newBelow += appended;
+                updateJump();
+              }
+            }
           } else {
             dot.className = 'dot ok';
             conn.textContent = 'ok';
@@ -525,21 +698,36 @@ HTML_PAGE = r"""<!doctype html>
       });
       clearBtn.addEventListener('click', () => {
         chat.innerHTML = '';
-        lastId = 0;
         total = 0;
         allMessages.length = 0;
         unseen.chatgpt = 0;
         unseen.gemini = 0;
+        newBelow = 0;
         countPill.textContent = '0';
         updateUnseenPill();
+        updateJump();
       });
 
       input.addEventListener('keydown', (ev) => {
-        if (ev.key === 'Enter' && ev.ctrlKey) {
+        // Chat-like:
+        // - Enter: send
+        // - Shift+Enter: newline
+        if (ev.key === 'Enter' && !ev.shiftKey) {
           ev.preventDefault();
           send();
         }
       });
+
+      chat.addEventListener('scroll', () => {
+        if (isNearBottom()) {
+          newBelow = 0;
+          updateJump();
+        }
+      });
+
+      if (jumpBtn) {
+        jumpBtn.addEventListener('click', () => scrollToBottom(true));
+      }
 
       updateUnseenPill();
       loadRules();
