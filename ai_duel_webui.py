@@ -34,21 +34,20 @@ DEFAULT_PORT = 8765
 MAX_MESSAGES = 1500
 
 # “对话规则”会被作为用户消息的一部分发送到网页端模型（无法真正注入 system prompt）。
-# 目标：更短、更结构化；允许联网获取事实，但“结论/洞见/权衡”必须独立推理而非“搜索答案式”复述。
+# 目标：更短、更像人说话；允许联网获取事实，但“结论/洞见/权衡”必须独立推理而非“搜索答案式”复述。
 DEFAULT_RULES = """【对话规则】
-- 允许联网：仅在需要“最新事实/具体数据/可核验信息”时联网；联网只用于获取【事实】，不要把搜索结果当结论。
-- 输出结构必须包含这些段落：
-  - 【结论】1 句（<= 20 字）
-  - 【事实】3-6 条（每条 <= 24 字；如提来源只写站点名，不贴 URL）
-  - 【分析】3-6 条（每条 <= 24 字；写因果/权衡/假设，而不是复述网页）
-- 必须给 1 个反例/边界条件，避免空泛。
+- 语气像正常人聊天：自然、有温度，但不要废话。
+- 禁止“编号式模板”（不要 1/2/3/4 逐条报菜名）。可以分 2-4 个短段落，或极少量要点（<=3）。
+- 允许联网：仅在需要“最新事实/具体数据/可核验信息”时联网；联网只用于补充事实，不要把网页复述当结论。
+- 争论时要抓重点：先用 1 句复述对方核心主张（不超过 25 字），再用 2-4 句给出最关键的反驳/补充。
+- 必须给 1 个反例/边界条件（1 句即可），避免空泛。
 - 最后给 1 个追问，推动更深一步讨论。
-- 总长度尽量 <= 420 字。
-- 末尾追加一段【转发摘要】（<= 120 字），供另一模型阅读（用于对话接续，不要写元信息）。
+- 总长度尽量 <= 320 字。
+- 末尾追加一段【转发摘要】（<= 120 字），只写关键观点，供另一模型接续（不要写元信息/不要说“我将转发”）。
 """.strip()
 
 # 每轮轻量提醒：避免模型“跑偏”回长文/检索式回答
-RULES_REMINDER = "【提醒】可联网抓事实，但结论/分析要独立推理；按结构输出：结论/事实/分析/反例/追问；末尾带【转发摘要】。"
+RULES_REMINDER = "【提醒】像人说话但要短；别用 1/2/3 模板；可联网补事实但结论要自己推理；抓住对方核心点反驳；末尾带【转发摘要】。"
 
 # 转发给另一模型的内容长度上限（过长会导致输入卡顿，也会让对话越来越发散）
 FORWARD_MAX_CHARS = 900
@@ -697,6 +696,21 @@ def _pick_forward_payload(full_reply: str) -> str:
     return compact
 
 
+def _strip_forward_summary(full_reply: str) -> str:
+    """
+    为了让 UI 里看起来更像“正常聊天”，把末尾的【转发摘要】从展示文本中移除。
+    该摘要仍会用于模型间转发（见 _pick_forward_payload）。
+    """
+    text = core.normalize_text(full_reply)
+    if not text:
+        return ""
+    matches = list(re.finditer(r"【转发摘要】\s*[:：]?\s*", text))
+    if not matches:
+        return text
+    body = text[: matches[-1].start()].rstrip()
+    return body or text
+
+
 def _compose_shadow_sync_message(source_site: str, user_text: str, source_reply: str) -> str:
     """
     把“当前主对话模型”的这一轮（用户 + 主模型回复）同步给另一个模型，让它在后台生成自己的回复。
@@ -714,8 +728,10 @@ def _compose_shadow_sync_message(source_site: str, user_text: str, source_reply:
             "【系统提示（旁听同步）】",
             "- 你现在处于“隐藏回复”模式：你的回复不会立刻展示给用户，用户稍后才会查看。",
             "- 用户可能尚未阅读你之前的回复：不要用“如我上面所说”等依赖已读的指代；如需引用，请简要重述关键点。",
-            "- 禁止联网搜索/禁止引用外链；仅基于你自身的知识与推理回答。",
-            "- 回复请尽量精炼：先 1 句话结论，再列 3-6 个要点。",
+            "- 像正常人聊天：自然、有温度，但要短；不要用 1/2/3 模板。",
+            "- 允许联网：仅在需要最新事实/数据时联网；只补充事实，不要复述网页当结论；不要贴 URL。",
+            "- 抓重点：先用 1 句复述对方核心主张，再用 2-4 句回应（反驳/补充）。",
+            "- 末尾加【转发摘要】<=120字，只写关键观点。",
             "- 不要在回复中提及“隐藏/旁听/未读”等元信息，直接正常回答即可。",
         ]
     ).strip()
@@ -849,8 +865,11 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                         if not has_new:
                             continue
 
-                        reply = core.read_stable_text(lambda: core.extract_chatgpt_last_reply(page), "ChatGPT", rounds=6)
-                        state.add_message("ChatGPT", reply or "（ChatGPT 回复为空或提取失败）")
+                        reply = core.read_stable_text(
+                            lambda: core.extract_chatgpt_last_reply(page), "ChatGPT", rounds=6
+                        )
+                        display = _strip_forward_summary(reply)
+                        state.add_message("ChatGPT", display or "（ChatGPT 回复为空或提取失败）")
                         shadow_inflight[site] = None
                         return True
 
@@ -865,7 +884,8 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                             continue
 
                         reply = core.read_stable_text(lambda: core.extract_gemini_last_reply(page), "Gemini", rounds=6)
-                        state.add_message("Gemini", reply or "（Gemini 回复为空或提取失败）")
+                        display = _strip_forward_summary(reply)
+                        state.add_message("Gemini", display or "（Gemini 回复为空或提取失败）")
                         shadow_inflight[site] = None
                         return True
                 except Exception:
@@ -953,14 +973,18 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
 
                         state.set_status("broadcast: waiting ChatGPT")
                         core.wait_chatgpt_generation_done(page_chatgpt, prev_a)
-                        reply_a = core.read_stable_text(lambda: core.extract_chatgpt_last_reply(page_chatgpt), "ChatGPT")
-                        mid_a = state.add_message("ChatGPT", reply_a or "（ChatGPT 回复为空或提取失败）")
+                        reply_a = core.read_stable_text(
+                            lambda: core.extract_chatgpt_last_reply(page_chatgpt), "ChatGPT"
+                        )
+                        display_a = _strip_forward_summary(reply_a)
+                        mid_a = state.add_message("ChatGPT", display_a or "（ChatGPT 回复为空或提取失败）")
                         seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], mid_a)
 
                         state.set_status("broadcast: waiting Gemini")
                         core.wait_gemini_generation_done(page_gemini, prev_b)
                         reply_b = core.read_stable_text(lambda: core.extract_gemini_last_reply(page_gemini), "Gemini")
-                        mid_b = state.add_message("Gemini", reply_b or "（Gemini 回复为空或提取失败）")
+                        display_b = _strip_forward_summary(reply_b)
+                        mid_b = state.add_message("Gemini", display_b or "（Gemini 回复为空或提取失败）")
                         seen_upto["Gemini"] = max(seen_upto["Gemini"], mid_b)
                     except Exception as exc:
                         tb = traceback.format_exc(limit=10)
@@ -1001,7 +1025,8 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                         extra = core.read_stable_text(
                             lambda: core.extract_chatgpt_last_reply(page_chatgpt), "ChatGPT", rounds=6
                         )
-                        state.add_message("ChatGPT", extra or "（ChatGPT 回复为空或提取失败）")
+                        display_extra = _strip_forward_summary(extra)
+                        state.add_message("ChatGPT", display_extra or "（ChatGPT 回复为空或提取失败）")
                         shadow_inflight["ChatGPT"] = None
                     core.send_message(page_chatgpt, "ChatGPT", _with_rules("ChatGPT", pending_text))
                     seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], int(pending_upto_mid or 0))
@@ -1009,7 +1034,8 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                     reply = core.read_stable_text(lambda: core.extract_chatgpt_last_reply(page_chatgpt), "ChatGPT")
                     if not reply:
                         reply = "（ChatGPT 回复为空或提取失败）"
-                    reply_mid = state.add_message("ChatGPT", reply)
+                    display = _strip_forward_summary(reply)
+                    reply_mid = state.add_message("ChatGPT", display or "（ChatGPT 回复为空或提取失败）")
                     seen_upto["ChatGPT"] = max(seen_upto["ChatGPT"], reply_mid)
                     if auto_duel:
                         pending_text = _format_forward("ChatGPT", _pick_forward_payload(reply))
@@ -1038,8 +1064,11 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                         core.warn("Gemini 仍在后台生成上一条同步消息，先等待完成以保证上下文一致...")
                         prev0 = int(infl.get("prev_count") or 0)
                         core.wait_gemini_generation_done(page_gemini, prev0)
-                        extra = core.read_stable_text(lambda: core.extract_gemini_last_reply(page_gemini), "Gemini", rounds=6)
-                        state.add_message("Gemini", extra or "（Gemini 回复为空或提取失败）")
+                        extra = core.read_stable_text(
+                            lambda: core.extract_gemini_last_reply(page_gemini), "Gemini", rounds=6
+                        )
+                        display_extra = _strip_forward_summary(extra)
+                        state.add_message("Gemini", display_extra or "（Gemini 回复为空或提取失败）")
                         shadow_inflight["Gemini"] = None
                     core.send_message(page_gemini, "Gemini", _with_rules("Gemini", pending_text))
                     seen_upto["Gemini"] = max(seen_upto["Gemini"], int(pending_upto_mid or 0))
@@ -1047,7 +1076,8 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                     reply = core.read_stable_text(lambda: core.extract_gemini_last_reply(page_gemini), "Gemini")
                     if not reply:
                         reply = "（Gemini 回复为空或提取失败）"
-                    reply_mid = state.add_message("Gemini", reply)
+                    display = _strip_forward_summary(reply)
+                    reply_mid = state.add_message("Gemini", display or "（Gemini 回复为空或提取失败）")
                     seen_upto["Gemini"] = max(seen_upto["Gemini"], reply_mid)
                     if auto_duel:
                         pending_text = _format_forward("Gemini", _pick_forward_payload(reply))
