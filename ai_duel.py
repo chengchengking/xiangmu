@@ -387,9 +387,12 @@ def wait_chatgpt_generation_done(page: Page, previous_count: int, timeout_s: int
         if stop_visible or has_new_assistant:
             started = True
 
+        # 关键：不能强依赖 Send 按钮是否可见。
+        # 现实中 ChatGPT 的输入区偶尔会因为 UI 卡顿/重渲染暂时不可见（你截图里就是这种情况），
+        # 这会导致 send_visible=False，从而旧逻辑永远无法累计 stable_hits，最终“卡死”在等待生成结束。
         if stop_visible:
             stable_hits = 0
-        elif started and send_visible and has_new_assistant:
+        elif started and has_new_assistant:
             stable_hits += 1
         else:
             stable_hits = 0
