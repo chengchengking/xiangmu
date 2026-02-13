@@ -2,5 +2,6 @@ __pycache__/
 *.pyc
 user_data/
 .tmp/
+.vscode/
 error.log
 .probe_mirror_speed.py
