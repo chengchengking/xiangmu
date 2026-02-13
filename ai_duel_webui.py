@@ -240,10 +240,10 @@ HTML_PAGE = r"""<!doctype html>
 
         <div class="row">
           <select id="target">
-            <option value="next" selected>发给下一位（推荐）</option>
-            <option value="chatgpt">只发给 ChatGPT</option>
-            <option value="gemini">只发给 Gemini</option>
-            <option value="both">广播给两边（每边回复一次）</option>
+            <option value="next" selected>互怼模式（A↔B 自动转发）</option>
+            <option value="chatgpt">前台 ChatGPT（Gemini 后台同步）</option>
+            <option value="gemini">前台 Gemini（ChatGPT 后台同步）</option>
+            <option value="both">广播两边（各回复一次，随后暂停）</option>
           </select>
         </div>
 
@@ -258,6 +258,7 @@ HTML_PAGE = r"""<!doctype html>
           <div>- 页面只汇总文本，不会嵌入 chatgpt.com / gemini.google.com（跨域限制）。</div>
           <div>- 底层仍会打开一个 Playwright 浏览器（你可以最小化它）。</div>
           <div>- 如果出现验证码/风控/弹窗，仍需你在原网页手动处理。</div>
+          <div>- 两个模型平等：选择“前台 ChatGPT/Gemini”仅影响你当前看到哪一边；另一边仍会后台同步并生成回复，计入“未读”。</div>
         </div>
       </aside>
 

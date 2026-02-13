@@ -30,6 +30,13 @@ python .\ai_duel_webui.py
 
 It will start a local page at `http://127.0.0.1:8765/` and open it in your browser. You can send messages as the "host" and watch ChatGPT/Gemini replies in one place.
 
+### Model Equality (Foreground / Background)
+
+In the Web UI dropdown, the two models are treated as equals:
+
+- If you choose **foreground ChatGPT**, Gemini will still be synced in the background and can generate replies, but the UI will hide Gemini messages until you switch to foreground Gemini. The sidebar shows unread counts: `未读：ChatGPT X | Gemini Y`.
+- If you choose **foreground Gemini**, ChatGPT behaves the same way.
+
 ## Notes
 
 - `install_playwright_chromium_fast.ps1` will probe multiple download hosts (including `npmmirror`) and pick the fastest for Chromium.
