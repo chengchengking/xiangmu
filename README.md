@@ -20,9 +20,18 @@ powershell -ExecutionPolicy Bypass -File .\install_playwright_chromium_fast.ps1
 python .\ai_duel.py
 ```
 
+## Web UI (3-person group chat)
+
+If you don't want to stare at the two web pages, use the local Web UI:
+
+```powershell
+python .\ai_duel_webui.py
+```
+
+It will start a local page at `http://127.0.0.1:8765/` and open it in your browser. You can send messages as the "host" and watch ChatGPT/Gemini replies in one place.
+
 ## Notes
 
 - `install_playwright_chromium_fast.ps1` will probe multiple download hosts (including `npmmirror`) and pick the fastest for Chromium.
 - If download errors like `stream disconnected before completion: ... error decoding response body` occur, the script will back off and retry automatically.
 - `ai_duel.py` uses a persistent Playwright profile directory at `.\user_data\` so you can log in once and reuse the session.
-
