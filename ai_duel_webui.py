@@ -228,7 +228,7 @@ HTML_PAGE = r"""<!doctype html>
             <option value="next" selected>发给下一位（推荐）</option>
             <option value="chatgpt">只发给 ChatGPT</option>
             <option value="gemini">只发给 Gemini</option>
-            <option value="both">广播给两边（实验）</option>
+            <option value="both">广播给两边（每边回复一次）</option>
           </select>
         </div>
 
@@ -575,7 +575,8 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
         state.add_message("You", seed_message)
 
         next_site = "ChatGPT"
-        pending_text = _format_user(seed_message)
+        pending_text: Optional[str] = _format_user(seed_message)
+        auto_duel = True  # 仅当目标为“发给下一位”时，才持续把回复转发给另一边
 
         while not state.should_stop():
             if state.is_paused():
@@ -597,33 +598,52 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
 
                 if to == "chatgpt":
                     next_site = "ChatGPT"
+                    auto_duel = False
                 elif to == "gemini":
                     next_site = "Gemini"
+                    auto_duel = False
                 elif to == "both":
-                    # “广播”按顺序执行：ChatGPT -> Gemini；最后继续由 Gemini 的回复进入互怼链条
-                    for site in ("ChatGPT", "Gemini"):
-                        state.set_status(f"sending user -> {site}")
-                        page = page_chatgpt if site == "ChatGPT" else page_gemini
-                        prev = core.count_chatgpt_assistant_messages(page) if site == "ChatGPT" else core.count_gemini_responses(page)
-                        core.send_message(page, site, _format_user(user_text))
-                        if site == "ChatGPT":
-                            core.wait_chatgpt_generation_done(page, prev)
-                            reply = core.read_stable_text(lambda: core.extract_chatgpt_last_reply(page), "ChatGPT")
-                        else:
-                            core.wait_gemini_generation_done(page, prev)
-                            reply = core.read_stable_text(lambda: core.extract_gemini_last_reply(page), "Gemini")
-                        state.add_message(site, reply)
+                    # “广播”语义：把用户消息发给两边，让两边各自回复一次，然后停在这里等待下一条用户消息。
+                    # 这样更像“群聊”，也能显著减少自动互怼带来的高频请求（更稳、更不容易触发风控）。
+                    auto_duel = False
+                    broadcast_text = _format_user(user_text)
 
-                        # 下一轮把该 bot 的回复作为 pending，继续互怼
-                        pending_text = _format_forward(site, reply)
-                        next_site = _other(site)
+                    try:
+                        state.set_status("broadcast: sending user -> ChatGPT + Gemini")
+                        prev_a = core.count_chatgpt_assistant_messages(page_chatgpt)
+                        prev_b = core.count_gemini_responses(page_gemini)
+                        core.send_message(page_chatgpt, "ChatGPT", broadcast_text)
+                        core.send_message(page_gemini, "Gemini", broadcast_text)
+
+                        state.set_status("broadcast: waiting ChatGPT")
+                        core.wait_chatgpt_generation_done(page_chatgpt, prev_a)
+                        reply_a = core.read_stable_text(lambda: core.extract_chatgpt_last_reply(page_chatgpt), "ChatGPT")
+                        state.add_message("ChatGPT", reply_a or "（ChatGPT 回复为空或提取失败）")
+
+                        state.set_status("broadcast: waiting Gemini")
+                        core.wait_gemini_generation_done(page_gemini, prev_b)
+                        reply_b = core.read_stable_text(lambda: core.extract_gemini_last_reply(page_gemini), "Gemini")
+                        state.add_message("Gemini", reply_b or "（Gemini 回复为空或提取失败）")
+                    except Exception as exc:
+                        tb = traceback.format_exc(limit=10)
+                        state.add_message("System", f"广播异常：{exc}\n{tb}")
+                        state.set_status("error (check web pages)")
+                    finally:
+                        pending_text = None
+                        state.set_status("waiting user input")
 
                     drained += 1
                     continue
 
                 # 默认：发给下一位（维持互怼的“单线程”节奏）
+                auto_duel = True
                 pending_text = _format_user(user_text)
                 drained += 1
+
+            if pending_text is None:
+                state.set_status("waiting user input")
+                time.sleep(0.25)
+                continue
 
             # 执行一轮：把 pending_text 发送给 next_site，等待生成完成，提取回复，然后转发给另一位
             try:
@@ -636,8 +656,12 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                     if not reply:
                         reply = "（ChatGPT 回复为空或提取失败）"
                     state.add_message("ChatGPT", reply)
-                    pending_text = _format_forward("ChatGPT", reply)
-                    next_site = "Gemini"
+                    if auto_duel:
+                        pending_text = _format_forward("ChatGPT", reply)
+                        next_site = "Gemini"
+                    else:
+                        pending_text = None
+                        state.set_status("waiting user input")
                 else:
                     state.set_status("Gemini generating")
                     prev = core.count_gemini_responses(page_gemini)
@@ -647,8 +671,12 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
                     if not reply:
                         reply = "（Gemini 回复为空或提取失败）"
                     state.add_message("Gemini", reply)
-                    pending_text = _format_forward("Gemini", reply)
-                    next_site = "ChatGPT"
+                    if auto_duel:
+                        pending_text = _format_forward("Gemini", reply)
+                        next_site = "ChatGPT"
+                    else:
+                        pending_text = None
+                        state.set_status("waiting user input")
             except Exception as exc:
                 # 任何异常都写到 UI，方便你看到，并给你机会手动处理网页上的风控/弹窗
                 tb = traceback.format_exc(limit=10)
