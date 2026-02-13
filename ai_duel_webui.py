@@ -52,6 +52,26 @@ RULES_REMINDER = "【提醒】像人说话但要短；别用 1/2/3 模板；可�
 # 转发给另一模型的内容长度上限（过长会导致输入卡顿，也会让对话越来越发散）
 FORWARD_MAX_CHARS = 900
 
+# 模型槽位（UI 左侧 1..10）
+# 说明：
+# - enabled=False 表示“UI 可见但暂未接入自动化”；会以灰色不可点击展示。
+# - 未来要接入更多模型：为每个模型补齐 Playwright 适配器（发送/等待/提取）后，把 enabled 改为 True。
+MODEL_SLOTS: list[dict[str, Any]] = [
+    {"slot": 1, "key": "chatgpt", "name": "ChatGPT", "enabled": True},
+    {"slot": 2, "key": "gemini", "name": "Gemini", "enabled": True},
+    {"slot": 3, "key": "deepseek", "name": "DeepSeek", "enabled": False},
+    {"slot": 4, "key": "doubao", "name": "豆包", "enabled": False},
+    {"slot": 5, "key": "qwen", "name": "通义千问", "enabled": False},
+    {"slot": 6, "key": "kimi", "name": "Kimi", "enabled": False},
+    {"slot": 7, "key": "zhipu", "name": "智谱", "enabled": False},
+    {"slot": 8, "key": "claude", "name": "Claude", "enabled": False},
+    {"slot": 9, "key": "glmm", "name": "GLM", "enabled": False},
+    {"slot": 10, "key": "other", "name": "Other", "enabled": False},
+]
+
+# 默认启用：和当前代码一致（ChatGPT + Gemini）
+DEFAULT_SELECTED_KEYS = ["chatgpt", "gemini"]
+
 
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -75,6 +95,9 @@ class SharedState:
         self._stop: bool = False
         self._rules: str = DEFAULT_RULES
         self._rules_version: int = 1
+        self._session_started: bool = False
+        self._selected_keys: list[str] = list(DEFAULT_SELECTED_KEYS)
+        self._start_event = threading.Event()
         self.inbox: "queue.Queue[dict[str, Any]]" = queue.Queue()
 
     def add_message(self, speaker: str, text: str) -> int:
@@ -96,7 +119,13 @@ class SharedState:
 
     def get_state(self) -> dict[str, Any]:
         with self._lock:
-            return {"status": self._status, "paused": self._paused, "stop": self._stop}
+            return {
+                "status": self._status,
+                "paused": self._paused,
+                "stop": self._stop,
+                "session_started": self._session_started,
+                "selected_keys": list(self._selected_keys),
+            }
 
     def set_paused(self, paused: bool) -> None:
         with self._lock:
@@ -109,10 +138,53 @@ class SharedState:
     def request_stop(self) -> None:
         with self._lock:
             self._stop = True
+        self._start_event.set()
 
     def should_stop(self) -> bool:
         with self._lock:
             return self._stop
+
+    def get_models(self) -> dict[str, Any]:
+        with self._lock:
+            slots = []
+            selected = set(self._selected_keys)
+            for s in MODEL_SLOTS:
+                item = dict(s)
+                item["selected"] = bool(item.get("key") in selected)
+                item["session_started"] = self._session_started
+                slots.append(item)
+            return {
+                "session_started": self._session_started,
+                "selected_keys": list(self._selected_keys),
+                "slots": slots,
+            }
+
+    def set_selected_keys(self, keys: list[str]) -> dict[str, Any]:
+        # 只能在 session 启动前修改
+        cleaned: list[str] = []
+        allowed = {str(s.get("key") or "") for s in MODEL_SLOTS if s.get("enabled")}
+        for k in keys:
+            k = str(k).strip().lower()
+            if not k:
+                continue
+            if k in allowed and k not in cleaned:
+                cleaned.append(k)
+        if not cleaned:
+            cleaned = list(DEFAULT_SELECTED_KEYS)
+        with self._lock:
+            if not self._session_started:
+                self._selected_keys = cleaned
+        return self.get_models()
+
+    def start_session(self) -> dict[str, Any]:
+        with self._lock:
+            if not self._session_started:
+                self._session_started = True
+        self._start_event.set()
+        return self.get_models()
+
+    def wait_for_session_start(self, timeout_s: int = 3600) -> bool:
+        return self._start_event.wait(timeout=timeout_s)
 
     def get_messages_after(self, after_id: int) -> list[dict[str, Any]]:
         with self._lock:
@@ -175,7 +247,78 @@ HTML_PAGE = r"""<!doctype html>
         color: var(--text);
         font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial;
       }
-      .app { display: grid; grid-template-columns: 360px 1fr; height: 100%; }
+      .app { display: grid; grid-template-columns: 96px 1fr; height: 100%; }
+      .modelbar {
+        border-right: 1px solid var(--border);
+        background: linear-gradient(180deg, rgba(17,24,38,0.95), rgba(15,23,42,0.85));
+        padding: 12px 10px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        align-items: center;
+      }
+      .modelList { display: flex; flex-direction: column; gap: 10px; align-items: center; }
+      .modelBtn {
+        width: 64px;
+        height: 64px;
+        padding: 0;
+        border-radius: 18px;
+        display: grid;
+        place-items: center;
+        position: relative;
+        border: 1px solid rgba(148,163,184,0.30);
+        background: rgba(17,24,38,0.55);
+        cursor: pointer;
+        transition: transform 120ms ease, border-color 120ms ease, filter 120ms ease, opacity 120ms ease;
+        user-select: none;
+      }
+      .modelBtn:hover { transform: translateY(-1px); border-color: rgba(148,163,184,0.45); }
+      .modelBtn:active { transform: translateY(0px) scale(0.98); }
+      .modelBtn.off { filter: grayscale(1); opacity: 0.48; }
+      .modelBtn.disabled { filter: grayscale(1); opacity: 0.30; cursor: not-allowed; }
+      .modelBtn.on { border-color: rgba(34,197,94,0.40); box-shadow: 0 18px 48px rgba(0,0,0,0.25); }
+      .modelNum {
+        width: 46px;
+        height: 46px;
+        border-radius: 14px;
+        display: grid;
+        place-items: center;
+        font-weight: 900;
+        font-size: 18px;
+        color: rgba(255,255,255,0.95);
+        border: 1px solid rgba(0,0,0,0.18);
+        box-shadow: 0 14px 28px rgba(0,0,0,0.22);
+      }
+      .modelNum.chatgpt { background: linear-gradient(180deg, rgba(34,197,94,0.95), rgba(16,185,129,0.86)); }
+      .modelNum.gemini { background: linear-gradient(180deg, rgba(245,158,11,0.95), rgba(251,191,36,0.86)); }
+      .modelNum.other { background: linear-gradient(180deg, rgba(96,165,250,0.95), rgba(37,99,235,0.86)); }
+      .badge {
+        position: absolute;
+        top: -8px;
+        right: -8px;
+        min-width: 18px;
+        height: 18px;
+        padding: 0 6px;
+        border-radius: 999px;
+        background: rgba(239,68,68,0.90);
+        color: rgba(255,255,255,0.98);
+        font-weight: 800;
+        font-size: 11px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid rgba(0,0,0,0.18);
+      }
+      .badge.hidden { display: none; }
+      .modelStart {
+        width: 64px;
+        padding: 10px 0;
+        border-radius: 18px;
+        border: 1px solid rgba(34,197,94,0.40);
+        background: rgba(34,197,94,0.16);
+        font-weight: 800;
+      }
+      .content { display: grid; grid-template-columns: 360px 1fr; height: 100%; min-width: 0; }
       .sidebar {
         border-right: 1px solid var(--border);
         background: linear-gradient(180deg, rgba(17,24,38,0.95), rgba(15,23,42,0.85));
@@ -183,6 +326,7 @@ HTML_PAGE = r"""<!doctype html>
         display: flex;
         flex-direction: column;
         gap: 12px;
+        min-width: 0;
       }
       .brand { display: flex; align-items: baseline; gap: 10px; }
       .brand h1 { margin: 0; font-size: 18px; letter-spacing: 0.4px; }
@@ -343,6 +487,12 @@ HTML_PAGE = r"""<!doctype html>
   </head>
   <body>
     <div class="app">
+      <aside class="modelbar">
+        <div id="modelList" class="modelList"></div>
+        <button id="startSessionBtn" class="modelStart">启动</button>
+      </aside>
+
+      <div class="content">
       <aside class="sidebar">
         <div class="brand">
           <h1>AI 群聊控制台</h1>
@@ -387,7 +537,7 @@ HTML_PAGE = r"""<!doctype html>
         </div>
       </aside>
 
-       <main class="main">
+      <main class="main">
          <div class="topbar">
            <div class="status">
              <span>消息流</span>
@@ -410,8 +560,9 @@ HTML_PAGE = r"""<!doctype html>
             <div>上滑看历史时，不会强制拉回底部</div>
           </div>
         </div>
-       </main>
-     </div>
+      </main>
+      </div>
+    </div>
 
     <script>
       let lastId = 0;
@@ -420,9 +571,14 @@ HTML_PAGE = r"""<!doctype html>
       const allMessages = [];
       const unseen = { chatgpt: 0, gemini: 0 };
       let newBelow = 0;
+      let sessionStarted = false;
+      let modelSlots = [];
+      let selectedKeys = new Set();
 
       const chat = document.getElementById('chat');
       const jumpBtn = document.getElementById('jumpBtn');
+      const modelList = document.getElementById('modelList');
+      const startSessionBtn = document.getElementById('startSessionBtn');
       const conn = document.getElementById('conn');
       const dot = document.getElementById('dot');
       const statusText = document.getElementById('statusText');
@@ -452,6 +608,132 @@ HTML_PAGE = r"""<!doctype html>
         if (x === 'you' || x === 'user' || x.includes('用户')) return 'you';
         if (x.includes('system') || x.includes('系统')) return 'system';
         return '';
+      }
+
+      function modelNumClass(key) {
+        const k = (key || '').toLowerCase();
+        if (k === 'chatgpt') return 'chatgpt';
+        if (k === 'gemini') return 'gemini';
+        return 'other';
+      }
+
+      function setUiEnabled(enabled) {
+        input.disabled = !enabled;
+        sendBtn.disabled = !enabled;
+        target.disabled = !enabled;
+        pauseBtn.disabled = !enabled;
+        clearBtn.disabled = !enabled;
+        if (!enabled) {
+          input.placeholder = '先在左侧选择模型并点击「启动」...';
+        } else {
+          input.placeholder = '在这里插话（群主发言）...';
+        }
+      }
+
+      function updateModelBadges() {
+        if (!modelList) return;
+        const badges = modelList.querySelectorAll('.badge');
+        for (const b of badges) {
+          const key = b.getAttribute('data-key') || '';
+          let n = 0;
+          if (key === 'chatgpt') n = unseen.chatgpt || 0;
+          if (key === 'gemini') n = unseen.gemini || 0;
+          if (n > 0) {
+            b.textContent = String(n);
+            b.classList.remove('hidden');
+          } else {
+            b.classList.add('hidden');
+          }
+        }
+      }
+
+      function applyTargetForKey(key) {
+        const k = (key || '').toLowerCase();
+        if (k === 'chatgpt') target.value = 'chatgpt';
+        else if (k === 'gemini') target.value = 'gemini';
+        else target.value = 'next';
+        // 切换视图时清零对应未读
+        const f = currentFilter();
+        if (f.chatgpt) unseen.chatgpt = 0;
+        if (f.gemini) unseen.gemini = 0;
+        updateUnseenPill();
+        updateModelBadges();
+        rerender();
+      }
+
+      function renderModels() {
+        if (!modelList) return;
+        modelList.innerHTML = '';
+
+        for (const slot of (modelSlots || [])) {
+          const key = String(slot.key || '').toLowerCase();
+          const name = String(slot.name || key || 'model');
+          const slotNo = String(slot.slot || '');
+          const enabled = !!slot.enabled;
+          const selected = selectedKeys.has(key);
+
+          const btn = document.createElement('button');
+          btn.className = 'modelBtn';
+          btn.setAttribute('type', 'button');
+          btn.setAttribute('data-key', key);
+          btn.title = enabled ? `${slotNo}. ${name}` : `${slotNo}. ${name}（待接入）`;
+
+          if (!enabled) btn.classList.add('disabled');
+          else if (selected) btn.classList.add('on');
+          else btn.classList.add('off');
+
+          const inner = document.createElement('div');
+          inner.className = 'modelNum ' + modelNumClass(key);
+          inner.textContent = slotNo;
+
+          const badge = document.createElement('div');
+          badge.className = 'badge hidden';
+          badge.setAttribute('data-key', key);
+
+          btn.appendChild(inner);
+          btn.appendChild(badge);
+
+          btn.addEventListener('click', async () => {
+            if (!enabled) return;
+            if (!sessionStarted) {
+              // 选择阶段：点击表示“启用/禁用”
+              if (selectedKeys.has(key)) selectedKeys.delete(key);
+              else selectedKeys.add(key);
+              try {
+                const resp = await apiPost('/api/models/select', { keys: Array.from(selectedKeys) });
+                if (resp && resp.selected_keys) selectedKeys = new Set(resp.selected_keys.map(x => String(x).toLowerCase()));
+                if (resp && resp.slots) modelSlots = resp.slots;
+                renderModels();
+                updateModelBadges();
+              } catch (e) {
+                alert('更新模型选择失败：' + e);
+              }
+              return;
+            }
+
+            // 启动后：点击用于切换“查看焦点”（不改变启用集合）
+            applyTargetForKey(key);
+          });
+
+          modelList.appendChild(btn);
+        }
+
+        updateModelBadges();
+      }
+
+      async function loadModels() {
+        try {
+          const data = await apiGet('/api/models');
+          sessionStarted = !!(data && data.session_started);
+          const keys = (data && data.selected_keys) ? data.selected_keys : [];
+          selectedKeys = new Set((keys || []).map(x => String(x).toLowerCase()));
+          modelSlots = (data && data.slots) ? data.slots : [];
+          renderModels();
+          if (startSessionBtn) startSessionBtn.style.display = sessionStarted ? 'none' : 'inline-block';
+          setUiEnabled(sessionStarted);
+        } catch (e) {
+          // ignore
+        }
       }
 
       function isNearBottom() {
@@ -587,7 +869,16 @@ HTML_PAGE = r"""<!doctype html>
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload || {}),
         });
-        if (!r.ok) throw new Error('HTTP ' + r.status);
+        if (!r.ok) {
+          let msg = 'HTTP ' + r.status;
+          try {
+            const j = await r.json();
+            if (j && j.error) msg = msg + ': ' + String(j.error);
+          } catch (e) {
+            // ignore
+          }
+          throw new Error(msg);
+        }
         return await r.json();
       }
 
@@ -608,6 +899,14 @@ HTML_PAGE = r"""<!doctype html>
           statusText.textContent = state.status || '';
           paused = !!state.paused;
           pauseBtn.textContent = paused ? '继续' : '暂停';
+          if (typeof state.session_started !== 'undefined') {
+            const started = !!state.session_started;
+            if (started !== sessionStarted) {
+              sessionStarted = started;
+              // 会话状态发生变化时，刷新模型栏与控件状态
+              loadModels();
+            }
+          }
 
           const msgs = await apiGet('/api/messages?after=' + lastId);
           if (Array.isArray(msgs) && msgs.length) {
@@ -630,6 +929,7 @@ HTML_PAGE = r"""<!doctype html>
             }
             countPill.textContent = String(total);
             updateUnseenPill();
+            updateModelBadges();
             if (appended > 0) {
               if (stick) {
                 scrollToBottom();
@@ -679,6 +979,24 @@ HTML_PAGE = r"""<!doctype html>
         }
       });
 
+      if (startSessionBtn) {
+        startSessionBtn.addEventListener('click', async () => {
+          if (sessionStarted) return;
+          startSessionBtn.disabled = true;
+          const oldText = startSessionBtn.textContent;
+          startSessionBtn.textContent = '启动中';
+          try {
+            await apiPost('/api/session/start', {});
+            await loadModels();
+          } catch (e) {
+            alert('启动失败：' + e);
+          } finally {
+            startSessionBtn.disabled = false;
+            startSessionBtn.textContent = oldText;
+          }
+        });
+      }
+
       saveRulesBtn.addEventListener('click', async () => {
         try {
           await apiPost('/api/rules', { rules: rulesInput.value || '' });
@@ -694,6 +1012,7 @@ HTML_PAGE = r"""<!doctype html>
         if (f.chatgpt) unseen.chatgpt = 0;
         if (f.gemini) unseen.gemini = 0;
         updateUnseenPill();
+        updateModelBadges();
         rerender();
       });
       clearBtn.addEventListener('click', () => {
@@ -705,6 +1024,7 @@ HTML_PAGE = r"""<!doctype html>
         newBelow = 0;
         countPill.textContent = '0';
         updateUnseenPill();
+        updateModelBadges();
         updateJump();
       });
 
@@ -729,8 +1049,11 @@ HTML_PAGE = r"""<!doctype html>
         jumpBtn.addEventListener('click', () => scrollToBottom(true));
       }
 
+      // 默认：未启动前禁止输入；模型选择 + 启动后再放开
+      setUiEnabled(false);
       updateUnseenPill();
       loadRules();
+      loadModels();
       poll();
     </script>
   </body>
@@ -780,6 +1103,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(self.state.get_state())
             return
 
+        if parsed.path == "/api/models":
+            self._send_json(self.state.get_models())
+            return
+
         if parsed.path == "/api/messages":
             q = urllib.parse.parse_qs(parsed.query)
             after_s = (q.get("after") or ["0"])[0]
@@ -800,7 +1127,32 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         data = self._read_json_body()
 
+        if parsed.path == "/api/models/select":
+            keys = data.get("keys")
+            if not isinstance(keys, list):
+                keys = []
+            payload = self.state.set_selected_keys([str(x) for x in keys])
+            self._send_json({"ok": True, **payload})
+            return
+
+        if parsed.path == "/api/session/start":
+            info = self.state.get_models()
+            selected = set(info.get("selected_keys") or [])
+            # 目前仅接入 ChatGPT + Gemini；先强制选择 1/2，避免“只选了未接入模型”导致启动后不可用。
+            if not {"chatgpt", "gemini"}.issubset(selected):
+                self._send_json(
+                    {"ok": False, "error": "当前版本请先选择 1=ChatGPT 与 2=Gemini 后再启动"},
+                    status=400,
+                )
+                return
+            payload = self.state.start_session()
+            self._send_json({"ok": True, **payload})
+            return
+
         if parsed.path == "/api/send":
+            if not self.state.get_state().get("session_started"):
+                self._send_json({"ok": False, "error": "session not started"}, status=409)
+                return
             text = core.normalize_text(str(data.get("text") or ""))
             to = str(data.get("to") or "next").strip().lower()
             if not text:
@@ -949,6 +1301,25 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
         webbrowser.open_new_tab(url)
     except Exception:
         pass
+
+    # 先启动 UI，再等待你在 UI 左侧选择模型并点击“启动”，然后才打开对应网页
+    state.add_message("System", "请先在最左侧选择要使用的模型槽位，然后点击「启动」。")
+    state.add_message("System", "为避免风控与不必要的加载，脚本会在「启动」之后才打开对应网页。")
+    state.set_status("waiting session start (select models + click Start)")
+    while not state.should_stop():
+        if state.wait_for_session_start(timeout_s=1):
+            break
+    if state.should_stop():
+        state.set_status("stopped")
+        try:
+            httpd.shutdown()
+        except Exception:
+            pass
+        return
+
+    info = state.get_models()
+    selected = list(info.get("selected_keys") or [])
+    state.add_message("System", f"已选择模型：{', '.join(selected) if selected else '（空）'}")
 
     user_data_dir = str(Path("./user_data").resolve())
     Path(user_data_dir).mkdir(parents=True, exist_ok=True)

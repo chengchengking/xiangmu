@@ -44,6 +44,14 @@ It will start a local page at `http://127.0.0.1:8765/` and open it in your brows
 
 Note: the WebUI does not auto-send a seed message. The first message is your first line in the WebUI input box.
 
+### Session Start (Model Slots 1..10)
+
+The WebUI now has a left model bar (slots `1..10`):
+
+- Click a slot to enable/disable it (selected = in use; grayscale = off; disabled = not integrated yet).
+- Click **启动** to start the automation. The script will only open the model web pages after you click **启动**.
+- Current version only integrates `1=ChatGPT` and `2=Gemini` (other slots are placeholders).
+
 ### Model Equality (Foreground / Background)
 
 In the Web UI dropdown, the two models are treated as equals:
