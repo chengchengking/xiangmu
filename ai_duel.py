@@ -579,9 +579,17 @@ def run_duel_loop() -> None:
         page_gemini.bring_to_front()
         wait_for_login(page_gemini, "Gemini")
 
-        # 初始化：给 ChatGPT 第一条消息
-        seed_message = "你好，请开始你的论述。"
-        log(f"初始化发送 -> ChatGPT: {seed_message}")
+        # 第一条消息由群主输入（不再自动发送固定 seed）
+        seed_message = ""
+        while not seed_message:
+            try:
+                seed_message = input("请输入群主第一句话（回车提交）: ").strip()
+            except EOFError:
+                seed_message = ""
+            if not seed_message:
+                warn("第一句话不能为空，请重新输入。")
+
+        log(f"群主初始化发送 -> ChatGPT: {seed_message}")
         chatgpt_prev = count_chatgpt_assistant_messages(page_chatgpt)
         send_message(page_chatgpt, "ChatGPT", seed_message)
 

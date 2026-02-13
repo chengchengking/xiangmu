@@ -793,19 +793,17 @@ def run_webui_duel(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
         core.wait_for_login(page_gemini, "Gemini")
         state.add_message("System", "Gemini 登录检查通过（检测到输入框）")
 
-        seed_message = "你好，请开始你的论述。"
-        seed_mid = state.add_message("You", seed_message)
-
         next_site = "ChatGPT"
-        pending_text: Optional[str] = _format_user(seed_message)
-        pending_upto_mid = seed_mid  # pending_text 对应的群聊消息 id（用于已同步游标）
-        pending_user_plain = seed_message  # 仅用于“单聊时后台同步给另一模型”的提示词拼接
+        # 不再自动发送“你好，请开始你的论述。”：
+        # 第一条消息由群主（你）在 WebUI 输入框里发出。
+        pending_text: Optional[str] = None
+        pending_upto_mid = 0  # pending_text 对应的群聊消息 id（用于已同步游标）
+        pending_user_plain = ""  # 仅用于“单聊时后台同步给另一模型”的提示词拼接
         shadow_sync_to: Optional[str] = None  # 单聊模式下：主模型回复后，把这一轮同步给哪一边
         auto_duel = True  # 仅当目标为“发给下一位”时，才持续把回复转发给另一边
         # 记录每个模型“已经看过”的群聊消息 id，用于切换目标时自动补上下文
         seen_upto: dict[str, int] = {"ChatGPT": 0, "Gemini": 0}
-        # 种子消息会先发给 ChatGPT，因此先把它标记为 ChatGPT 已见
-        seen_upto["ChatGPT"] = seed_mid
+        state.add_message("System", "请在 WebUI 里输入群主第一句话开始对话。")
 
         # 规则注入：记录每个站点最后一次注入的 rules version，避免每条都重复长规则
         rules_version_sent: dict[str, int] = {"ChatGPT": 0, "Gemini": 0}

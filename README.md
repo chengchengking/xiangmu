@@ -2,6 +2,18 @@
 
 ## Quick Start
 
+### One-click (Windows)
+
+Double click:
+
+```text
+start_webui.bat
+```
+
+It will (best-effort) install Python deps, install Playwright Chromium, then start the WebUI.
+
+### Manual
+
 1. Install Python deps:
 
 ```powershell
@@ -17,7 +29,7 @@ powershell -ExecutionPolicy Bypass -File .\install_playwright_chromium_fast.ps1
 3. Run the demo (opens visible browser windows):
 
 ```powershell
-python .\ai_duel.py
+python .\ai_duel_webui.py
 ```
 
 ## Web UI (3-person group chat)
@@ -29,6 +41,8 @@ python .\ai_duel_webui.py
 ```
 
 It will start a local page at `http://127.0.0.1:8765/` and open it in your browser. You can send messages as the "host" and watch ChatGPT/Gemini replies in one place.
+
+Note: the WebUI does not auto-send a seed message. The first message is your first line in the WebUI input box.
 
 ### Model Equality (Foreground / Background)
 
