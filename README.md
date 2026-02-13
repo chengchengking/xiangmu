@@ -42,6 +42,8 @@ python .\ai_duel_webui.py
 
 It will start a local page at `http://127.0.0.1:8765/` and open it in your browser. You can send messages as the "host" and watch ChatGPT/Gemini replies in one place.
 
+On Windows, it will *prefer* opening the UI as a standalone app window (Chrome/Edge `--app=` mode) instead of a normal tab. If not available, it falls back to the default browser.
+
 Note: the WebUI does not auto-send a seed message. The first message is your first line in the WebUI input box.
 
 ### Session Start (Model Slots 1..10)
