@@ -66,7 +66,7 @@ set "CODE=0"
 for /l %%i in (1,1,40) do (
   for /f %%c in ('powershell -NoProfile -Command "try{(Invoke-WebRequest -UseBasicParsing '%URL%api/state' -TimeoutSec 2).StatusCode}catch{0}"') do set "CODE=%%c"
   if "!CODE!"=="200" goto :started
-  timeout /t 1 /nobreak >nul
+  powershell -NoProfile -Command "Start-Sleep -Seconds 1" >nul 2>nul
 )
 
 echo [ERROR] WebUI backend did not become ready.
