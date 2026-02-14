@@ -10,7 +10,12 @@ Double click:
 start_webui.bat
 ```
 
-It will (best-effort) install Python deps, install Playwright Chromium, then start the WebUI.
+It will (best-effort) install Python deps, install Playwright Chromium, then start the WebUI backend **detached** (in background).
+
+- Logs: `.tmp\webui.out.log` / `.tmp\webui.err.log`
+- Stop: click **Stop** in the WebUI, or double click `stop_webui.bat`
+
+If you see `Failed to fetch` in the UI, it usually means the backend is not running. Re-run `start_webui.bat` and check `.tmp\webui.err.log`.
 
 ### Manual
 

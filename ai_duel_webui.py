@@ -773,7 +773,7 @@ HTML_PAGE = r"""<!doctype html>
                 renderModels();
                 updateModelBadges();
               } catch (e) {
-                alert('更新模型选择失败：' + e);
+                alert('更新模型选择失败：' + e + netHint(e));
               }
               return;
             }
@@ -958,6 +958,19 @@ HTML_PAGE = r"""<!doctype html>
         return await r.json();
       }
 
+      function netHint(e) {
+        const s = String(e || '');
+        if (
+          s.includes('Failed to fetch') ||
+          s.includes('NetworkError') ||
+          s.includes('ERR_CONNECTION') ||
+          s.includes('ECONN')
+        ) {
+          return '\\n\\n提示：后端未运行或已退出。请重新运行 start_webui.bat；如果仍失败，查看 .tmp\\\\webui.err.log。';
+        }
+        return '';
+      }
+
       async function loadRules() {
         try {
           const data = await apiGet('/api/rules');
@@ -1023,6 +1036,8 @@ HTML_PAGE = r"""<!doctype html>
         } catch (e) {
           dot.className = 'dot bad';
           conn.textContent = 'error';
+          statusText.textContent = '后端断开：请重新运行 start_webui.bat（必要时查看 .tmp\\\\webui.err.log）';
+          setUiEnabled(false);
         } finally {
           setTimeout(poll, 800);
         }
@@ -1036,7 +1051,7 @@ HTML_PAGE = r"""<!doctype html>
         try {
           await apiPost('/api/send', { text, to });
         } catch (e) {
-          alert('发送失败：' + e);
+          alert('发送失败：' + e + netHint(e));
         }
       }
 
@@ -1044,7 +1059,7 @@ HTML_PAGE = r"""<!doctype html>
         try {
           await apiPost('/api/pause', { paused: !paused });
         } catch (e) {
-          alert('操作失败：' + e);
+          alert('操作失败：' + e + netHint(e));
         }
       });
 
@@ -1053,7 +1068,7 @@ HTML_PAGE = r"""<!doctype html>
         try {
           await apiPost('/api/stop', {});
         } catch (e) {
-          alert('停止失败：' + e);
+          alert('停止失败：' + e + netHint(e));
         }
       });
 
@@ -1065,9 +1080,9 @@ HTML_PAGE = r"""<!doctype html>
           startSessionBtn.textContent = '启动中';
           try {
             await apiPost('/api/session/start', {});
-            await loadModels();
-          } catch (e) {
-            alert('启动失败：' + e);
+           await loadModels();
+         } catch (e) {
+            alert('启动失败：' + e + netHint(e));
             startSessionBtn.disabled = false;
             startSessionBtn.textContent = oldText;
           }
@@ -1079,7 +1094,7 @@ HTML_PAGE = r"""<!doctype html>
           await apiPost('/api/rules', { rules: rulesInput.value || '' });
           alert('规则已应用（下一轮生效）');
         } catch (e) {
-          alert('应用失败：' + e);
+          alert('应用失败：' + e + netHint(e));
         }
       });
 
