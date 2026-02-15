@@ -58,7 +58,7 @@ del /q "%OUT_LOG%" >nul 2>nul
 del /q "%ERR_LOG%" >nul 2>nul
 del /q "%PID_FILE%" >nul 2>nul
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Start-Process -FilePath 'python' -ArgumentList @('ai_duel_webui.py','--host','%HOST%','--port','%PORT%') -WorkingDirectory '%cd%' -WindowStyle Hidden -RedirectStandardOutput '%OUT_LOG%' -RedirectStandardError '%ERR_LOG%' -PassThru; $p.Id | Out-File -Encoding ASCII '%PID_FILE%'"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Start-Process -FilePath 'python' -ArgumentList @('ai_duel_webui.py','--host','%HOST%','--port','%PORT%','--no-open') -WorkingDirectory '%cd%' -WindowStyle Hidden -RedirectStandardOutput '%OUT_LOG%' -RedirectStandardError '%ERR_LOG%' -PassThru; $p.Id | Out-File -Encoding ASCII '%PID_FILE%'"
 if errorlevel 1 goto :fail
 
 rem Wait for the backend to become ready (up to ~40s).
@@ -78,8 +78,9 @@ goto :fail
 
 :started
 echo [INFO] WebUI is running: %URL%
-echo [INFO] First message is from you in the WebUI input box (no auto seed).
-echo [INFO] To stop: click Stop in the WebUI, or run stop_webui.bat.
+echo [INFO] Opening WebUI window...
+python -c "import ai_duel_webui as w; w._open_webui_window('%URL%')" >nul 2>nul
+echo [INFO] To stop backend: run stop_webui.bat.
 exit /b 0
 
 :fail

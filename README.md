@@ -51,20 +51,30 @@ On Windows, it will *prefer* opening the UI as a standalone app window (Chrome/E
 
 Note: the WebUI does not auto-send a seed message. The first message is your first line in the WebUI input box.
 
-### Session Start (Model Slots 1..10)
+### Model Slots (1..10)
 
-The WebUI now has a left model bar (slots `1..10`):
+The WebUI has a left model bar (slots `1..10`):
 
-- Click a slot to enable/disable it (selected = in use; grayscale = off; disabled = not integrated yet).
-- Click **启动** to start the automation. The script will only open the model web pages after you click **启动**.
-- Current version only integrates `1=ChatGPT` and `2=Gemini` (other slots are placeholders).
+- 3-state:
+  - Locked: not integrated yet (grey + lock)
+  - Available: integrated but not selected (grey)
+  - Selected: enabled (color)
+- Green dot means authenticated (login detected).
+- Click a slot to toggle join/leave group chat. If not authenticated, it will show a login modal:
+  - **Open login window** (official site)
+  - **Recheck** after you finish manual login
+- Send requires explicit target selection in the bottom dropdown:
+  - `请选择` / `群聊 (public)` / `单聊 (shadow, only selected models)`
 
-### Model Equality (Foreground / Background)
+Integrated models (current):
 
-In the Web UI dropdown, the two models are treated as equals:
+- `1=ChatGPT` `2=Gemini` `3=DeepSeek`
+- `4=豆包` `5=Qwen` `6=Kimi` (generic adapter template; may need selector tweaks)
+- `7..10` are locked placeholders
 
-- If you choose **foreground ChatGPT**, Gemini will still be synced in the background and can generate replies, but the UI will hide Gemini messages until you switch to foreground Gemini. The sidebar shows unread counts: `未读：ChatGPT X | Gemini Y`.
-- If you choose **foreground Gemini**, ChatGPT behaves the same way.
+### Model Equality
+
+All selected models are treated equally. Use `群聊` to send to all selected models, or `单聊` to talk to one model (messages are stored as `shadow` but still go into global context for later understanding).
 
 ## Notes
 
