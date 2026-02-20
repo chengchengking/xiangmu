@@ -42,14 +42,9 @@ set "ERR_LOG=%TMPDIR%\webui.err.log"
 
 if not exist "%TMPDIR%" mkdir "%TMPDIR%" >nul 2>nul
 
-rem If WebUI is already running, just open the window and exit.
-set "CODE=0"
-for /f %%c in ('powershell -NoProfile -Command "try{(Invoke-WebRequest -UseBasicParsing '%URL%api/state' -TimeoutSec 2).StatusCode}catch{0}"') do set "CODE=%%c"
-if "!CODE!"=="200" (
-  echo [INFO] WebUI already running: %URL%
-  python -c "import ai_duel_webui as w; w._open_webui_window('%URL%')"
-  exit /b 0
-)
+echo [INFO] Performing clean restart (stop old backend first)...
+call "%~dp0stop_webui.bat" >nul 2>nul
+powershell -NoProfile -Command "Start-Sleep -Milliseconds 700" >nul 2>nul
 
 echo [INFO] Starting WebUI backend (detached)...
 echo [INFO] Logs: %OUT_LOG% and %ERR_LOG%

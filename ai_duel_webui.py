@@ -10,10 +10,12 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import queue
 import re
+from difflib import SequenceMatcher
 import subprocess
 import threading
 import time
@@ -34,12 +36,29 @@ from playwright.sync_api import sync_playwright
 from model_adapters import (
     ChatGPTAdapter,
     DeepSeekAdapter,
+    DoubaoAdapter,
     GeminiAdapter,
     GenericWebChatAdapter,
     ModelAdapter,
     ModelMeta,
+    QwenAdapter,
     default_avatar_svg,
 )
+
+
+def _env_int(name: str, default: int, *, min_v: int = 0, max_v: int = 86400) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except Exception:
+        return default
+    if v < min_v:
+        return min_v
+    if v > max_v:
+        return max_v
+    return v
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -48,9 +67,50 @@ MAX_MESSAGES = 1500
 MAX_CONTEXT_MESSAGES = 120
 MAX_MODEL_PROMPT_CHARS = 12000
 MODEL_REPLY_TIMEOUT_S = 180
+MODEL_REPLY_TIMEOUT_OVERRIDES: dict[str, int] = {
+    "qwen": 42,
+}
+TURN_TRACE_ENABLED = os.environ.get("AI_DUEL_TURN_TRACE", "1").strip().lower() not in {"0", "false", "off", "no"}
 GROUP_CONTINUOUS_MAX_ROUNDS = 60
 GROUP_DEFAULT_ROUNDS = -1  # -1 means continuous rounds until manual stop/safety cap
-FOCUS_RECOVERY_ROUNDS = 2
+FOCUS_RECOVERY_ROUNDS = 4
+TOPIC_LOCK_MAX_ATTEMPTS_PER_MODEL = 2
+RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+TRACE_DIR = Path(".tmp")
+MESSAGE_LOG_FILE = Path(
+    os.environ.get("AI_DUEL_MSG_LOG_FILE", str(TRACE_DIR / f"ai_group_messages_{RUN_ID}.jsonl"))
+)
+TURN_LOG_FILE = Path(
+    os.environ.get("AI_DUEL_TURN_LOG_FILE", str(TRACE_DIR / f"ai_group_turns_{RUN_ID}.jsonl"))
+)
+_JSONL_LOCK = threading.Lock()
+GROUP_PUBLIC_TURN_SOFT_TIMEOUT_S = {
+    "qwen": _env_int("AI_DUEL_GROUP_TIMEOUT_SOFT_QWEN", 30, min_v=12, max_v=240),
+    "doubao": _env_int("AI_DUEL_GROUP_TIMEOUT_SOFT_DOUBAO", 32, min_v=12, max_v=240),
+    "default": _env_int("AI_DUEL_GROUP_TIMEOUT_SOFT_DEFAULT", 26, min_v=10, max_v=180),
+}
+GROUP_PUBLIC_ROUND_CAP_BY_COUNT = {
+    2: _env_int("AI_DUEL_GROUP_TIMEOUT_CAP_2", 34, min_v=12, max_v=240),
+    3: _env_int("AI_DUEL_GROUP_TIMEOUT_CAP_3", 38, min_v=12, max_v=260),
+    4: _env_int("AI_DUEL_GROUP_TIMEOUT_CAP_4", 42, min_v=12, max_v=280),
+    5: _env_int("AI_DUEL_GROUP_TIMEOUT_CAP_5", 46, min_v=12, max_v=320),
+}
+
+
+def _group_round_timeout_cap_s(model_count: int) -> int:
+    if model_count <= 2:
+        return int(GROUP_PUBLIC_ROUND_CAP_BY_COUNT[2])
+    if model_count == 3:
+        return int(GROUP_PUBLIC_ROUND_CAP_BY_COUNT[3])
+    if model_count == 4:
+        return int(GROUP_PUBLIC_ROUND_CAP_BY_COUNT[4])
+    return int(GROUP_PUBLIC_ROUND_CAP_BY_COUNT[5])
+
+
+def _topic_lock_rounds(model_count: int) -> int:
+    # Keep topic lock short: enough to force a visible reaction, but not so long that
+    # normal chat flow gets over-constrained and appears "stuck".
+    return max(1, min(3, int(model_count)))
 
 MODEL_MENTION_ALIASES: dict[str, tuple[str, ...]] = {
     "chatgpt": ("chatgpt", "gpt", "chat-gpt", "chat gpt"),
@@ -71,14 +131,15 @@ DEFAULT_RULES = """【对话规则】
 - 必须给 1 个反例/边界条件（1 句即可），避免空泛。
 - 最后给 1 个追问，推动更深一步讨论。
 - 总长度尽量 <= 320 字。
-- 末尾追加一段【转发摘要】（<= 120 字），只写关键观点，供另一模型接续（不要写元信息/不要说“我将转发”）。
 """.strip()
 
 # 每轮轻量提醒：避免模型“跑偏”回长文/检索式回答
-RULES_REMINDER = "【提醒】像人说话但要短；别用 1/2/3 模板；可联网补事实但结论要自己推理；抓住对方核心点反驳；末尾带【转发摘要】。"
+RULES_REMINDER = "【提醒】像人说话但要短；别用 1/2/3 模板；可联网补事实但结论要自己推理；抓住对方核心点反驳。"
 
-# 转发给另一模型的内容长度上限（过长会导致输入卡顿，也会让对话越来越发散）
-FORWARD_MAX_CHARS = 900
+# 单条转发上限：只做安全截断，不做摘要拼装/历史重打包。
+FORWARD_MAX_CHARS = 3200
+INCREMENTAL_MSG_MAX_LINES = 20
+INCREMENTAL_MSG_MAX_CHARS = 3200
 
 # 模型槽位（UI 左侧 1..10）
 # 说明：
@@ -201,11 +262,27 @@ def build_adapter(meta: ModelMeta) -> ModelAdapter:
         return GeminiAdapter(meta)
     if meta.key == "deepseek":
         return DeepSeekAdapter(meta)
+    if meta.key == "doubao":
+        return DoubaoAdapter(meta)
+    if meta.key == "qwen":
+        return QwenAdapter(meta)
     return GenericWebChatAdapter(meta)
 
 
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(row, ensure_ascii=False)
+        with _JSONL_LOCK:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        # Logging must never block chat pipeline.
+        pass
 
 
 def _open_webui_window(url: str) -> None:
@@ -338,6 +415,19 @@ class SharedState:
             )
             if len(self._messages) > MAX_MESSAGES:
                 self._messages = self._messages[-MAX_MESSAGES:]
+            _append_jsonl(
+                MESSAGE_LOG_FILE,
+                {
+                    "run_id": RUN_ID,
+                    "id": mid,
+                    "ts": self._messages[-1].ts,
+                    "role": role,
+                    "speaker": speaker,
+                    "visibility": visibility,
+                    "model_key": model_key,
+                    "text": t,
+                },
+            )
             return mid
 
     def add_system(self, text: str) -> int:
@@ -1076,6 +1166,8 @@ HTML_PAGE = r"""<!doctype html>
         const clearBtn = $('clearBtn');
         const hintLeft = $('hintLeft');
         const countPill = $('countPill');
+        let stopArmUntil = 0;
+        let isComposing = false;
 
         const authMask = $('authMask');
         const authTitle = $('authTitle');
@@ -1242,31 +1334,7 @@ HTML_PAGE = r"""<!doctype html>
 
             btn.addEventListener('click', async () => {
               if (!m.integrated) return;
-              // 关闭模型：直接切换
-              if (m.selected) {
-                await apiPost('/api/models/toggle', { key: m.key });
-                await pollModels();
-                rebuildTargets();
-                return;
-              }
-
-              // 启用模型：先静默检测登录态（已登录则不弹窗）
-              let authed = !!m.authenticated;
-              if (!authed) {
-                const chk = await apiPost('/api/models/login/check', { key: m.key });
-                await pollModels();
-                rebuildTargets();
-                authed = !!(chk && chk.ok && chk.authenticated);
-              }
-
-              if (authed) {
-                await apiPost('/api/models/toggle', { key: m.key });
-                await pollModels();
-                rebuildTargets();
-                return;
-              }
-
-              // 未登录：沿用原流程（设置 pending_enable，并弹出登录提示）
+              // 一键切换：后端会自动做登录态检查。
               const res = await apiPost('/api/models/toggle', { key: m.key });
               await pollModels();
               rebuildTargets();
@@ -1334,7 +1402,17 @@ HTML_PAGE = r"""<!doctype html>
 
           const text = document.createElement('div');
           text.className = 'bubble-text';
-          text.innerHTML = esc(msg.text || '');
+          const hideRouteMentions = (raw) => {
+            let t = String(raw || '');
+            if (msg.role !== 'model' || msg.visibility !== 'public') return t;
+            // Hide routing mentions in UI while keeping backend routing logic.
+            t = t.replace(/(^|\\n)\\s*@[-_0-9A-Za-z\\u4e00-\\u9fff]{1,24}\\s*(?=\\n|$)/g, '$1');
+            t = t.replace(/\\s+@[-_0-9A-Za-z\\u4e00-\\u9fff]{1,24}\\b/g, '');
+            t = t.replace(/\\n{3,}/g, '\\n\\n');
+            t = t.trim();
+            return t || String(raw || '');
+          };
+          text.innerHTML = esc(hideRouteMentions(msg.text || ''));
 
           bub.appendChild(meta);
           bub.appendChild(text);
@@ -1383,6 +1461,45 @@ HTML_PAGE = r"""<!doctype html>
           // Could render status in UI if needed.
         };
 
+        const toUtf8Base64 = (s) => {
+          try {
+            const bytes = new TextEncoder().encode(String(s || ''));
+            let bin = '';
+            const chunk = 0x8000;
+            for (let i = 0; i < bytes.length; i += chunk) {
+              bin += String.fromCharCode(...bytes.slice(i, i + chunk));
+            }
+            return btoa(bin);
+          } catch (_) {
+            try {
+              return btoa(unescape(encodeURIComponent(String(s || ''))));
+            } catch (_) {
+              return '';
+            }
+          }
+        };
+        const toUriText = (s) => {
+          try {
+            return encodeURIComponent(String(s || ''));
+          } catch (_) {
+            return '';
+          }
+        };
+        const textKeyLen = (s) => {
+          try {
+            return String(s || '').replace(/[^0-9A-Za-z\u4e00-\u9fff]+/g, '').length;
+          } catch (_) {
+            return 0;
+          }
+        };
+        const looksGarbled = (s) => {
+          const t = String(s || '');
+          if (!t) return false;
+          const q = (t.match(/[?？]/g) || []).length;
+          const ratio = q / Math.max(1, t.length);
+          return ratio >= 0.35 && textKeyLen(t) < 6;
+        };
+
         const sendNow = async () => {
           const v = sendTarget.value;
           if (!v || v === '__sep__') {
@@ -1390,9 +1507,22 @@ HTML_PAGE = r"""<!doctype html>
             updateComposerEnabled();
             return;
           }
-          const text = input.value || '';
-          if (!text.trim()) return;
-          const payload = { target: v, text };
+          const original = String(input.value || '');
+          if (!original.trim()) return;
+          let text = original;
+          // IME edge case: Enter may arrive right before composition commits.
+          // Re-read once shortly, then reject obvious garbled payload.
+          if (looksGarbled(text)) {
+            await new Promise((r) => setTimeout(r, 120));
+            const late = String(input.value || '');
+            if (textKeyLen(late) > textKeyLen(text)) text = late;
+          }
+          if (looksGarbled(text)) {
+            hintLeft.textContent = '检测到疑似乱码输入，请重新输入后发送';
+            hintLeft.style.color = 'var(--danger)';
+            return;
+          }
+          const payload = { target: v, text, text_b64: toUtf8Base64(text), text_uri: toUriText(text) };
           if (v === 'group') {
             const rv = parseInt((groupRounds && groupRounds.value) ? groupRounds.value : '-1', 10);
             payload.rounds = Number.isFinite(rv) ? rv : -1;
@@ -1418,6 +1548,14 @@ HTML_PAGE = r"""<!doctype html>
 
         // events
         stopTopBtn && stopTopBtn.addEventListener('click', async () => {
+          const now = Date.now();
+          if (now > stopArmUntil) {
+            stopArmUntil = now + 1800;
+            hintLeft.textContent = '再点一次“停止轮聊”以确认';
+            hintLeft.style.color = 'var(--warn)';
+            return;
+          }
+          stopArmUntil = 0;
           await apiPost('/api/debate/stop', {});
           hintLeft.textContent = '已请求停止自动轮聊';
           hintLeft.style.color = 'var(--warn)';
@@ -1427,7 +1565,10 @@ HTML_PAGE = r"""<!doctype html>
           input.focus();
         });
         sendBtn && sendBtn.addEventListener('click', sendNow);
+        input && input.addEventListener('compositionstart', () => { isComposing = true; });
+        input && input.addEventListener('compositionend', () => { isComposing = false; });
         input && input.addEventListener('keydown', (ev) => {
+          if (isComposing || ev.isComposing) return;
           if (ev.key === 'Enter' && !ev.shiftKey) {
             ev.preventDefault();
             if (!sendBtn.disabled) sendNow();
@@ -1889,7 +2030,29 @@ HTML_PAGE = r"""<!doctype html>
         const to = target.value || 'next';
         input.value = '';
         try {
-          await apiPost('/api/send', { text, to });
+          const enc = (() => {
+            try {
+              const bytes = new TextEncoder().encode(text);
+              let bin = '';
+              for (let i = 0; i < bytes.length; i += 0x8000) {
+                bin += String.fromCharCode(...bytes.slice(i, i + 0x8000));
+              }
+              return btoa(bin);
+            } catch (_) {
+              try {
+                return btoa(unescape(encodeURIComponent(text)));
+              } catch (_) {
+                return '';
+              }
+            }
+          })();
+          let textUri = '';
+          try {
+            textUri = encodeURIComponent(text);
+          } catch (_) {
+            textUri = '';
+          }
+          await apiPost('/api/send', { text, text_b64: enc, text_uri: textUri, to });
         } catch (e) {
           alert('发送失败：' + e + netHint(e));
         }
@@ -1998,6 +2161,15 @@ class _Handler(BaseHTTPRequestHandler):
     state: SharedState  # injected
     worker: Any  # injected
 
+    def _sync_login_check(self, key: str, *, timeout_s: float = 45.0) -> dict[str, Any]:
+        ev = threading.Event()
+        box: dict[str, Any] = {}
+        self.state.inbox.put({"kind": "login_check", "key": key, "_ev": ev, "_reply": box})
+        ev.wait(timeout=timeout_s)
+        if box:
+            return box
+        return {"ok": False, "authenticated": False, "error": "login_check_timeout"}
+
     def _send_json(self, obj: Any, status: int = 200) -> None:
         raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -2020,7 +2192,27 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or "0")
         if length <= 0:
             return {}
-        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        raw = self.rfile.read(length)
+        ctype = self.headers.get("Content-Type") or ""
+        m = re.search(r"charset\s*=\s*([-\w.]+)", ctype, re.I)
+        candidates: list[str] = []
+        if m:
+            candidates.append(m.group(1).strip().strip("\"'"))
+        candidates.extend(["utf-8", "utf-8-sig", "gb18030", "gbk"])
+        body = ""
+        tried: set[str] = set()
+        for enc in candidates:
+            e = (enc or "").strip().lower()
+            if not e or e in tried:
+                continue
+            tried.add(e)
+            try:
+                body = raw.decode(e)
+                break
+            except Exception:
+                continue
+        if not body:
+            body = raw.decode("utf-8", errors="replace")
         try:
             data = json.loads(body)
             return data if isinstance(data, dict) else {}
@@ -2058,7 +2250,12 @@ class _Handler(BaseHTTPRequestHandler):
         data = self._read_json_body()
 
         if parsed.path == "/api/models/toggle":
-            key = str(data.get("key") or "")
+            key = str(data.get("key") or "").strip().lower()
+            m = self.state.get_model(key)
+            # 一键启用：若是“未选中且未认证”，先自动检查登录态；
+            # 已登录则直接加入，不再要求手动点“打开登录窗口”。
+            if m and m.integrated and (not m.selected) and (not m.authenticated):
+                self._sync_login_check(key, timeout_s=45.0)
             self._send_json(self.state.toggle_selected(key))
             return
 
@@ -2073,10 +2270,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/models/login/check":
             key = str(data.get("key") or "")
-            ev = threading.Event()
-            box: dict[str, Any] = {}
-            self.state.inbox.put({"kind": "login_check", "key": key, "_ev": ev, "_reply": box})
-            ev.wait(timeout=25)
+            box = self._sync_login_check(key, timeout_s=45.0)
             self._send_json(box or {"ok": True, "authenticated": False})
             return
 
@@ -2087,8 +2281,29 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/send":
-            text = core.normalize_text(str(data.get("text") or ""))
-            target = str(data.get("target") or "").strip().lower()
+            text_plain = core.normalize_text(str(data.get("text") or ""))
+            text = text_plain
+            text_b64 = core.normalize_text(str(data.get("text_b64") or ""))
+            text_uri = core.normalize_text(str(data.get("text_uri") or data.get("text_urlenc") or ""))
+            decoded_b64 = ""
+            if text_b64:
+                try:
+                    decoded_b64 = base64.b64decode(text_b64.encode("ascii"), validate=False).decode(
+                        "utf-8", errors="replace"
+                    )
+                    decoded_b64 = core.normalize_text(decoded_b64)
+                except Exception:
+                    decoded_b64 = ""
+            decoded_uri = ""
+            if text_uri:
+                try:
+                    decoded_uri = core.normalize_text(urllib.parse.unquote(text_uri, encoding="utf-8", errors="replace"))
+                except Exception:
+                    decoded_uri = ""
+            text = _pick_best_transport_text(text_plain, decoded_b64, decoded_uri)
+            target = str(data.get("target") or data.get("to") or "").strip().lower()
+            if target in {"next", "groupchat", "public"}:
+                target = "group"
             if not text:
                 self._send_json({"ok": False, "error": "empty text"}, status=400)
                 return
@@ -2102,6 +2317,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/debate/stop":
             self.state.request_round_stop()
+            self.state.add_system("收到停止轮聊请求。")
             self._send_json({"ok": True})
             return
 
@@ -2138,8 +2354,8 @@ def _split_forward_summary(text: str) -> tuple[str, str]:
     main = t[: m.start()].strip()
     tail = t[m.end() :].strip()
     summary = core.normalize_text(tail)
-    if len(summary) > 200:
-        summary = summary[:200].rstrip() + "…"
+    if len(summary) > 320:
+        summary = summary[:320].rstrip() + "…"
     return main, summary
 
 
@@ -2152,15 +2368,1406 @@ def _clip_text(s: str, max_chars: int) -> str:
     return f"{head}…（略）…{tail}".strip()
 
 
+def _transport_text_score(text: str) -> float:
+    t = core.normalize_text(text)
+    if not t:
+        return -1e9
+    key = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", t.lower())
+    score = float(len(key))
+    q_cnt = t.count("?")
+    repl_cnt = t.count("�")
+    q_ratio = (q_cnt / max(1, len(t)))
+    if q_ratio >= 0.30:
+        score -= 180.0
+    elif q_ratio >= 0.15:
+        score -= 80.0
+    elif q_ratio >= 0.08:
+        score -= 30.0
+    score -= float(repl_cnt * 22)
+    cjk_cnt = len(re.findall(r"[\u4e00-\u9fff]", t))
+    if cjk_cnt:
+        score += min(64.0, float(cjk_cnt) * 0.65)
+    if re.search(r"[A-Za-z]{3,}", t):
+        score += 10.0
+    if re.search(r"\d", t):
+        score += 6.0
+    if len(key) < 4:
+        score -= 18.0
+    if re.search(r"(?:%[0-9a-f]{2}){3,}", t, re.I):
+        score -= 160.0
+    # Common UTF-8<->GBK mojibake fingerprints; strongly down-rank these payloads.
+    weird_hits = len(re.findall(r"[浣鍦鍙鍐鍑锛銆鏈€闂瑕缇缁鏂鏃闄鎯璇鎴寮鎺纭]", t))
+    cjk_total = len(re.findall(r"[\u4e00-\u9fff]", t))
+    if cjk_total >= 8 and weird_hits >= 4:
+        if (weird_hits / max(1, cjk_total)) >= 0.16:
+            score -= 260.0
+    if re.search(r"(?:浣犲|鏈€|闂棰|璇峰|鍙洖|濡傛殏|缇や富)", t):
+        score -= 140.0
+    return score
+
+
+def _pick_best_transport_text(*candidates: str) -> str:
+    normed: list[str] = []
+    best = ""
+    best_score = -1e9
+    first_non_empty = ""
+    for cand in candidates:
+        txt = core.normalize_text(cand)
+        normed.append(txt)
+        if txt and not first_non_empty:
+            first_non_empty = txt
+        sc = _transport_text_score(txt)
+        if sc > best_score:
+            best_score = sc
+            best = txt
+
+    picked = core.normalize_text(best or first_non_empty)
+    # Safety net: if the picked text is mostly "?" but another candidate contains
+    # meaningful letters/CJK, prefer the meaningful candidate.
+    if picked:
+        q_like = picked.count("?") + picked.count("？")
+        if q_like >= max(4, int(len(picked) * 0.35)):
+            for cand in normed:
+                if not cand or cand == picked:
+                    continue
+                key_len = len(re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", cand.lower()))
+                if key_len >= 6:
+                    cand_q = cand.count("?") + cand.count("？")
+                    if cand_q <= max(1, int(len(cand) * 0.12)):
+                        picked = cand
+                        break
+    # If picked payload still looks mojibake-like, prefer any cleaner candidate.
+    if picked:
+        picked_score = _transport_text_score(picked)
+        for cand in normed:
+            if not cand or cand == picked:
+                continue
+            cand_score = _transport_text_score(cand)
+            if cand_score >= (picked_score + 80):
+                picked = cand
+                picked_score = cand_score
+    return core.normalize_text(picked)
+
+
+_TOPIC_ZH_STOPWORDS = {
+    "我们",
+    "你们",
+    "大家",
+    "这个",
+    "那个",
+    "然后",
+    "如果",
+    "因为",
+    "所以",
+    "就是",
+    "以及",
+    "需要",
+    "可以",
+    "应该",
+    "但是",
+    "不过",
+    "还是",
+    "一下",
+    "一个",
+    "一些",
+    "可能",
+    "开始",
+    "继续",
+    "讨论",
+    "回复",
+}
+
+_TOPIC_EN_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "to",
+    "of",
+    "in",
+    "on",
+    "for",
+    "with",
+    "that",
+    "this",
+    "is",
+    "are",
+    "be",
+    "as",
+    "we",
+    "you",
+}
+
+
+def _topic_terms(text: str, *, max_terms: int = 40) -> set[str]:
+    t = core.normalize_text(text).lower()
+    if not t:
+        return set()
+    out: list[str] = []
+    seen: set[str] = set()
+
+    for en in re.findall(r"[a-z]{3,}", t):
+        if en in _TOPIC_EN_STOPWORDS:
+            continue
+        if en not in seen:
+            seen.add(en)
+            out.append(en)
+        if len(out) >= max_terms:
+            return set(out)
+
+    for zh in re.findall(r"[\u4e00-\u9fff]{2,24}", t):
+        chunks: list[str]
+        if len(zh) <= 6:
+            chunks = [zh]
+        else:
+            chunks = [zh[i : i + 2] for i in range(0, len(zh) - 1)]
+        for c in chunks:
+            if len(c) < 2:
+                continue
+            if c in _TOPIC_ZH_STOPWORDS:
+                continue
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+            if len(out) >= max_terms:
+                return set(out)
+    return set(out)
+
+
+def _topic_overlap_score(reply: str, topic: str) -> float:
+    rep = core.normalize_text(reply).lower()
+    top = core.normalize_text(topic).lower()
+    if not top:
+        return 1.0
+    if not rep:
+        return 0.0
+
+    rt = _topic_terms(rep)
+    tt = _topic_terms(top)
+    score_term = 0.0
+    if tt:
+        score_term = len(rt & tt) / max(1, len(tt))
+
+    r_chars = set(re.findall(r"[0-9a-z\u4e00-\u9fff]", rep))
+    t_chars = set(re.findall(r"[0-9a-z\u4e00-\u9fff]", top))
+    score_char = 0.0
+    if t_chars:
+        score_char = len(r_chars & t_chars) / max(1, len(t_chars))
+    return max(score_term, score_char * 0.65)
+
+
+def _looks_like_clarify_reply(text: str) -> bool:
+    t = core.normalize_text(text)
+    if not t:
+        return False
+    if not re.search(r"[?？]$", t):
+        return False
+    return bool(
+        re.search(r"(再|请|具体|说明|澄清|哪个|哪一个|如何|what|which|clarify|specify|details?)", t, re.I)
+    )
+
+
+def _is_reply_aligned_with_user_topic(reply: str, user_text: str, *, strict: bool = False) -> bool:
+    rep = core.normalize_text(reply)
+    top = core.normalize_text(user_text)
+    if not top:
+        return True
+    if not rep:
+        return False
+    if _TRIVIAL_PUBLIC_PAT.match(rep):
+        return False
+    if _LOW_VALUE_PROCESS_PAT.match(rep):
+        return False
+    if _QWEN_STATUS_ONLY_PAT.match(rep):
+        return False
+    if _looks_like_clarify_reply(rep):
+        return True
+    score = _topic_overlap_score(rep, top)
+    rep_terms = _topic_terms(rep, max_terms=40)
+    top_terms = _topic_terms(top, max_terms=34)
+    term_overlap = len(rep_terms & top_terms)
+    top_digits = set(re.findall(r"\d+(?:\.\d+)?", top))
+    rep_digits = set(re.findall(r"\d+(?:\.\d+)?", rep))
+    # Hard off-topic guard: when the host switched topic, old "idiom/festival chatter"
+    # should not survive if overlap is very low.
+    if _IDIOM_STYLE_CHATTER_PAT.search(rep) and not _IDIOM_STYLE_CHATTER_PAT.search(top):
+        if score < 0.18:
+            return False
+    if strict:
+        if _GROUP_HOST_CHATTER_PAT.search(rep) and len(_line_dedupe_key(rep)) <= 72:
+            return False
+        if _GROUP_ORCHESTRATION_PAT.search(rep) and len(_line_dedupe_key(rep)) <= 72:
+            return False
+        if _looks_prompt_leak_reply(rep):
+            return False
+        # Numeric topic: avoid hard-rejecting valid cross-language responses.
+        # If host topic includes numbers, prefer "has any numeric grounding" first.
+        if top_digits:
+            if not rep_digits:
+                return False
+            if top_digits & rep_digits:
+                return True
+            # No direct shared number, but still allow if semantic overlap is acceptable.
+            if score >= 0.12 and term_overlap >= 1:
+                return True
+            if score >= 0.18:
+                return True
+            return False
+        if score >= 0.12 and term_overlap >= 1:
+            return True
+        if term_overlap >= 2 and score >= 0.08:
+            return True
+        if not top_terms and score >= 0.18:
+            return True
+        # Cross-language or paraphrased replies can have low lexical overlap.
+        # Accept unless it clearly looks like stale/group-chatter boilerplate.
+        if len(_line_dedupe_key(rep)) >= 10:
+            return True
+        return False
+    if score >= 0.14:
+        return True
+    if score >= 0.08 and len(_line_dedupe_key(rep)) >= 14:
+        return True
+    # Keep this gate conservative: only block clear stale/process chatter.
+    if _GROUP_HOST_CHATTER_PAT.search(rep) and len(_line_dedupe_key(rep)) <= 72:
+        return False
+    if _GROUP_ORCHESTRATION_PAT.search(rep) and len(_line_dedupe_key(rep)) <= 72:
+        return False
+    if _looks_prompt_leak_reply(rep):
+        return False
+    return True
+
+
+_GROUP_HOST_CHATTER_PAT = re.compile(
+    r"(?:^|[，,。!！~～\s])"
+    r"(?:好(?:的|嘞)?|收到|明白|行(?:吧)?|ok|OK|哈喽|hello)"
+    r"(?:[，,。!！~～\s]{0,3})"
+    r"(?:群主|主持人|老大|老板)",
+    re.I,
+)
+_GROUP_ORCHESTRATION_PAT = re.compile(
+    r"(谁先来|我们这就开始|先来(?:出)?第一个|我先来抛砖引玉|接龙(?:开始|走起)|继续接龙|下一位谁来)",
+    re.I,
+)
+_IDIOM_STYLE_CHATTER_PAT = re.compile(
+    r"(成语|接龙|尾字|下一位|谁来接|我接|祝大家|马年|福气|好运)",
+    re.I,
+)
+_LOW_VALUE_PROCESS_PAT = re.compile(
+    r"^\s*(?:继续推进(?:接龙)?游戏(?:进程)?|继续推进对话进程|继续成语接龙(?:的游戏)?|继续推进接龙游戏|"
+    r"专注推进对话进程|聚焦于生成符合要求的回应|忽略初始回合的起始声明，专注回应核心请求|"
+    r"继续推进游戏|聚焦于回应|专注回应核心请求|继续推进游戏进程|专注推进(?:游戏|对话)进程|"
+    r"聚焦于(?:生成|回应|推进)(?:符合要求的)?(?:回应|内容|流程)?|"
+    r"专注解析对话(?:情境|语境)?|承接对话(?:脉络)?(?:，|,)?(?:自然)?(?:回应|延续语意流|延续语义流)?|"
+    r"保持专注与清晰的表达|保持流畅对话的节奏|"
+    r"(?:优化|组织|梳理)(?:回应|表达)(?:以契合语境)?|"
+    r"(?:正在)?理解对话(?:情境|语境)与语义内涵|"
+    r"正在权衡上下文限制与用户期待之间的矛盾|权衡上下文限制与用户期待之间的矛盾|"
+    r"用心体会用户传递的情感与需求|营造和谐共处的对话氛围|"
+    r"表达观点|肯定这一创意的趣味性与教育意义|"
+    r"评估(?:人民币计价)?黄金价格走势|评估.*(?:走势|区间|情境|语境|话题)|"
+    r"开始成语接龙游戏|启动成语接龙游戏|接龙游戏正酣.*|"
+    r"我需要[:：].*|让我(?:构思|想一下|数一下|再确认)|检查字数|数一下|好，就这个|"
+    r"(?:现在)?我需要.{0,120}(?:然后|再)(?:回应|补充|给出|讨论)|"
+    r"基于当前信息提出预测与假设|先给区间和假设|首先[，,]先给区间和假设|"
+    r"根据(?:群主)?最新话题.*(?:给出|回应|讨论)|给出一个简洁.*核心假设|"
+    r"给出.*人民币.*黄金.*价格区间.*假设|"
+    r"请把公开发言放在.*之间|如需隐藏想法.*之间|"
+    r"(?:\d{1,3}\s*字(?:左右)?|字数)(?:[，,、\s]{0,4})(?:符合要求|可|即可)|"
+    r"符合要求(?:即可)?|"
+    r"按要求(?:输出|回复)|"
+    r"先回应用户，再补充你对上一位的看法|先回应群主话题|如暂不发言，仅回复\s*\[?\s*PASS\s*\]?)\s*[。.!！~～]*\s*$",
+    re.I,
+)
+
+
+def _trace_turn(model_key: str, stage: str, text: str, *, elapsed_s: Optional[float] = None) -> None:
+    body = _clip_text(text, 220).replace("\n", " | ").strip()
+    if not body:
+        body = "∅"
+    tail = f", {elapsed_s:.2f}s" if elapsed_s is not None else ""
+    if TURN_TRACE_ENABLED:
+        core.log(f"[TURN][{model_key}] {stage}{tail}: {body}")
+    _append_jsonl(
+        TURN_LOG_FILE,
+        {
+            "run_id": RUN_ID,
+            "ts": _now_iso(),
+            "model_key": model_key,
+            "stage": stage,
+            "elapsed_s": round(float(elapsed_s), 3) if elapsed_s is not None else None,
+            "text": body,
+        },
+    )
+
+
+def _strip_group_chatter_boilerplate(text: str) -> str:
+    t = core.normalize_text(text)
+    if not t:
+        return ""
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if not lines:
+        return t
+
+    kept: list[str] = []
+    for ln in lines:
+        key_len = len(_line_dedupe_key(ln))
+        if key_len <= 56 and _GROUP_HOST_CHATTER_PAT.search(ln):
+            continue
+        if key_len <= 56 and _GROUP_ORCHESTRATION_PAT.search(ln):
+            continue
+        if re.match(r"^(?:@?[\w\u4e00-\u9fff-]{1,20}\s*)?(?:接|你接|请接|来接)\s*[~～!！。\.]*$", ln):
+            continue
+        kept.append(ln)
+
+    if not kept:
+        return t
+    return core.normalize_text("\n".join(kept))
+
+
+def _strip_private_thoughts(text: str) -> str:
+    """
+    过滤明显“思考/内心独白”段，避免在模型之间传播。
+    仅用于转发与跨模型提示，不影响 UI 上原始公开回复展示。
+    """
+    t = core.normalize_text(text)
+    if not t:
+        return ""
+
+    # Common explicit thought blocks.
+    t = re.sub(r"(?is)<\s*think\s*>.*?<\s*/\s*think\s*>", "", t)
+    t = re.sub(r"(?is)</?\s*think\s*>", "", t)
+    t = re.sub(r"(?is)```(?:thinking|analysis|reasoning|thought).*?```", "", t)
+
+    thought_head = re.compile(
+        r"^\s*(思考(?:中)?|已思考|思路|推理过程|内心独白|thinking|analysis|reasoning|thoughts?)\b",
+        re.I,
+    )
+    thought_timer = re.compile(r"^\s*思考[（(]用时.+?[)）]\s*$", re.I)
+
+    out: list[str] = []
+    skipping = False
+    for ln in t.splitlines():
+        s = ln.strip()
+        if not s:
+            if skipping:
+                skipping = False
+                continue
+            out.append("")
+            continue
+        if thought_timer.match(s):
+            continue
+        if thought_head.match(s):
+            skipping = True
+            continue
+        if re.search(r"(让我构思|让我再确认|让我数一下|检查字数|字数符合要求|好，就这个)", s):
+            continue
+        if re.match(r"^\s*我需要\s*[:：].{0,64}$", s):
+            continue
+        if skipping:
+            continue
+        out.append(ln)
+
+    return core.normalize_text("\n".join(out))
+
+
+_PUBLIC_HEAD_PAT = re.compile(
+    r"^\s*(?:【|\[)?(?:对外|公开|外显|发言|public|output|out)(?:】|\])?\s*[:：]?\s*$",
+    re.I,
+)
+_PRIVATE_HEAD_PAT = re.compile(
+    r"^\s*(?:【|\[)?(?:内心|私下|私有|思考|想法|thought|private|inner|analysis)(?:】|\])?\s*[:：]?\s*$",
+    re.I,
+)
+_EXPLICIT_PUBLIC_PRIVATE_MARK_PAT = re.compile(
+    r"(?:"
+    r"(?:【|\[)\s*(?:对外|公开|外显|发言|public|output|out|内心|私下|私有|思考|想法|thought|private|inner|analysis)\s*(?:】|\])"
+    r"|(?:^|\n)\s*(?:对外|公开|外显|发言|public|output|out|内心|私下|私有|思考|想法|thought|private|inner|analysis)\s*[:：]"
+    r")",
+    re.I,
+)
+_INLINE_PUBLIC_PRIVATE_MARK_PAT = re.compile(
+    r"(?:"
+    r"(?:【|\[)\s*(?P<head_a>对外|公开|外显|发言|public|output|out|内心|私下|私有|思考|想法|thought|private|inner|analysis)\s*(?:】|\])\s*[:：]?"
+    r"|(?:^|\n)\s*(?P<head_b>对外|公开|外显|发言|public|output|out|内心|私下|私有|思考|想法|thought|private|inner|analysis)\s*[:：]"
+    r")",
+    re.I,
+)
+_TRIVIAL_PUBLIC_PAT = re.compile(r"^\s*(?:已?完成|已经完成|done|ok|好的|收到)\s*[。.!?]?\s*$", re.I)
+_QWEN_STATUS_ONLY_PAT = re.compile(
+    r"^\s*(?:"
+    r"已?完成(?:思考)?|已经完成(?:思考)?|思考|思考中|正在思考|继续思考|生成中|回答中|正在构思|构思中|"
+    r"the chat is in progress|in progress|generating|composing"
+    r")\s*[。.!！？?]?\s*$",
+    re.I,
+)
+_PUBLIC_WRAP_OPEN = "[[PUBLIC_REPLY]]"
+_PUBLIC_WRAP_CLOSE = "[[/PUBLIC_REPLY]]"
+_PRIVATE_WRAP_OPEN = "[[PRIVATE_REPLY]]"
+_PRIVATE_WRAP_CLOSE = "[[/PRIVATE_REPLY]]"
+# Qwen / Doubao are prone to echoing format instructions.
+# Keep wrapper parsing support for backward compatibility, but default to no wrapper hinting.
+_USE_WRAP_HINT_FOR_CN_MODELS = False
+_WRAP_TOKEN_PAT = re.compile(
+    r"(?:<<<\s*(?:PUBLIC_REPLY|END_PUBLIC_REPLY|PRIVATE_REPLY|END_PRIVATE_REPLY)\s*>>>"
+    r"|\[\[\s*/?\s*(?:PUBLIC_REPLY|PRIVATE_REPLY)\s*\]\])",
+    re.I,
+)
+_WRAP_INSTRUCTION_HINTS = (
+    "请把公开发言放在",
+    "公开发言放在",
+    "如需隐藏想法",
+    "你的公开回复",
+    "公开回复",
+    "不要复述本提示",
+    "不要复述提示词",
+    "不要复述题目",
+)
+
+
+def _wrapped_public_quality_score(text: str) -> float:
+    t = core.normalize_text(text)
+    if not t:
+        return -1e9
+    key_len = len(_line_dedupe_key(t))
+    score = float(key_len)
+    if key_len < 8:
+        score -= 300.0
+    if _LOW_VALUE_PROCESS_PAT.match(t):
+        score -= 260.0
+    if _QWEN_STATUS_ONLY_PAT.match(t):
+        score -= 180.0
+    if _looks_unfinished_public_reply(t):
+        score -= 90.0
+    if _looks_prompt_leak_reply(t):
+        score -= 120.0
+    if any(h in t for h in _WRAP_INSTRUCTION_HINTS):
+        score -= 320.0
+    if re.search(r"(?:<<<|>>>|PUBLIC_REPLY|END_PUBLIC_REPLY|PRIVATE_REPLY|END_PRIVATE_REPLY)", t, re.I):
+        score -= 180.0
+    return score
+
+
+def _extract_wrapped_reply(text: str) -> tuple[str, str]:
+    t = core.normalize_text(text)
+    if not t:
+        return "", ""
+    pub = ""
+    pri = ""
+    # Accept both legacy angle-bracket tags and current bracket tags.
+    # Some UIs sanitize "<...>" visually, so bracket tags are more stable.
+    pub_patterns = (
+        re.compile(r"(?is)<<<\s*PUBLIC_REPLY\s*>>>\s*(.*?)\s*<<<\s*END_PUBLIC_REPLY\s*>>>", re.I),
+        re.compile(r"(?is)\[\[\s*PUBLIC_REPLY\s*\]\]\s*(.*?)\s*\[\[\s*/\s*PUBLIC_REPLY\s*\]\]", re.I),
+    )
+    pri_patterns = (
+        re.compile(r"(?is)<<<\s*PRIVATE_REPLY\s*>>>\s*(.*?)\s*<<<\s*END_PRIVATE_REPLY\s*>>>", re.I),
+        re.compile(r"(?is)\[\[\s*PRIVATE_REPLY\s*\]\]\s*(.*?)\s*\[\[\s*/\s*PRIVATE_REPLY\s*\]\]", re.I),
+    )
+    pub_candidates: list[str] = []
+    for pat in pub_patterns:
+        for m in pat.finditer(t):
+            c = core.normalize_text(m.group(1) or "")
+            if c:
+                pub_candidates.append(c)
+    if pub_candidates:
+        pub = max(pub_candidates, key=_wrapped_public_quality_score)
+    pri_candidates: list[str] = []
+    for pat in pri_patterns:
+        for m in pat.finditer(t):
+            c = core.normalize_text(m.group(1) or "")
+            if c:
+                pri_candidates.append(c)
+    if pri_candidates:
+        # Private block is optional; prefer the latest one if multiple appear.
+        pri = pri_candidates[-1]
+    return pub, pri
+
+
+def _split_public_private_reply(text: str) -> tuple[str, str]:
+    """
+    Parse model output into:
+    - public: visible/forwardable content
+    - private: hidden inner thoughts (not forwarded)
+    """
+    t = core.normalize_text(text)
+    if not t:
+        return "", ""
+
+    wrapped_public, wrapped_private = _extract_wrapped_reply(t)
+    if wrapped_public or wrapped_private:
+        pub = _strip_private_thoughts(wrapped_public) or wrapped_public
+        pub = core.normalize_text(_WRAP_TOKEN_PAT.sub("", pub))
+        pri = core.normalize_text(_WRAP_TOKEN_PAT.sub("", wrapped_private))
+        pub_key_len = len(_line_dedupe_key(pub))
+        wrap_placeholder = (
+            pub_key_len < 8
+            or _LOW_VALUE_PROCESS_PAT.match(pub or "")
+            or re.search(
+                r"(你的公开回复|公开回复|在此填写|示例|格式|标记|正文|PUBLIC_REPLY|END_PUBLIC_REPLY|"
+                r"群主最新话题|最终发言要求|如暂不发言|请把公开发言放在|公开发言放在|如需隐藏想法)",
+                pub or "",
+                re.I,
+            )
+        )
+        if pub and not wrap_placeholder:
+            return pub, pri
+
+    private_parts: list[str] = []
+
+    def _save_private(m: re.Match[str]) -> str:
+        part = core.normalize_text(m.group(1) or "")
+        if part:
+            private_parts.append(part)
+        return ""
+
+    body = re.sub(r"(?is)<\s*think\s*>(.*?)<\s*/\s*think\s*>", _save_private, t)
+    body = _WRAP_TOKEN_PAT.sub("", body)
+    body = core.normalize_text(body)
+    if not body:
+        return "", core.normalize_text("\n".join(private_parts))
+
+    # Parse explicit markers like: "【对外】...【内心】..." / "内心: ...".
+    inline: list[re.Match[str]] = []
+    if _EXPLICIT_PUBLIC_PRIVATE_MARK_PAT.search(body):
+        inline = list(_INLINE_PUBLIC_PRIVATE_MARK_PAT.finditer(body))
+    if inline:
+        pub_seg: list[str] = []
+        pri_seg: list[str] = []
+        structured_hits = 0
+        first_private_pos: Optional[int] = None
+
+        for idx, m in enumerate(inline):
+            head = core.normalize_text((m.group("head_a") or m.group("head_b") or "")).lower()
+            if not head:
+                continue
+            start = m.end()
+            end = inline[idx + 1].start() if idx + 1 < len(inline) else len(body)
+            seg = core.normalize_text(body[start:end])
+            if not seg:
+                continue
+            if head in {"对外", "公开", "外显", "发言", "public", "output", "out"}:
+                pub_seg.append(seg)
+                structured_hits += 1
+            elif head in {"内心", "私下", "私有", "思考", "想法", "thought", "private", "inner", "analysis"}:
+                if first_private_pos is None:
+                    first_private_pos = m.start()
+                pri_seg.append(seg)
+                structured_hits += 1
+
+        if structured_hits >= 1 and (pub_seg or pri_seg):
+            public = core.normalize_text("\n".join(pub_seg))
+            private = core.normalize_text("\n".join(pri_seg + private_parts))
+            if not public and first_private_pos is not None:
+                public = core.normalize_text(body[:first_private_pos])
+            if public:
+                return _strip_private_thoughts(public) or public, private
+            # no public block: fallback to original body to avoid empty visible reply.
+            return _strip_private_thoughts(body) or body, private
+
+    pub_lines: list[str] = []
+    pri_lines: list[str] = []
+    mode = "public"
+    has_struct = False
+
+    for ln in body.splitlines():
+        s = ln.strip()
+        if not s:
+            if mode == "public":
+                pub_lines.append("")
+            else:
+                pri_lines.append("")
+            continue
+        if _PUBLIC_HEAD_PAT.match(s):
+            mode = "public"
+            has_struct = True
+            continue
+        if _PRIVATE_HEAD_PAT.match(s):
+            mode = "private"
+            has_struct = True
+            continue
+        if mode == "public":
+            pub_lines.append(ln)
+        else:
+            pri_lines.append(ln)
+
+    public = core.normalize_text("\n".join(pub_lines))
+    private = core.normalize_text("\n".join(pri_lines + private_parts))
+
+    # If no explicit structure exists, keep original as public.
+    if not has_struct:
+        public = body
+        # still strip explicit "内心：..." one-liners into private when possible.
+        m = re.search(r"(?is)(?:^|\n)\s*(?:内心|思考|private|inner)\s*[:：]\s*(.+)$", body, re.I)
+        if m:
+            p = core.normalize_text(m.group(1))
+            if p:
+                private = core.normalize_text("\n".join([private, p]))
+            public = core.normalize_text(body[: m.start()])
+
+    public = _strip_private_thoughts(public) or public
+    return core.normalize_text(public), core.normalize_text(private)
+
+
+def _detail_digest(text: str, *, max_chars: int, max_lines: int) -> str:
+    """
+    细节保留型压缩：
+    - 保留首尾句；
+    - 优先保留带数字/条件/边界/结论的句子；
+    - 控制总长度，避免上下文膨胀。
+    """
+    t = core.normalize_text(text)
+    if not t:
+        return ""
+
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if not lines:
+        return _clip_text(t, max_chars)
+    if len(t) <= max_chars and len(lines) <= max_lines:
+        return t
+
+    scored: list[tuple[int, int, str]] = []
+    last_idx = len(lines) - 1
+    for idx, ln in enumerate(lines):
+        score = 0
+        if idx == 0:
+            score += 4
+        if idx == last_idx:
+            score += 3
+        if re.search(r"\d|%|￥|\$|年|月|日|分钟|小时|ms|MB|GB|km|℃", ln):
+            score += 3
+        if re.search(r"因为|所以|但是|然而|如果|前提|风险|边界|反例|结论|建议|成本|收益|限制|条件|步骤|方案|假设", ln):
+            score += 2
+        if len(ln) >= 22:
+            score += 1
+        scored.append((score, idx, ln))
+
+    keep_idx: set[int] = {0, last_idx}
+    for _, idx, _ in sorted(scored, key=lambda x: (-x[0], x[1])):
+        keep_idx.add(idx)
+        if len(keep_idx) >= max_lines:
+            break
+
+    picked = [lines[i] for i in sorted(keep_idx)]
+    out: list[str] = []
+    used = 0
+    for ln in picked:
+        extra = len(ln) + (1 if out else 0)
+        if used + extra > max_chars:
+            break
+        out.append(ln)
+        used += extra
+
+    if not out:
+        return _clip_text("\n".join(lines), max_chars)
+    merged = "\n".join(out).strip()
+    if len(merged) < len(t) and len(merged) < max_chars:
+        if not merged.endswith("…"):
+            merged += "\n…"
+    return merged
+
+
+def _strip_leading_status_noise(text: str) -> str:
+    t = core.normalize_text(text)
+    if not t:
+        return ""
+    out: list[str] = []
+    for ln in t.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if _QWEN_STATUS_ONLY_PAT.match(s):
+            continue
+        s2 = re.sub(
+            r"^\s*(?:已?完成(?:思考)?|已经完成(?:思考)?|思考|思考中|正在思考|继续思考|生成中|回答中|正在构思|构思中)\s*(?:[|｜:：\-—>»]+\s*)",
+            "",
+            s,
+            flags=re.I,
+        )
+        s2 = re.sub(r"^\s*(?:首先写|先写|先答|先说|先回一句)\s*[：:]\s*", "", s2, flags=re.I)
+        s2 = core.normalize_text(s2) or s
+        if _QWEN_STATUS_ONLY_PAT.match(s2):
+            continue
+        out.append(s2)
+    return core.normalize_text("\n".join(out))
+
+
 def _format_msg_for_context(msg: UiMessage) -> str:
-    # 优先使用模型的【转发摘要】压缩上下文，避免“已截断”。
+    # 优先用【转发摘要】；没有时做“细节保留型”压缩，统一三模型上下文质量。
     if msg.role == "model":
         main, summary = _split_forward_summary(msg.text)
-        body = summary or _clip_text(main or msg.text, 240)
+        body_src = summary or (main or msg.text)
+        body = _detail_digest(body_src, max_chars=420, max_lines=8)
     else:
-        body = _clip_text(msg.text, 260)
+        body = _detail_digest(msg.text, max_chars=360, max_lines=7)
     prefix = "系统" if msg.role == "system" else msg.speaker
     return f"{prefix}: {body}".strip()
+
+
+def _looks_prompt_leak_reply(text: str) -> bool:
+    t = core.normalize_text(text)
+    if not t:
+        return True
+    hints = (
+        _PUBLIC_WRAP_OPEN,
+        _PUBLIC_WRAP_CLOSE,
+        _PRIVATE_WRAP_OPEN,
+        _PRIVATE_WRAP_CLOSE,
+        f"格式：{_PUBLIC_WRAP_OPEN}正文{_PUBLIC_WRAP_CLOSE}",
+        "你在多人群聊中发言",
+        "你在多人群聊中继续讨论",
+        "群主最新话题：",
+        "上一位发言（",
+        "最终发言要求：",
+        "只输出给群里的正文",
+        "请把公开发言放在",
+        "如需隐藏想法，可放在",
+        "如暂不发言，仅回复 [PASS]",
+        "只输出 [PASS]",
+        "只依据以下群聊消息回复",
+        "不要复述本提示",
+        "不要复述提示词",
+        "可回应对象：",
+        "可点名对象：",
+        "上下文边界",
+        "忽略网页里更早的旧对话",
+        "Gemini 应用",
+        "与 Gemini 对话",
+        "须遵守《Google 条款》",
+        "须遵守《Google 隐私权政策》",
+        "Gemini 是一款 AI 工具",
+    )
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if not lines:
+        return True
+
+    bad = 0
+    good = 0
+    for ln in lines:
+        candidate = re.sub(
+            r"^\s*(?:已?完成(?:思考)?|已经完成(?:思考)?|思考中|正在思考|生成中|回答中)\s*[|｜:：\-]*\s*",
+            "",
+            ln,
+            flags=re.I,
+        )
+        candidate = core.normalize_text(candidate) or ln
+        k = _line_dedupe_key(candidate)
+        is_bad = False
+        q_ratio = (candidate.count("?") + candidate.count("？")) / max(1, len(candidate))
+        if any(h in ln for h in hints):
+            is_bad = True
+        if q_ratio >= 0.35 and len(k) < 12:
+            is_bad = True
+        if _QWEN_STATUS_ONLY_PAT.match(candidate):
+            is_bad = True
+        if _GROUP_HOST_CHATTER_PAT.search(candidate) and len(k) <= 56:
+            is_bad = True
+        if _GROUP_ORCHESTRATION_PAT.search(candidate) and len(k) <= 56:
+            is_bad = True
+        if _LOW_VALUE_PROCESS_PAT.match(candidate):
+            is_bad = True
+        if is_bad:
+            if k and len(k) >= 12 and not _QWEN_STATUS_ONLY_PAT.match(candidate):
+                good += 1
+            bad += 1
+            continue
+        if k and len(k) >= 10:
+            good += 1
+
+    if good >= 1 and bad < len(lines):
+        return False
+    return bad >= max(1, len(lines) // 2)
+
+
+def _line_dedupe_key(line: str) -> str:
+    s = core.normalize_text(line).lower()
+    if not s:
+        return ""
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", s)
+
+
+def _drop_repeated_line_blocks(lines: list[str], *, max_block: int = 10) -> list[str]:
+    if len(lines) < 4:
+        return lines
+    keys = [_line_dedupe_key(x) for x in lines]
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        block_cap = min(max_block, i, n - i)
+        skip = 0
+        for block in range(block_cap, 1, -1):
+            cur = keys[i : i + block]
+            if not all(cur):
+                continue
+            if sum(len(x) for x in cur) < 16:
+                continue
+            seen_before = False
+            for j in range(0, i - block + 1):
+                if keys[j : j + block] == cur:
+                    seen_before = True
+                    break
+            if seen_before:
+                skip = block
+                break
+        if skip:
+            i += skip
+            continue
+        out.append(lines[i])
+        i += 1
+    return out
+
+
+def _dedupe_public_reply(text: str) -> str:
+    t = core.normalize_text(text)
+    if not t:
+        return ""
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if len(lines) <= 1:
+        return t
+
+    out: list[str] = []
+    seen: set[str] = set()
+    seen_long: list[str] = []
+    prev_key = ""
+    for ln in lines:
+        k = _line_dedupe_key(ln)
+        if not k:
+            continue
+        if k == prev_key:
+            continue
+        if len(k) >= 8 and k in seen:
+            continue
+        covered = False
+        if len(k) >= 8:
+            for old in seen_long[-24:]:
+                if len(old) >= len(k) + 8 and k in old:
+                    covered = True
+                    break
+        if covered:
+            continue
+        out.append(ln)
+        if k:
+            seen.add(k)
+        if len(k) >= 14:
+            seen_long.append(k)
+        prev_key = k
+
+    out = _drop_repeated_line_blocks(out, max_block=10)
+    changed = True
+    while changed and len(out) >= 4:
+        changed = False
+        cap = min(8, len(out) // 2)
+        for block in range(cap, 0, -1):
+            left = out[-2 * block : -block]
+            right = out[-block:]
+            if not left or not right:
+                continue
+            if left == right:
+                out = out[:-block]
+                changed = True
+                break
+    return core.normalize_text("\n".join(out))
+
+
+def _compact_public_reply(text: str, *, max_chars: int = 220, max_lines: int = 4) -> str:
+    t = core.normalize_text(text)
+    if not t:
+        return ""
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if len(t) <= max_chars and len(lines) <= max_lines:
+        return t
+
+    norm_lines: list[str] = []
+    for ln in lines:
+        s = re.sub(r"^\s*[-*•●]+\s*", "", ln)
+        s = re.sub(r"^\s*\d+\s*[).、]\s*", "", s)
+        s = re.sub(r"^\s*#{1,6}\s*", "", s)
+        s = core.normalize_text(s)
+        if not s:
+            continue
+        if norm_lines and _line_dedupe_key(s) == _line_dedupe_key(norm_lines[-1]):
+            continue
+        norm_lines.append(s)
+
+    if not norm_lines:
+        return _clip_text(t, max_chars)
+
+    flat = " ".join(norm_lines)
+    sentences = [x.strip() for x in re.split(r"(?<=[。！？?!；;])\s*", flat) if x.strip()]
+    picked_sent: list[str] = []
+    used = 0
+    for s in sentences[:8]:
+        extra = len(s) + (0 if not picked_sent else 0)
+        if used + extra > max_chars:
+            break
+        picked_sent.append(s)
+        used += extra
+        if len(picked_sent) >= 3:
+            break
+    if picked_sent:
+        out = core.normalize_text("".join(picked_sent))
+        if out:
+            return out
+
+    picked_lines: list[str] = []
+    used_lines = 0
+    for ln in norm_lines:
+        if len(picked_lines) >= max_lines:
+            break
+        extra = len(ln) + (1 if picked_lines else 0)
+        if used_lines + extra > max_chars:
+            break
+        picked_lines.append(ln)
+        used_lines += extra
+    out2 = core.normalize_text("\n".join(picked_lines))
+    if out2:
+        return out2
+    return _clip_text(t, max_chars)
+
+
+def _strip_reply_history_echo(text: str, previous_texts: list[str]) -> str:
+    cur = core.normalize_text(text)
+    if not cur:
+        return ""
+    prevs = [core.normalize_text(x) for x in previous_texts if core.normalize_text(x)]
+    if not prevs:
+        return cur
+
+    def _split_lines(x: str) -> list[str]:
+        return [ln.strip() for ln in core.normalize_text(x).splitlines() if ln.strip()]
+
+    cur_lines = _split_lines(cur)
+    if not cur_lines:
+        return cur
+
+    cur_keys = [_line_dedupe_key(ln) for ln in cur_lines]
+    cur_keys = [k for k in cur_keys if k]
+    if not cur_keys:
+        return cur
+
+    best = cur
+    best_key_len = len(_line_dedupe_key(cur))
+
+    for prev in prevs:
+        if not prev or prev == cur:
+            continue
+        cand = ""
+        if cur.startswith(prev) and len(cur) > len(prev):
+            cand = core.normalize_text(cur[len(prev) :])
+
+        prev_lines = _split_lines(prev)
+        prev_keys = [_line_dedupe_key(ln) for ln in prev_lines]
+        prev_keys = [k for k in prev_keys if k]
+        if prev_keys and cur_keys:
+            common = 0
+            max_common = min(len(prev_keys), len(cur_keys))
+            while common < max_common and prev_keys[common] == cur_keys[common]:
+                common += 1
+            if common >= max(2, len(prev_keys) - 1) and len(cur_lines) > common:
+                tail = core.normalize_text("\n".join(cur_lines[common:]))
+                if tail:
+                    cand = tail if (not cand or len(_line_dedupe_key(tail)) < len(_line_dedupe_key(cand))) else cand
+
+            max_overlap = min(len(prev_keys), len(cur_keys) - 1)
+            for overlap in range(max_overlap, 1, -1):
+                if prev_keys[-overlap:] == cur_keys[:overlap]:
+                    tail2 = core.normalize_text("\n".join(cur_lines[overlap:]))
+                    if tail2:
+                        cand = (
+                            tail2
+                            if (not cand or len(_line_dedupe_key(tail2)) < len(_line_dedupe_key(cand)))
+                            else cand
+                        )
+                    break
+
+        cand = core.normalize_text(cand)
+        if not cand:
+            continue
+        cand_key_len = len(_line_dedupe_key(cand))
+        if cand_key_len >= 6 and cand_key_len < best_key_len:
+            best = cand
+            best_key_len = cand_key_len
+
+    hist_keys: set[str] = set()
+    for prev in prevs:
+        for ln in prev.splitlines():
+            k = _line_dedupe_key(ln)
+            if k and len(k) >= 8:
+                hist_keys.add(k)
+
+    if hist_keys:
+        best_lines = [ln.strip() for ln in best.splitlines() if ln.strip()]
+        if len(best_lines) >= 3:
+            kept: list[str] = []
+            dropped = 0
+            for ln in best_lines:
+                k = _line_dedupe_key(ln)
+                if k and len(k) >= 8 and k in hist_keys:
+                    dropped += 1
+                    continue
+                kept.append(ln)
+            if kept and (dropped >= 2 or (dropped * 1.0 / max(1, len(best_lines))) >= 0.45):
+                tail_keep = core.normalize_text("\n".join(kept))
+                if tail_keep:
+                    best = tail_keep
+
+    if hist_keys:
+        best_lines2 = [ln.strip() for ln in best.splitlines() if ln.strip()]
+        if len(best_lines2) >= 2:
+            idx = 0
+            while idx < len(best_lines2) - 1:
+                k = _line_dedupe_key(best_lines2[idx])
+                if not k or k not in hist_keys:
+                    break
+                idx += 1
+            if idx > 0:
+                lead_trim = core.normalize_text("\n".join(best_lines2[idx:]))
+                if lead_trim:
+                    best = lead_trim
+
+    best_norm = core.normalize_text(best)
+    if not best_norm:
+        return cur
+
+    cur_key_len = len(_line_dedupe_key(cur))
+    best_key_len = len(_line_dedupe_key(best_norm))
+    if cur_key_len >= 20 and best_key_len > 0 and best_key_len < max(10, int(cur_key_len * 0.45)):
+        return cur
+    if re.match(r"^[，,。.!！?？；;:：]", best_norm):
+        if best_key_len < max(12, int(cur_key_len * 0.85)):
+            return cur
+    return best_norm
+
+
+def _strip_instruction_echo(reply: str, instruction: str) -> str:
+    cur = core.normalize_text(reply)
+    inst = core.normalize_text(instruction)
+    if not cur or not inst:
+        return cur
+
+    cur_key = _line_dedupe_key(cur)
+    inst_key = _line_dedupe_key(inst)
+    if cur_key and inst_key:
+        if cur_key == inst_key:
+            return ""
+        if len(cur_key) >= 16 and cur_key in inst_key:
+            return ""
+        if len(inst_key) >= 24 and inst_key in cur_key and (len(cur_key) - len(inst_key)) <= 64:
+            return ""
+
+    inst_line_keys = {
+        _line_dedupe_key(ln)
+        for ln in inst.splitlines()
+        if _line_dedupe_key(ln) and len(_line_dedupe_key(ln)) >= 10
+    }
+    if not inst_line_keys:
+        return cur
+
+    kept: list[str] = []
+    dropped = 0
+    for ln in cur.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        k = _line_dedupe_key(s)
+        if k and len(k) >= 10:
+            if k in inst_line_keys:
+                dropped += 1
+                continue
+            if any(k in ik for ik in inst_line_keys if len(ik) >= len(k) + 10):
+                dropped += 1
+                continue
+        kept.append(s)
+
+    out = core.normalize_text("\n".join(kept))
+    if dropped <= 0:
+        return cur
+    if not out:
+        return ""
+    if dropped >= 2 and len(_line_dedupe_key(out)) < 12:
+        return ""
+    return out
+
+
+def _is_near_duplicate_reply(text: str, previous_texts: list[str]) -> bool:
+    cur = core.normalize_text(text)
+    if not cur:
+        return False
+    cur_key = _line_dedupe_key(cur)
+    if not cur_key:
+        return False
+    cur_lines = {
+        _line_dedupe_key(ln)
+        for ln in cur.splitlines()
+        if _line_dedupe_key(ln) and len(_line_dedupe_key(ln)) >= 8
+    }
+
+    for prev in previous_texts:
+        old = core.normalize_text(prev)
+        if not old:
+            continue
+        old_key = _line_dedupe_key(old)
+        if not old_key:
+            continue
+        if cur_key == old_key:
+            return True
+        if len(cur_key) < 10 or len(old_key) < 10:
+            continue
+        if len(cur_key) >= 18 and len(old_key) >= 18:
+            if old_key in cur_key and (len(cur_key) - len(old_key)) <= 88:
+                return True
+            if cur_key in old_key and (len(old_key) - len(cur_key)) <= 88:
+                return True
+            ratio = SequenceMatcher(None, cur_key[-1500:], old_key[-1500:]).ratio()
+            if ratio >= 0.86:
+                return True
+            if min(len(cur_key), len(old_key)) >= 24 and ratio >= 0.78:
+                pref = 0
+                for a, b in zip(cur_key, old_key):
+                    if a != b:
+                        break
+                    pref += 1
+                if (pref / max(1, min(len(cur_key), len(old_key)))) >= 0.72:
+                    return True
+            if ratio >= 0.70:
+                intro_pat = r"(?:大家好|我是|我叫|i am|this is)"
+                if re.search(intro_pat, cur, re.I) and re.search(intro_pat, old, re.I):
+                    return True
+
+        if cur_lines:
+            old_lines = {
+                _line_dedupe_key(ln)
+                for ln in old.splitlines()
+                if _line_dedupe_key(ln) and len(_line_dedupe_key(ln)) >= 8
+            }
+            if len(cur_lines) >= 3 and old_lines:
+                overlap = len(cur_lines & old_lines) / max(1, len(cur_lines))
+                if overlap >= 0.78:
+                    return True
+    return False
+
+
+def _looks_unfinished_public_reply(text: str) -> bool:
+    t = core.normalize_text(text)
+    if not t:
+        return True
+    if _WRAP_TOKEN_PAT.search(t):
+        pub, _ = _extract_wrapped_reply(t)
+        if not core.normalize_text(pub):
+            return True
+    if _LOW_VALUE_PROCESS_PAT.match(t):
+        return True
+    if re.search(r"</?\s*think\s*>", t, re.I):
+        return True
+    if re.search(r"(?:我需要\s*[:：]|让我(?:构思|想一下|数一下|再确认)|检查字数|字数符合要求|好，就这个)", t):
+        return True
+    if re.match(r"^\s*(?:现在)?我需要.{0,140}(?:然后|再)(?:回应|补充|给出|讨论)", t):
+        return True
+    if re.search(r"(基于当前信息提出预测与假设|先给区间和假设|首先[，,]先给区间和假设)", t):
+        return True
+    if ("价格区间" in t and "假设" in t) and not re.search(r"\d", t):
+        return True
+    m_pref = re.match(r"^(?:@?[\w\u4e00-\u9fff-]{1,24})[：:]\s*(.+)$", t)
+    if m_pref and _LOW_VALUE_PROCESS_PAT.match(core.normalize_text(m_pref.group(1))):
+        return True
+    if re.fullmatch(r"[\u4e00-\u9fff]{4,10}(?:\n@[\w\u4e00-\u9fff-]{1,24})?", t):
+        return False
+    k = _line_dedupe_key(t)
+    klen = len(k)
+    if "\n" not in t and 6 <= klen <= 34:
+        if re.search(r"(开始|启动|继续|承接|推进|分析|理解|权衡|优化|聚焦|专注|整理|总结|接龙|回应|流程|进程)", t):
+            if not re.search(r"(我|你|他|她|我们|建议|同意|反对|认为|可以|应该|因为|所以)", t):
+                return True
+    if klen < 8:
+        return True
+    if any(h in t for h in ("正在构思", "构思中", "先想一下", "先整理一下", "组织语言")):
+        return True
+    if re.search(r"(?:\d{1,3}\s*字(?:左右)?|字数).{0,10}(?:符合要求|即可)|符合要求(?:即可)?", t):
+        return True
+    if any(h in t for h in ("不要复述提示词", "不要复述题目", "实质内容", "附一个追问", "直接发你在群里的这条回复")):
+        return True
+    if t.endswith(("...", "…")) and klen < 64:
+        return True
+    if re.search(r"[A-Za-z]$", t) and klen < 120:
+        return True
+    if "\n" not in t and klen < 18 and not re.search(r"[。？！?!]", t):
+        return True
+    return False
+
+
+def _looks_like_suggestion_chip_reply(text: str) -> bool:
+    t = core.normalize_text(text)
+    if not t:
+        return False
+    parts: list[str] = []
+    for ln in t.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        segs = [x.strip() for x in re.split(r"[|｜/]+", s) if x.strip()]
+        if segs:
+            parts.extend(segs)
+        else:
+            parts.append(s)
+    if len(parts) < 2:
+        return False
+
+    chip_like = 0
+    for p in parts:
+        key_len = len(_line_dedupe_key(p))
+        if key_len <= 2 or key_len > 34:
+            continue
+        if re.search(r"[。！？?!；;:：]", p):
+            continue
+        if re.search(r"^(生成|写一份|写一封|帮我|推荐|提供|整理|翻译|总结)", p):
+            chip_like += 1
+            continue
+        if p.endswith("生成") or p.endswith("模板") or p.endswith("大纲"):
+            chip_like += 1
+            continue
+    return chip_like >= max(2, int(len(parts) * 0.65))
+
+
+def _strip_trailing_solicit_line(text: str) -> str:
+    t = core.normalize_text(text)
+    if not t:
+        return ""
+    t = re.sub(
+        r"^\s*(?:ChatGPT|Gemini|DeepSeek|Qwen|Doubao|豆包|通义千问|千问)\s*说\s*(?:[/：:]\s*)?",
+        "",
+        t,
+        flags=re.I,
+    )
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if not lines:
+        return t
+
+    while lines:
+        tail = lines[-1]
+        klen = len(_line_dedupe_key(tail))
+        if re.match(r"^[A-Za-z][A-Za-z0-9 _-]{1,20}\s*说$", tail):
+            lines.pop()
+            continue
+        if klen <= 56 and re.search(r"(需要我|要不要我|如果你需要|是否需要我|我可以继续|我可以帮你|还需要我)", tail):
+            lines.pop()
+            continue
+        if klen <= 64 and re.search(r"(要我为你|要我给你|需要我给你|我来帮你整理)", tail):
+            lines.pop()
+            continue
+        if klen <= 48 and re.search(r"(还有什么|继续聊|继续问|欢迎继续|想聊的尽管说)", tail):
+            lines.pop()
+            continue
+        break
+
+    out = core.normalize_text("\n".join(lines))
+    if out:
+        return out
+    if re.search(r"(需要我|要不要我|如果你需要|是否需要我|我可以继续|我可以帮你|还需要我|要我为你|要我给你|需要我给你)", t):
+        return ""
+    return t
+
+
+def _looks_stale_extracted_reply(reply: str, before_snapshot: str, *, before_last_reply: str = "") -> bool:
+    cur = core.normalize_text(reply)
+    if not cur:
+        return False
+
+    cur_key = _line_dedupe_key(cur)
+    prev_last_key = _line_dedupe_key(before_last_reply)
+    if cur_key and prev_last_key and len(cur_key) >= 10 and cur_key == prev_last_key:
+        return True
+
+    before_keys = {
+        _line_dedupe_key(ln)
+        for ln in core.normalize_text(before_snapshot).splitlines()
+        if _line_dedupe_key(ln) and len(_line_dedupe_key(ln)) >= 8
+    }
+    if not before_keys:
+        return False
+
+    cur_keys = [
+        _line_dedupe_key(ln)
+        for ln in cur.splitlines()
+        if _line_dedupe_key(ln) and len(_line_dedupe_key(ln)) >= 8
+    ]
+    if not cur_keys:
+        return False
+
+    unseen = [k for k in cur_keys if k not in before_keys]
+    if not unseen:
+        return True
+    overlap = 1.0 - (len(unseen) / max(1, len(cur_keys)))
+    if overlap >= 0.86 and len(unseen) <= 1 and len(cur_keys) >= 2:
+        return True
+    return False
+
+
+def _pick_best_semantic_fragment(text: str) -> str:
+    t = core.normalize_text(text)
+    if not t:
+        return ""
+    segments: list[tuple[int, str]] = []
+    for idx_line, ln in enumerate(t.splitlines()):
+        s = ln.strip()
+        if not s:
+            continue
+        segs = [x.strip() for x in re.split(r"[|｜]+", s) if x.strip()]
+        if not segs:
+            continue
+        for seg in segs:
+            segments.append((idx_line, seg))
+    if len(segments) <= 1:
+        return t
+
+    cleaned: list[tuple[float, str]] = []
+    for idx, seg0 in segments:
+        seg = core.normalize_text(seg0)
+        if not seg:
+            continue
+        m_pref = re.match(r"^(?:@?[\w\u4e00-\u9fff-]{1,24})[：:]\s*(.+)$", seg)
+        if m_pref:
+            tail = core.normalize_text(m_pref.group(1))
+            if tail and not _looks_unfinished_public_reply(tail):
+                seg = tail
+        if _TRIVIAL_PUBLIC_PAT.match(seg) or _QWEN_STATUS_ONLY_PAT.match(seg):
+            continue
+        if _looks_like_suggestion_chip_reply(seg):
+            continue
+        if _looks_unfinished_public_reply(seg):
+            continue
+        klen = len(_line_dedupe_key(seg))
+        if klen < 4:
+            continue
+        bad_hint = 0
+        if re.search(r"(上下文边界|忽略网页里更早的旧对话|可回应对象|可点名对象|只输出\s*\[?\s*PASS|状态词)", seg, re.I):
+            bad_hint += 3
+        if re.search(r"请(?:直接|基于|必须|先|你).*?(?:回复|回应|观点|短消息)", seg):
+            bad_hint += 2
+        if bad_hint >= 2 and klen <= 84:
+            continue
+        score = 0.0
+        score += idx * 0.15
+        if re.search(r"[。！？?!]", seg):
+            score += 2.0
+        if 4 <= klen <= 64:
+            score += 2.0
+        if klen > 64:
+            score += 0.8
+        if "@" in seg:
+            score += 0.5
+        if _LOW_VALUE_PROCESS_PAT.match(seg) or re.search(
+            r"(继续推进|聚焦|专注回应|忽略初始回合|专注解析|承接对话|延续语意流|权衡上下文限制)",
+            seg,
+        ):
+            score -= 3.0
+        cleaned.append((score, seg))
+
+    if not cleaned:
+        return t
+    cleaned.sort(key=lambda x: (x[0], len(_line_dedupe_key(x[1]))))
+    return core.normalize_text(cleaned[-1][1]) or t
 
 
 def build_model_prompt(history: list[UiMessage], instruction: str) -> str:
@@ -2195,6 +3802,15 @@ class Worker:
         self._pw = None
         self._sp = None
         self._adapters: dict[str, ModelAdapter] = {}
+        # 每次后端重启后，DeepSeek 首次发言前强制新建对话，避免误用旧线程历史。
+        self._deepseek_need_fresh_chat = True
+        # 每次后端重启后，Qwen 首次发言前也新建对话，避免串旧上下文。
+        self._qwen_need_fresh_chat = True
+        # 豆包不强制首轮新对话：部分页面版本在“新对话”按钮切换后首轮提取会不稳定。
+        self._doubao_need_fresh_chat = False
+        # ChatGPT / Gemini 在长会话下也会明显串旧话题；群任务开始时尽量新开对话。
+        self._chatgpt_need_fresh_chat = True
+        self._gemini_need_fresh_chat = True
 
     def start(self) -> None:
         self._thread.start()
@@ -2304,24 +3920,88 @@ class Worker:
         assert self._pw is not None
 
         self.state.set_status(f"checking_login:{key}")
-        ad.ensure_page(self._pw)
-        ok = ad.is_authenticated_now()
+        page = ad.ensure_page(self._pw)
+        m = self.state.get_model(key)
+
+        # 允许页面在“已登录但输入框晚出现”时完成初始化，降低误判。
+        ok = False
+        deadline = time.time() + 18.0
+        while time.time() < deadline:
+            if m and m.key == "deepseek":
+                try:
+                    self._ensure_deepseek_dialog(page)
+                except Exception:
+                    pass
+            try:
+                ok = ad.is_authenticated_now()
+            except Exception:
+                ok = False
+            if ok:
+                break
+            time.sleep(0.6)
+
         self.state.set_authenticated(key, ok)
         if ok:
             self.state.mark_pending_enable_done(key)
         self.state.set_status("idle")
         self._safe_reply(action, {"ok": True, "authenticated": bool(ok)})
 
-    def _ensure_deepseek_dialog(self, page: Any) -> None:
-        """DeepSeek occasionally lands on list-only view; open a chat panel for stability."""
+    @staticmethod
+    def _click_generic_new_chat(page: Any) -> bool:
+        candidates = [
+            page.get_by_role("button", name=re.compile(r"新建对话|新对话|新聊天|new chat|new conversation", re.I)),
+            page.get_by_role("link", name=re.compile(r"新建对话|新对话|新聊天|new chat|new conversation", re.I)),
+            page.get_by_text(re.compile(r"新建对话|新对话|新聊天|new chat|new conversation", re.I)),
+            page.locator("a:has-text('新建对话'),a:has-text('新对话'),a:has-text('新聊天')"),
+            page.locator("button[aria-label*='New chat' i],button[title*='New chat' i]"),
+            page.locator("[data-testid*='new' i],[data-test*='new' i]"),
+        ]
+        for loc in candidates:
+            node = core.pick_visible(loc, prefer_last=False)
+            if node is None:
+                continue
+            try:
+                node.click(timeout=3000)
+                time.sleep(0.8)
+                return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _click_deepseek_new_chat(page: Any) -> bool:
+        candidates = [
+            page.get_by_role("button", name=re.compile(r"开启新对话|新对话|new chat", re.I)),
+            page.get_by_text(re.compile(r"开启新对话|新对话|new chat", re.I)),
+        ]
+        for loc in candidates:
+            node = core.pick_visible(loc, prefer_last=False)
+            if node is None:
+                continue
+            try:
+                node.click(timeout=3000)
+                time.sleep(0.8)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _ensure_deepseek_dialog(self, page: Any, *, force_new_chat: bool = False) -> bool:
+        """
+        Ensure DeepSeek has an active dialog panel.
+        - force_new_chat=True: 强制优先点“新对话”（用于后端重启后的首次发言）。
+        """
+        if force_new_chat and self._click_deepseek_new_chat(page):
+            return True
+
         try:
             if page.locator("div.ds-message").count() > 0:
-                return
+                return True
         except Exception:
-            return
+            pass
 
         clicked = False
-        # Prefer opening the latest existing thread (keeps context visible).
+        # Fallback: open the latest existing thread if visible.
         for sel in ("div._3098d02", "div[class*='_3098d02']"):
             try:
                 loc = page.locator(sel)
@@ -2341,25 +4021,64 @@ class Worker:
             except Exception:
                 continue
 
-        # Fallback: open a new chat.
-        if not clicked:
-            candidates = [
-                page.get_by_role("button", name=re.compile(r"开启新对话|新对话|new chat", re.I)),
-                page.get_by_text(re.compile(r"开启新对话|新对话|new chat", re.I)),
-            ]
-            for loc in candidates:
-                node = core.pick_visible(loc, prefer_last=False)
-                if node is None:
-                    continue
-                try:
-                    node.click(timeout=3000)
-                    clicked = True
-                    break
-                except Exception:
-                    continue
-
         if clicked:
             time.sleep(0.8)
+            return True
+
+        return self._click_deepseek_new_chat(page)
+
+    @staticmethod
+    def _click_qwen_new_chat(page: Any) -> bool:
+        candidates = [
+            page.get_by_role("button", name=re.compile(r"新建对话|新对话|new chat|new conversation", re.I)),
+            page.get_by_text(re.compile(r"新建对话|新对话|new chat|new conversation", re.I)),
+            page.get_by_role("link", name=re.compile(r"新建对话|新对话|new chat|new conversation", re.I)),
+            page.locator("a:has-text('新建对话'),a:has-text('新对话')"),
+            page.locator("[data-testid*='new' i],[data-test*='new' i]"),
+        ]
+        for loc in candidates:
+            node = core.pick_visible(loc, prefer_last=False)
+            if node is None:
+                continue
+            try:
+                node.click(timeout=3000)
+                time.sleep(0.8)
+                return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _click_doubao_new_chat(page: Any) -> bool:
+        candidates = [
+            page.get_by_role("button", name=re.compile(r"新对话|新建对话|开始新对话|new chat", re.I)),
+            page.get_by_text(re.compile(r"新对话|新建对话|开始新对话|new chat", re.I)),
+            page.get_by_role("link", name=re.compile(r"新对话|新建对话|开始新对话|new chat", re.I)),
+            page.locator("button[aria-label*='新对话'], button[title*='新对话']"),
+            page.locator("a:has-text('新对话'),a:has-text('新建对话')"),
+            page.locator("[data-testid*='new' i],[data-test*='new' i]"),
+        ]
+        for loc in candidates:
+            node = core.pick_visible(loc, prefer_last=False)
+            if node is None:
+                continue
+            try:
+                node.click(timeout=3000)
+                time.sleep(0.8)
+                return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _reset_adapter_reply_cache(ad: ModelAdapter) -> None:
+        # Fresh web thread should not be contaminated by previous-turn extraction cache.
+        for attr, value in (("_last_effective_reply", ""), ("_recent_sent_line_keys", [])):
+            if hasattr(ad, attr):
+                try:
+                    setattr(ad, attr, value)
+                except Exception:
+                    pass
 
     def _ensure_chat_surface(self, ad: ModelAdapter, m: ModelRuntime) -> Any:
         assert self._pw is not None
@@ -2374,7 +4093,54 @@ class Worker:
             time.sleep(0.5)
 
         if m.key == "deepseek":
-            self._ensure_deepseek_dialog(page)
+            forced = bool(self._deepseek_need_fresh_chat)
+            ok = self._ensure_deepseek_dialog(page, force_new_chat=forced)
+            if forced and ok:
+                self._deepseek_need_fresh_chat = False
+                self._reset_adapter_reply_cache(ad)
+        elif m.key == "doubao" and self._doubao_need_fresh_chat:
+            if self._click_doubao_new_chat(page):
+                self._doubao_need_fresh_chat = False
+                self._reset_adapter_reply_cache(ad)
+            else:
+                try:
+                    page.goto(ad.meta.url, wait_until="domcontentloaded")
+                    time.sleep(0.6)
+                except Exception:
+                    pass
+                if self._click_doubao_new_chat(page):
+                    self._doubao_need_fresh_chat = False
+                    self._reset_adapter_reply_cache(ad)
+        elif m.key == "qwen" and self._qwen_need_fresh_chat:
+            if self._click_qwen_new_chat(page):
+                self._qwen_need_fresh_chat = False
+                self._reset_adapter_reply_cache(ad)
+            else:
+                try:
+                    page.goto(ad.meta.url, wait_until="domcontentloaded")
+                    time.sleep(0.6)
+                except Exception:
+                    pass
+                if self._click_qwen_new_chat(page):
+                    self._qwen_need_fresh_chat = False
+                    self._reset_adapter_reply_cache(ad)
+        elif m.key in {"chatgpt", "gemini"}:
+            need = self._chatgpt_need_fresh_chat if m.key == "chatgpt" else self._gemini_need_fresh_chat
+            if need:
+                ok_new = self._click_generic_new_chat(page)
+                if not ok_new:
+                    try:
+                        page.goto(ad.meta.url, wait_until="domcontentloaded")
+                        time.sleep(0.6)
+                    except Exception:
+                        pass
+                    ok_new = self._click_generic_new_chat(page)
+                if ok_new:
+                    if m.key == "chatgpt":
+                        self._chatgpt_need_fresh_chat = False
+                    else:
+                        self._gemini_need_fresh_chat = False
+                    self._reset_adapter_reply_cache(ad)
 
         if ad.find_input() is None:
             # Generic recovery for popups/overlay.
@@ -2389,10 +4155,36 @@ class Worker:
             time.sleep(0.6)
 
         if ad.find_input() is None:
+            # Some pages need a short settle window after navigation/reload.
+            for _ in range(6):
+                time.sleep(0.5)
+                if ad.find_input() is not None:
+                    break
+
+        if ad.find_input() is None:
             raise RuntimeError(f"{m.name} 对话输入框不可用（可能被弹窗遮挡或未进入会话）")
         return page
 
-    def _run_model_turn(self, key: str, instruction: str, *, visibility: str) -> tuple[bool, str]:
+    @staticmethod
+    def _compose_turn_input(instruction: str, *, hidden_reply_hint: bool) -> str:
+        body = core.normalize_text(instruction)
+        if not body:
+            return ""
+        if not hidden_reply_hint:
+            return body
+        hint = "你是群聊成员，这条回复会用于后续讨论。可旁听时回复 [PASS]。"
+        return f"{hint}\n\n{body}".strip()
+
+    def _run_model_turn(
+        self,
+        key: str,
+        instruction: str,
+        *,
+        visibility: str,
+        hidden_reply_hint: bool = False,
+        record_reply: bool = True,
+        timeout_cap_s: Optional[int] = None,
+    ) -> tuple[bool, str]:
         m = self.state.get_model(key)
         if not m or not m.integrated:
             self.state.add_system(f"目标模型不可用: {key}")
@@ -2407,26 +4199,437 @@ class Worker:
             return False, ""
 
         try:
+            turn_start = time.time()
             self.state.set_status(f"sending:{key}")
-            self._ensure_chat_surface(ad, m)
+            page = self._ensure_chat_surface(ad, m)
+            prompt = self._compose_turn_input(instruction, hidden_reply_hint=hidden_reply_hint)
+            if not prompt:
+                self.state.add_system(f"{m.name} 本轮跳过：空指令")
+                return False, ""
 
-            history = self.state.get_all_messages()
-            prompt = build_model_prompt(history, instruction)
-
+            _trace_turn(key, "prompt", prompt)
             before = ad.snapshot_conversation()
+            before_last_reply = ""
+            try:
+                if key == "gemini":
+                    before_last_reply = core.normalize_text(core.extract_gemini_last_reply(page))
+                else:
+                    pick_last = getattr(ad, "_extract_last_reply_candidate", None)
+                    if callable(pick_last):
+                        before_last_reply = core.normalize_text(pick_last())
+            except Exception:
+                before_last_reply = ""
+            before_full_snapshot = ""
+            if key in {"doubao", "qwen"}:
+                try:
+                    before_full_snapshot = core.normalize_text(page.locator("main").first.inner_text())
+                except Exception:
+                    try:
+                        before_full_snapshot = core.normalize_text(page.locator("body").first.inner_text())
+                    except Exception:
+                        before_full_snapshot = ""
             ad.send_user_text(prompt)
-            reply = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=MODEL_REPLY_TIMEOUT_S))
+            timeout_s = int(MODEL_REPLY_TIMEOUT_OVERRIDES.get(key, MODEL_REPLY_TIMEOUT_S))
+            # Group public turns must stay responsive; avoid one model blocking the whole round too long.
+            if visibility == "public" and not record_reply:
+                soft_cap = int(GROUP_PUBLIC_TURN_SOFT_TIMEOUT_S.get(key, GROUP_PUBLIC_TURN_SOFT_TIMEOUT_S["default"]))
+                timeout_s = min(timeout_s, max(8, soft_cap))
+            if timeout_cap_s is not None:
+                try:
+                    cap = max(6, int(timeout_cap_s))
+                    timeout_s = min(timeout_s, cap)
+                except Exception:
+                    pass
+            reply = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=timeout_s))
+            _trace_turn(key, "extract", reply, elapsed_s=(time.time() - turn_start))
+            if key in {"doubao", "gemini"} and _looks_prompt_leak_reply(reply):
+                # Fast retry can often pick finalized assistant content
+                # instead of transient prompt-echo/nav blocks.
+                try:
+                    time.sleep(0.8)
+                    retry_timeout = 12 if key == "doubao" else 18
+                    retry = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=retry_timeout))
+                    if retry and not _looks_prompt_leak_reply(retry):
+                        reply = retry
+                except Exception:
+                    pass
             if not reply:
+                # Last-chance rescue: some web UIs intermittently miss one polling window.
+                try:
+                    raw_last = getattr(ad, "_extract_last_reply_candidate", lambda: "")()
+                    raw_last = core.normalize_text(raw_last)
+                    if raw_last:
+                        cleaner = getattr(ad, "_clean_candidate_text", None)
+                        if callable(cleaner):
+                            raw_last = core.normalize_text(cleaner(raw_last))
+                    if raw_last:
+                        reply = raw_last
+                except Exception:
+                    pass
+            if not reply and visibility == "public" and not record_reply and key in {"doubao", "qwen"}:
+                # One extra wait-without-resend when extraction is empty:
+                # improves first-turn capture without adding extra token spend.
+                late_timeout = 16 if key == "doubao" else 16
+                try:
+                    late = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=late_timeout))
+                except Exception:
+                    late = ""
+                if late:
+                    reply = late
+            if not reply and key in {"doubao", "qwen"} and before_full_snapshot:
+                try:
+                    after_full = core.normalize_text(page.locator("main").first.inner_text())
+                except Exception:
+                    try:
+                        after_full = core.normalize_text(page.locator("body").first.inner_text())
+                    except Exception:
+                        after_full = ""
+                if after_full and after_full != before_full_snapshot:
+                    try:
+                        diff_full = core.normalize_text(ad._diff_reply(before_full_snapshot, after_full))
+                    except Exception:
+                        diff_full = ""
+                    if diff_full:
+                        diff_full = _strip_instruction_echo(diff_full, instruction)
+                        diff_full = _sanitize_forward_payload(diff_full) or diff_full
+                        diff_full = _strip_leading_status_noise(diff_full) or diff_full
+                        diff_full = _dedupe_public_reply(diff_full) or diff_full
+                        diff_full = _pick_best_semantic_fragment(diff_full) or diff_full
+                        if (
+                            diff_full
+                            and not _looks_prompt_leak_reply(diff_full)
+                            and not _looks_unfinished_public_reply(diff_full)
+                            and not _looks_like_suggestion_chip_reply(diff_full)
+                        ):
+                            reply = diff_full
+            if not reply:
+                if visibility == "public" and not record_reply:
+                    # In group auto-rotation, give one short retry before treating it as silent pass.
+                    retry_empty = ""
+                    try:
+                        retry_empty = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=10))
+                    except Exception:
+                        retry_empty = ""
+                    if retry_empty:
+                        reply = retry_empty
+                    elif key == "qwen":
+                        # Qwen occasionally misses one extraction window right after topic switch.
+                        # One resend-without-context-change improves first-turn capture reliability.
+                        try:
+                            ad.send_user_text(prompt)
+                            resend = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=18))
+                        except Exception:
+                            resend = ""
+                        if resend:
+                            _trace_turn(key, "retry(resend_after_empty)", resend)
+                            reply = resend
+                        else:
+                            _trace_turn(key, "pass(empty)", "")
+                            return True, "[PASS]"
+                    else:
+                        _trace_turn(key, "pass(empty)", "")
+                        return True, "[PASS]"
                 reply = "（未能提取到回复，可能仍在生成中或页面结构变化）"
 
-            self.state.add_message(
-                "model",
-                m.name,
-                reply,
-                visibility=visibility,
-                model_key=key,
-            )
-            return True, reply
+            public_reply, private_reply = _split_public_private_reply(reply)
+            public_reply = core.normalize_text(public_reply) or reply
+            private_reply = core.normalize_text(private_reply)
+            public_reply = _strip_leading_status_noise(public_reply) or public_reply
+            private_reply = _strip_leading_status_noise(private_reply) or private_reply
+            pub_key_len = len(re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", public_reply.lower()))
+            pri_key_len = len(re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", private_reply.lower()))
+            if private_reply and pri_key_len >= 28 and (pub_key_len < 10 or _TRIVIAL_PUBLIC_PAT.match(public_reply)):
+                # Some UIs/models occasionally put the full answer under "private" and keep a trivial public stub.
+                public_reply = private_reply
+                private_reply = ""
+            recent_self: list[str] = []
+            if key in {"doubao", "qwen"}:
+                recent_self = self._recent_public_replies(key, limit=12)
+                stripped = _strip_reply_history_echo(public_reply, recent_self)
+                if stripped:
+                    public_reply = stripped
+                public_reply = _strip_instruction_echo(public_reply, instruction)
+                if not public_reply and private_reply:
+                    # Some providers may place valid final text in private channel while public part echoes prompt.
+                    public_reply = _strip_instruction_echo(private_reply, instruction)
+                    if public_reply:
+                        private_reply = ""
+                sanitized_public = _sanitize_forward_payload(public_reply)
+                if sanitized_public:
+                    public_reply = sanitized_public
+                elif visibility == "public" and not record_reply:
+                    retry_timeout = 20 if key == "doubao" else 12
+                    # sanitize returned empty => likely prompt-echo/status-only content.
+                    # Retry once with short extra wait; still empty => PASS (do not fallback to raw leaked text).
+                    try:
+                        retry2 = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=retry_timeout))
+                    except Exception:
+                        retry2 = ""
+                    if retry2:
+                        r2_pub, _ = _split_public_private_reply(retry2)
+                        r2_pub = core.normalize_text(r2_pub) or retry2
+                        r2_pub = _strip_instruction_echo(r2_pub, instruction)
+                        r2_pub_s = _sanitize_forward_payload(r2_pub)
+                        if r2_pub_s:
+                            r2_pub = r2_pub_s
+                            r2_pub = _strip_leading_status_noise(r2_pub) or r2_pub
+                            r2_pub = _dedupe_public_reply(r2_pub) or r2_pub
+                            r2_pub = _pick_best_semantic_fragment(r2_pub) or r2_pub
+                            if (
+                                r2_pub
+                                and not _looks_prompt_leak_reply(r2_pub)
+                                and not _looks_unfinished_public_reply(r2_pub)
+                                and not _looks_like_suggestion_chip_reply(r2_pub)
+                            ):
+                                public_reply = r2_pub
+                                sanitized_public = r2_pub
+                    if not sanitized_public:
+                        # Last-chance rescue from direct DOM candidate.
+                        # Helps when Doubao/Qwen first expose controls, then finalized text.
+                        try:
+                            raw_last = core.normalize_text(getattr(ad, "_extract_last_reply_candidate", lambda: "")())
+                        except Exception:
+                            raw_last = ""
+                        if raw_last:
+                            raw_last = _strip_instruction_echo(raw_last, instruction)
+                            raw_last = _sanitize_forward_payload(raw_last) or raw_last
+                            raw_last = _strip_leading_status_noise(raw_last) or raw_last
+                            raw_last = _dedupe_public_reply(raw_last) or raw_last
+                            raw_last = _strip_trailing_solicit_line(raw_last) or raw_last
+                            if key in {"qwen", "doubao"}:
+                                raw_last = _pick_best_semantic_fragment(raw_last) or raw_last
+                            if (
+                                raw_last
+                                and not _looks_prompt_leak_reply(raw_last)
+                                and not _looks_unfinished_public_reply(raw_last)
+                                and not _looks_like_suggestion_chip_reply(raw_last)
+                            ):
+                                public_reply = raw_last
+                                sanitized_public = raw_last
+                    if not sanitized_public and key == "doubao":
+                        # Doubao may briefly return control-text first; resend once to obtain final block.
+                        try:
+                            ad.send_user_text(prompt)
+                            retry3 = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=20))
+                        except Exception:
+                            retry3 = ""
+                        if retry3:
+                            r3_pub, _ = _split_public_private_reply(retry3)
+                            r3_pub = core.normalize_text(r3_pub) or retry3
+                            r3_pub = _strip_instruction_echo(r3_pub, instruction)
+                            r3_pub = _sanitize_forward_payload(r3_pub) or r3_pub
+                            r3_pub = _strip_leading_status_noise(r3_pub) or r3_pub
+                            r3_pub = _dedupe_public_reply(r3_pub) or r3_pub
+                            r3_pub = _strip_trailing_solicit_line(r3_pub) or r3_pub
+                            r3_pub = _pick_best_semantic_fragment(r3_pub) or r3_pub
+                            if (
+                                r3_pub
+                                and not _looks_prompt_leak_reply(r3_pub)
+                                and not _looks_unfinished_public_reply(r3_pub)
+                                and not _looks_like_suggestion_chip_reply(r3_pub)
+                            ):
+                                public_reply = r3_pub
+                                sanitized_public = r3_pub
+                    if not sanitized_public:
+                        _trace_turn(key, "pass(prompt_echo)", public_reply)
+                        return True, "[PASS]"
+            if key == "gemini":
+                # Gemini occasionally appends nav/suggestion tails in one block.
+                # Apply the same sanitizer pass before final checks.
+                sanitized_g = _sanitize_forward_payload(public_reply)
+                if sanitized_g:
+                    public_reply = sanitized_g
+                if visibility == "public" and not record_reply and _looks_prompt_leak_reply(public_reply):
+                    try:
+                        retry_g = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=18))
+                    except Exception:
+                        retry_g = ""
+                    if retry_g:
+                        rg_pub, rg_pri = _split_public_private_reply(retry_g)
+                        rg_pub = core.normalize_text(rg_pub) or retry_g
+                        rg_pub = _strip_instruction_echo(rg_pub, instruction)
+                        rg_pub = _sanitize_forward_payload(rg_pub) or rg_pub
+                        rg_pub = _strip_leading_status_noise(rg_pub) or rg_pub
+                        rg_pub = _dedupe_public_reply(rg_pub) or rg_pub
+                        rg_pub = _strip_trailing_solicit_line(rg_pub) or rg_pub
+                        if rg_pub and not _looks_prompt_leak_reply(rg_pub):
+                            public_reply = rg_pub
+                            if rg_pri:
+                                private_reply = _strip_leading_status_noise(core.normalize_text(rg_pri))
+                    if _looks_prompt_leak_reply(public_reply):
+                        _trace_turn(key, "pass(gemini_prompt_echo)", public_reply)
+                        return True, "[PASS]"
+            public_reply = _strip_group_chatter_boilerplate(public_reply) or public_reply
+            public_reply = _strip_leading_status_noise(public_reply) or public_reply
+            public_reply = _dedupe_public_reply(public_reply) or public_reply
+            public_reply = _strip_trailing_solicit_line(public_reply) or public_reply
+            if key in {"qwen", "doubao"}:
+                # Aggressive fragment picking is mainly needed for noisy web UIs.
+                # For Gemini/ChatGPT/DeepSeek, keep full public semantic blocks.
+                public_reply = _pick_best_semantic_fragment(public_reply) or public_reply
+            public_reply = _strip_trailing_solicit_line(public_reply) or public_reply
+            if key == "qwen" and _QWEN_STATUS_ONLY_PAT.match(public_reply or ""):
+                # Qwen occasionally exposes "已完成思考/已经完成" status pills as text.
+                # Retry once for final answer block before giving up.
+                retry_timeout = 22 if (visibility == "public" and not record_reply) else 24
+                try:
+                    retry_q = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=retry_timeout))
+                except Exception:
+                    retry_q = ""
+                if retry_q:
+                    retry_pub, retry_pri = _split_public_private_reply(retry_q)
+                    retry_pub = core.normalize_text(retry_pub) or core.normalize_text(retry_q)
+                    retry_pub = _strip_leading_status_noise(retry_pub) or retry_pub
+                    retry_pub = _strip_instruction_echo(retry_pub, instruction)
+                    retry_pub = _sanitize_forward_payload(retry_pub) or retry_pub
+                    retry_pub = _strip_leading_status_noise(retry_pub) or retry_pub
+                    retry_pub = _dedupe_public_reply(retry_pub) or retry_pub
+                    retry_pub = _pick_best_semantic_fragment(retry_pub) or retry_pub
+                    if retry_pub and not _QWEN_STATUS_ONLY_PAT.match(retry_pub):
+                        public_reply = retry_pub
+                        if retry_pri:
+                            private_reply = _strip_leading_status_noise(core.normalize_text(retry_pri))
+                if key == "qwen" and _QWEN_STATUS_ONLY_PAT.match(public_reply or ""):
+                    if visibility == "public" and not record_reply:
+                        _trace_turn(key, "warn(qwen_status_only)", public_reply)
+                        # Do not pass immediately: allow the next low-value/unfinished
+                        # retry branch to fetch the finalized text once more.
+                        public_reply = ""
+                    else:
+                        public_reply = "（未能提取到有效回复）"
+            if key in {"qwen", "doubao"} and visibility == "public" and not record_reply:
+                if _LOW_VALUE_PROCESS_PAT.match(public_reply or "") or _looks_unfinished_public_reply(public_reply):
+                    retry_timeout2 = 18 if key == "qwen" else 16
+                    try:
+                        retry_lv = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=retry_timeout2))
+                    except Exception:
+                        retry_lv = ""
+                    if retry_lv:
+                        r_pub, r_pri = _split_public_private_reply(retry_lv)
+                        r_pub = core.normalize_text(r_pub) or core.normalize_text(retry_lv)
+                        r_pub = _strip_leading_status_noise(r_pub) or r_pub
+                        r_pub = _strip_instruction_echo(r_pub, instruction)
+                        r_pub = _sanitize_forward_payload(r_pub) or r_pub
+                        r_pub = _dedupe_public_reply(r_pub) or r_pub
+                        r_pub = _strip_trailing_solicit_line(r_pub) or r_pub
+                        if key in {"qwen", "doubao"}:
+                            r_pub = _pick_best_semantic_fragment(r_pub) or r_pub
+                        if (
+                            r_pub
+                            and not _LOW_VALUE_PROCESS_PAT.match(r_pub)
+                            and not _looks_unfinished_public_reply(r_pub)
+                            and not _looks_prompt_leak_reply(r_pub)
+                        ):
+                            public_reply = r_pub
+                            if r_pri:
+                                private_reply = _strip_leading_status_noise(core.normalize_text(r_pri))
+            if not core.normalize_text(public_reply):
+                if visibility == "public" and not record_reply:
+                    _trace_turn(key, "pass(empty_public)", "")
+                    return True, "[PASS]"
+                public_reply = "（未能提取到有效回复）"
+            if key in {"qwen", "gemini"} and visibility == "public" and not record_reply:
+                if _looks_stale_extracted_reply(public_reply, before, before_last_reply=before_last_reply):
+                    if key == "gemini":
+                        # Gemini sometimes yields a stale card first; allow one extra short fetch before skipping.
+                        retry_stale = ""
+                        try:
+                            retry_stale = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=14))
+                        except Exception:
+                            retry_stale = ""
+                        if retry_stale:
+                            rs_pub, rs_pri = _split_public_private_reply(retry_stale)
+                            rs_pub = core.normalize_text(rs_pub) or retry_stale
+                            rs_pub = _strip_instruction_echo(rs_pub, instruction)
+                            rs_pub = _sanitize_forward_payload(rs_pub) or rs_pub
+                            rs_pub = _strip_leading_status_noise(rs_pub) or rs_pub
+                            rs_pub = _dedupe_public_reply(rs_pub) or rs_pub
+                            rs_pub = _strip_trailing_solicit_line(rs_pub) or rs_pub
+                            if rs_pub and not _looks_stale_extracted_reply(
+                                rs_pub, before, before_last_reply=before_last_reply
+                            ):
+                                public_reply = rs_pub
+                                if rs_pri:
+                                    private_reply = _strip_leading_status_noise(core.normalize_text(rs_pri))
+                        if _looks_stale_extracted_reply(public_reply, before, before_last_reply=before_last_reply):
+                            # One resend fallback for Gemini stale snapshots.
+                            # Trade a bit more token usage for much better first-turn reliability.
+                            try:
+                                ad.send_user_text(prompt)
+                                resend_g = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=22))
+                            except Exception:
+                                resend_g = ""
+                            if resend_g:
+                                g_pub, g_pri = _split_public_private_reply(resend_g)
+                                g_pub = core.normalize_text(g_pub) or resend_g
+                                g_pub = _strip_instruction_echo(g_pub, instruction)
+                                g_pub = _sanitize_forward_payload(g_pub) or g_pub
+                                g_pub = _strip_leading_status_noise(g_pub) or g_pub
+                                g_pub = _dedupe_public_reply(g_pub) or g_pub
+                                g_pub = _strip_trailing_solicit_line(g_pub) or g_pub
+                                if g_pub and not _looks_stale_extracted_reply(
+                                    g_pub, before, before_last_reply=before_last_reply
+                                ):
+                                    public_reply = g_pub
+                                    if g_pri:
+                                        private_reply = _strip_leading_status_noise(core.normalize_text(g_pri))
+                    if _looks_stale_extracted_reply(public_reply, before, before_last_reply=before_last_reply):
+                        _trace_turn(key, "pass(stale_snapshot)", public_reply)
+                        return True, "[PASS]"
+            if key in {"doubao", "qwen"} and visibility == "public" and not record_reply:
+                if _looks_unfinished_public_reply(public_reply):
+                    _trace_turn(key, "pass(unfinished)", public_reply)
+                    return True, "[PASS]"
+                if _TRIVIAL_PUBLIC_PAT.match(public_reply):
+                    _trace_turn(key, "pass(trivial)", public_reply)
+                    return True, "[PASS]"
+                if _looks_like_suggestion_chip_reply(public_reply):
+                    _trace_turn(key, "pass(chip_reply)", public_reply)
+                    return True, "[PASS]"
+                compact_len = len(_line_dedupe_key(public_reply))
+                if compact_len < 4:
+                    _trace_turn(key, "pass(short)", public_reply)
+                    return True, "[PASS]"
+                if key in {"doubao", "qwen"}:
+                    min_klen = 12 if key == "doubao" else 10
+                    if compact_len >= min_klen and _is_near_duplicate_reply(public_reply, recent_self):
+                        _trace_turn(key, "pass(near_duplicate)", public_reply)
+                        return True, "[PASS]"
+                cur_key = _line_dedupe_key(public_reply)
+                if cur_key and len(cur_key) >= 14:
+                    for old in recent_self:
+                        if cur_key == _line_dedupe_key(old):
+                            # In group mode, duplicated old text is usually stale extraction; skip this turn.
+                            _trace_turn(key, "pass(history_duplicate)", public_reply)
+                            return True, "[PASS]"
+            if key == "qwen" and re.search(
+                r"(internal server error|连接到[^\\n]{0,40}出现问题|网络错误|请求失败|暂时不可用)",
+                public_reply,
+                re.I,
+            ):
+                self.state.add_system(f"{m.name} 本轮失败：{_clip_text(public_reply, 140)}")
+                return False, ""
+            if visibility == "public":
+                public_reply = _compact_public_reply(public_reply, max_chars=220, max_lines=4)
+
+            if record_reply:
+                self.state.add_message(
+                    "model",
+                    m.name,
+                    public_reply,
+                    visibility=visibility,
+                    model_key=key,
+                )
+            if private_reply and private_reply != public_reply:
+                self.state.add_message(
+                    "model",
+                    f"{m.name}·内心",
+                    _clip_text(private_reply, 1200),
+                    visibility="shadow",
+                    model_key=key,
+                )
+            _trace_turn(key, "final", public_reply, elapsed_s=(time.time() - turn_start))
+            return True, public_reply
         except Exception as exc:
             self.state.add_system(f"{m.name} 本轮失败：{exc}")
             return False, ""
@@ -2468,6 +4671,187 @@ class Worker:
                 found.append(key)
         return found
 
+    def _mention_candidates_line(self, keys: list[str], *, exclude_key: Optional[str] = None) -> str:
+        tags: list[str] = []
+        for key in keys:
+            if exclude_key and key == exclude_key:
+                continue
+            m = self.state.get_model(key)
+            name = core.normalize_text(m.name if m else key)
+            if not name:
+                continue
+            tags.append(name)
+        if not tags:
+            return ""
+        return "可回应对象：" + " / ".join(tags) + "（可直接写名字，不必使用@）。"
+
+    @staticmethod
+    def _looks_like_disagreement(text: str) -> bool:
+        raw = core.normalize_text(text).lower()
+        if not raw:
+            return False
+        strong = [
+            "不同意",
+            "不认同",
+            "不成立",
+            "站不住脚",
+            "我反对",
+            "反驳",
+            "你忽略",
+            "你高估",
+            "你低估",
+            "i disagree",
+            "not true",
+            "incorrect",
+            "counterpoint",
+        ]
+        weak = [
+            "但是",
+            "然而",
+            "不过",
+            "相反",
+            "but",
+            "however",
+            "yet",
+        ]
+        strong_hits = sum(1 for x in strong if x in raw)
+        weak_hits = sum(1 for x in weak if x in raw)
+        return strong_hits >= 1 or weak_hits >= 2
+
+    @staticmethod
+    def _is_pass_reply(text: str) -> bool:
+        t = core.normalize_text(text).lower()
+        if not t:
+            return True
+        compact = re.sub(r"\s+", "", t)
+        return compact in {
+            "pass",
+            "[pass]",
+            "skip",
+            "[skip]",
+            "旁听",
+            "暂不加入",
+            "不加入",
+            "已完成",
+            "已经完成",
+            "done",
+            "ok",
+            "好的",
+            "收到",
+        }
+
+    @staticmethod
+    def _infer_group_style(text: str) -> str:
+        # Disable topic-specific hard mode in the core group engine.
+        # Group chat should stay general-purpose by default.
+        return ""
+
+    @staticmethod
+    def _is_continue_signal(text: str) -> bool:
+        t = core.normalize_text(text).lower()
+        if not t:
+            return False
+        compact = re.sub(r"\s+", "", t)
+        return bool(
+            re.fullmatch(
+                r"(继续|继续吧|继续一下|继续进行|继续聊|继续讨论|接着|接着来|接下去|接下去吧)",
+                compact,
+            )
+        )
+
+    @staticmethod
+    def _looks_like_idiom_payload(text: str) -> bool:
+        t = core.normalize_text(text)
+        if not t:
+            return False
+        if t == "[PASS]":
+            return True
+        return bool(re.match(r"^[\u4e00-\u9fff]{4}\n@[\w\u4e00-\u9fff-]{1,24}$", t))
+
+    def _infer_group_style_from_recent(self) -> str:
+        # Disable sticky topic-mode inference for now.
+        return ""
+
+    def _coerce_idiom_reply(
+        self,
+        text: str,
+        *,
+        speaker_key: str,
+        all_keys: list[str],
+        preferred_key: Optional[str] = None,
+    ) -> str:
+        raw = core.normalize_text(text)
+        if not raw:
+            return ""
+
+        # Strict idiom extraction:
+        # - only accept a standalone 4-char Chinese line (or "xxxx@name" line),
+        # - do not slice arbitrary 4-char fragments from long sentences.
+        banned = {"成语接龙", "群主插话", "等待接龙", "回应群主", "继续接龙", "接龙规则", "指出违规", "继续成语"}
+        idiom = ""
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        for ln in reversed(lines):
+            s = re.sub(r"\s+", "", ln)
+            if not s:
+                continue
+            m0 = re.match(r"^([\u4e00-\u9fff]{4})$", s)
+            if m0:
+                cand = m0.group(1)
+                if cand not in banned:
+                    idiom = cand
+                    break
+            m1 = re.match(r"^([\u4e00-\u9fff]{4})@[\w\u4e00-\u9fff-]{1,24}$", s)
+            if m1:
+                cand = m1.group(1)
+                if cand not in banned:
+                    idiom = cand
+                    break
+            m2 = re.match(r"^(?:接成语|接龙|我接|接)[:：]?([\u4e00-\u9fff]{4})$", s)
+            if m2:
+                cand = m2.group(1)
+                if cand not in banned:
+                    idiom = cand
+                    break
+        if not idiom:
+            return "[PASS]"
+
+        peers: list[tuple[str, str]] = []
+        for key in all_keys:
+            if key == speaker_key:
+                continue
+            m = self.state.get_model(key)
+            name = core.normalize_text(m.name if m else key)
+            if name:
+                peers.append((key, name))
+        if not peers:
+            return idiom
+
+        mention = ""
+        for token in re.findall(r"@([A-Za-z0-9_\-\u4e00-\u9fff]{1,24})", raw):
+            t = core.normalize_text(token).lower()
+            if not t:
+                continue
+            for key, name in peers:
+                aliases = {
+                    key.lower(),
+                    core.normalize_text(name).lower(),
+                    re.sub(r"[（(].*?[)）]", "", core.normalize_text(name)).strip().lower(),
+                }
+                if t in aliases:
+                    mention = name
+                    break
+            if mention:
+                break
+        if not mention and preferred_key:
+            for key, name in peers:
+                if key == preferred_key:
+                    mention = name
+                    break
+        if not mention:
+            mention = peers[0][1]
+
+        return f"{idiom}\n@{mention}".strip()
+
     def _latest_public_model_message(self, *, exclude_key: Optional[str] = None) -> Optional[UiMessage]:
         msgs = self.state.get_all_messages()
         for msg in reversed(msgs):
@@ -2480,6 +4864,100 @@ class Worker:
             return msg
         return None
 
+    def _recent_public_replies(self, key: str, limit: int = 3) -> list[str]:
+        out: list[str] = []
+        if not key or limit <= 0:
+            return out
+        msgs = self.state.get_all_messages()
+        for msg in reversed(msgs):
+            if msg.role != "model":
+                continue
+            if msg.visibility != "public":
+                continue
+            if msg.model_key != key:
+                continue
+            txt = _strip_private_thoughts(msg.text) or core.normalize_text(msg.text)
+            txt = _sanitize_forward_payload(txt) or txt
+            txt = _dedupe_public_reply(txt) or txt
+            txt = core.normalize_text(txt)
+            if not txt:
+                continue
+            out.append(txt)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _drain_group_interjections(self, max_items: int = 20) -> list[str]:
+        """
+        在群聊自动轮转期间，抽取队列里的 send(group) 作为插话。
+        其他动作先暂存再放回队列，保持“可插话”而不破坏现有串行架构。
+        """
+        picked: list[str] = []
+        stash: list[dict[str, Any]] = []
+        for _ in range(max_items):
+            try:
+                item = self.state.inbox.get_nowait()
+            except queue.Empty:
+                break
+            kind = str(item.get("kind") or "")
+            if kind == "send":
+                tgt = str(item.get("target") or "").strip().lower()
+                txt = core.normalize_text(str(item.get("text") or ""))
+                if tgt == "group" and txt:
+                    picked.append(txt)
+                    continue
+            stash.append(item)
+
+        for item in stash:
+            self.state.inbox.put(item)
+        return picked
+
+    def _purge_stale_group_sends(self, max_items: int = 80) -> None:
+        """
+        新群任务启动时清理遗留的 send(group) 动作，避免旧话题覆盖本轮用户消息。
+        """
+        stash: list[dict[str, Any]] = []
+        for _ in range(max_items):
+            try:
+                item = self.state.inbox.get_nowait()
+            except queue.Empty:
+                break
+            kind = str(item.get("kind") or "")
+            if kind == "send":
+                tgt = str(item.get("target") or "").strip().lower()
+                if tgt == "group":
+                    continue
+            stash.append(item)
+        for item in stash:
+            self.state.inbox.put(item)
+
+    @staticmethod
+    def _build_shadow_sync_instruction(source_name: str, user_text: str, source_reply: str) -> str:
+        user_part = _clip_text(user_text, 2000)
+        source_public, _ = _split_public_private_reply(source_reply)
+        reply_part = _clip_text(source_public or _strip_private_thoughts(source_reply), 2400)
+        return (
+            "你在同一个群聊中，下面是刚发生的一轮消息：\n\n"
+            f"群主：{user_part}\n"
+            f"{source_name}：{reply_part}\n\n"
+            "请像正常群聊一样直接回复，简短清晰即可。\n"
+            "若你这轮不想发言，只输出 [PASS]。\n"
+            "可选：使用【对外】...【内心】...（内心不会公开）。"
+        ).strip()
+
+    @staticmethod
+    def _build_observer_probe_instruction(source_name: str, source_reply: str, mention_line: str = "") -> str:
+        source_public, _ = _split_public_private_reply(source_reply)
+        reply_part = _clip_text(source_public or _strip_private_thoughts(source_reply), 2200)
+        mention_part = (mention_line.strip() + "\n") if mention_line.strip() else ""
+        return (
+            "你在同一个群聊中，下面是刚发生的一条新消息：\n\n"
+            f"{source_name}：{reply_part}\n\n"
+            f"{mention_part}"
+            "如果你想加入讨论，直接发一条短消息；如果暂时旁听，只输出 [PASS]。\n"
+            "不要解释规则，不要输出思考过程。"
+        ).strip()
+
     def _handle_send(self, action: dict[str, Any]) -> None:
         target = str(action.get("target") or "").strip().lower()
         text = core.normalize_text(str(action.get("text") or ""))
@@ -2487,6 +4965,7 @@ class Worker:
             self._safe_reply(action, {"ok": False, "error": "empty_text"})
             return
 
+        selected_snapshot = self.state.selected_keys()
         if target == "group":
             raw_rounds = action.get("rounds", GROUP_DEFAULT_ROUNDS)
             try:
@@ -2520,24 +4999,68 @@ class Worker:
         self._ensure_playwright()
         assert self._pw is not None
 
+        # Start each new group task with a fresh Qwen web thread.
+        # Reason: long in-page history can increase latency and leak stale topics.
+        if target == "group":
+            self._purge_stale_group_sends()
+            self._deepseek_need_fresh_chat = True
+            self._qwen_need_fresh_chat = True
+            self._doubao_need_fresh_chat = True
+            self._chatgpt_need_fresh_chat = True
+            self._gemini_need_fresh_chat = True
+
         if target != "group":
-            self._run_model_turn(keys[0], text, visibility=visibility)
+            ok_main, main_reply = self._run_model_turn(keys[0], text, visibility=visibility, hidden_reply_hint=False)
+            if ok_main and main_reply:
+                # Freeze peer targets at send-time snapshot to avoid mid-turn toggle races causing wrong sync targets.
+                peers = [k for k in selected_snapshot if k != target]
+                if peers:
+                    sm = self.state.get_model(target)
+                    source_name = sm.name if sm else target
+                    payload = _pick_forward_payload(main_reply) or main_reply
+                    for peer in peers:
+                        # 让每个旁听模型也有同一条“用户消息”，便于后续切换到该模型时上下文完整。
+                        self.state.add_message("user", "用户", text, visibility="shadow", model_key=peer)
+                        instruction = self._build_shadow_sync_instruction(source_name, text, payload)
+                        self._run_model_turn(peer, instruction, visibility="shadow", hidden_reply_hint=True)
             self.state.set_status("idle")
             self._safe_reply(action, {"ok": True})
             return
 
         focus_keys: Optional[set[str]] = None
         focus_idle_rounds = 0
+        silent_rounds = 0
         round_no = 0
+        active_user_instruction: Optional[str] = text
+        active_user_force_rounds = _topic_lock_rounds(len(selected_snapshot))
+        active_user_pending_models: set[str] = set(selected_snapshot)
+        active_user_pending_attempts: dict[str, int] = {}
         while True:
             if self.state.should_round_stop():
                 self.state.add_system("已停止自动轮聊。")
                 break
 
+            queued_user_msgs = self._drain_group_interjections()
+            if queued_user_msgs:
+                for extra in queued_user_msgs:
+                    self.state.add_message("user", "用户", extra, visibility="public", model_key=None)
+                active_user_instruction = queued_user_msgs[-1]
+                now_selected = self.state.selected_keys()
+                active_user_force_rounds = _topic_lock_rounds(len(now_selected))
+                active_user_pending_models = set(now_selected)
+                active_user_pending_attempts = {}
+                focus_keys = None
+                focus_idle_rounds = 0
+                self.state.add_system("群主插话已加入当前讨论。")
+
             current_keys = self.state.selected_keys()
             if not current_keys:
                 self.state.add_system("轮聊结束：当前没有已启用模型。")
                 break
+            if active_user_pending_models:
+                active_user_pending_models = {x for x in active_user_pending_models if x in current_keys}
+                for stale in [x for x in list(active_user_pending_attempts.keys()) if x not in active_user_pending_models]:
+                    active_user_pending_attempts.pop(stale, None)
             if round_no >= 1 and len(current_keys) < 2:
                 self.state.add_system("轮聊结束：当前仅 1 个模型，无法继续轮流发言。")
                 break
@@ -2548,58 +5071,247 @@ class Worker:
                     focus_keys = None
 
             if focus_keys:
-                talk_keys = [k for k in current_keys if k in focus_keys]
+                pri = [k for k in current_keys if k in focus_keys]
+                rest = [k for k in current_keys if k not in focus_keys]
+                talk_keys = pri + rest
             else:
                 talk_keys = list(current_keys)
+            if len(current_keys) == 2 and talk_keys:
+                # Two-model fairness: alternate start speaker based on latest public model message.
+                # Avoid one side repeatedly speaking first when the other side is slow.
+                last_pub = self._latest_public_model_message()
+                if last_pub and last_pub.model_key in talk_keys:
+                    lead = [x for x in talk_keys if x != last_pub.model_key]
+                    follow = [x for x in talk_keys if x == last_pub.model_key]
+                    if lead and follow:
+                        talk_keys = lead + follow
+            if len(current_keys) >= 2 and talk_keys:
+                # Generic fairness: avoid same speaker starting consecutive rounds in larger groups.
+                last_pub2 = self._latest_public_model_message()
+                if last_pub2 and talk_keys[0] == (last_pub2.model_key or "") and len(talk_keys) > 1:
+                    talk_keys = talk_keys[1:] + talk_keys[:1]
 
             round_no += 1
-            any_success = False
+            any_turn_ok = False
+            round_visible_replies = 0
             mention_switched = False
+            round_interrupted_by_host = False
+            # Keep this round's latest accepted model message so later speakers can see fresh context immediately.
+            round_latest: Optional[dict[str, str]] = None
             for k in talk_keys:
                 if self.state.should_round_stop():
                     break
 
-                if round_no == 1:
-                    turn_instruction = (
-                        f"{text}\n"
-                        "补充：如果你认为应让某个模型加入当前讨论，请在结尾显式写 @模型名。"
+                mid_round_msgs = self._drain_group_interjections(max_items=8)
+                if mid_round_msgs:
+                    for extra in mid_round_msgs:
+                        self.state.add_message("user", "用户", extra, visibility="public", model_key=None)
+                    active_user_instruction = mid_round_msgs[-1]
+                    active_user_force_rounds = _topic_lock_rounds(len(current_keys))
+                    active_user_pending_models = set(current_keys)
+                    active_user_pending_attempts = {}
+                    focus_keys = None
+                    focus_idle_rounds = 0
+                    self.state.add_system("群主插话已加入当前回合。")
+                    round_interrupted_by_host = True
+                    # 抢占：下一个完整回合优先处理群主新话题，避免旧话题继续刷屏。
+                    break
+
+                last_msg = self._latest_public_model_message(exclude_key=k)
+                counterpart_key: Optional[str] = None
+                if last_msg and last_msg.model_key and last_msg.model_key != k:
+                    counterpart_key = last_msg.model_key
+                mention_line = self._mention_candidates_line(current_keys, exclude_key=k)
+                if k in {"qwen", "doubao"}:
+                    # Qwen/Doubao are sensitive to long control templates and often echo prompt lines.
+                    mention_line = ""
+                mention_part = (mention_line + "\n") if mention_line else ""
+                allow_pass = len(current_keys) >= 3
+                pass_line = (
+                    "如暂不发言，仅回复 [PASS]。"
+                    if allow_pass
+                    else "必须给出实际观点，不能输出 [PASS]。"
+                )
+                concise_line = "最终发言要求：1-2句，20-90字。"
+                style_line = "直接说你在群里要发的话，不要复述规则。"
+                if k in {"qwen", "doubao"}:
+                    # Keep CN web models on a minimal instruction profile to reduce prompt echo.
+                    style_line = "只输出一句给群里的正文，不要复述规则。"
+                    concise_line = ""
+                    pass_line = "不想发言就仅回复 [PASS]。"
+                wrap_line = ""
+                if _USE_WRAP_HINT_FOR_CN_MODELS and k in {"qwen", "doubao"}:
+                    # Keep wrapper format instruction short to reduce prompt-echo leakage.
+                    wrap_line = (
+                        f"格式：{_PUBLIC_WRAP_OPEN}正文{_PUBLIC_WRAP_CLOSE}"
+                        f"；可选{_PRIVATE_WRAP_OPEN}内心{_PRIVATE_WRAP_CLOSE}。"
                     )
-                else:
-                    last_msg = self._latest_public_model_message(exclude_key=k)
-                    if last_msg is None:
+                wrap_part = (wrap_line + "\n") if wrap_line else ""
+                strict_topic_phase = bool(
+                    active_user_instruction and (active_user_force_rounds > 0 or bool(active_user_pending_models))
+                )
+                topic_lock_line = (
+                    "优先级：必须先回应“群主最新话题”，不要延续旧话题。"
+                    if strict_topic_phase
+                    else ""
+                )
+                topic_lock_part = (topic_lock_line + "\n") if topic_lock_line else ""
+
+                if active_user_instruction:
+                    user_line = _clip_text(active_user_instruction, 420)
+                    if round_latest and round_latest.get("model_key") != k:
+                        latest_speaker = core.normalize_text(round_latest.get("speaker") or "上一位")
+                        latest_text = core.normalize_text(round_latest.get("text") or "")
+                        compact_latest = _pick_forward_payload(latest_text) or (_strip_private_thoughts(latest_text) or "")
+                        compact_latest = compact_latest.replace("\n", " ").strip()
+                        if len(compact_latest) > 260:
+                            compact_latest = compact_latest[:260] + "…"
                         turn_instruction = (
-                            "请继续群聊，给出补充/反驳，并抛出一个追问。"
-                            "如果你希望某个模型加入，请显式写 @模型名。"
+                            "你在多人群聊中发言。\n"
+                            f"群主最新话题：{user_line}\n"
+                            f"上一位发言（{latest_speaker}）：{compact_latest}\n"
+                            "先回应群主话题，再补充你对上一位的看法。\n"
+                            f"{topic_lock_part}"
+                            f"{style_line}\n"
+                            f"{wrap_part}"
+                            f"{concise_line}\n"
+                            f"{mention_part}"
+                            f"{pass_line}"
                         )
                     else:
-                        compact = core.normalize_text(last_msg.text)
-                        if len(compact) > 280:
-                            compact = compact[:280] + "…"
-                        scope_line = ""
-                        if focus_keys:
-                            observers = [x for x in current_keys if x not in focus_keys]
-                            if observers:
-                                names = []
-                                for ok in observers:
-                                    om = self.state.get_model(ok)
-                                    names.append(om.name if om else ok)
-                                scope_line = "旁听模型：" + "、".join(names) + "。如需其加入请显式 @点名。\n"
                         turn_instruction = (
-                            f"这是群聊第 {round_no} 轮。\n"
-                            f"上一位发言（{last_msg.speaker}）：{compact}\n"
-                            f"{scope_line}"
-                            "请你基于当前对话提出观点/反驳/补充，并追加一个追问。"
+                            "你在多人群聊中发言。\n"
+                            f"群主最新话题：{user_line}\n"
+                            f"{topic_lock_part}"
+                            "先回应群主话题，再给出你的观点或补充。\n"
+                            f"{style_line}\n"
+                            f"{wrap_part}"
+                            f"{concise_line}\n"
+                            f"{mention_part}"
+                            f"{pass_line}"
                         )
+                elif last_msg is None:
+                    turn_instruction = (
+                        "你在多人群聊中继续讨论。\n"
+                        "请直接给出一条新观点或追问。\n"
+                        f"{style_line}\n"
+                        f"{wrap_part}"
+                        f"{concise_line}\n"
+                        f"{mention_part}"
+                        f"{pass_line}"
+                    )
+                else:
+                    compact = _pick_forward_payload(last_msg.text) or (_strip_private_thoughts(last_msg.text) or "")
+                    compact = compact.replace("\n", " ").strip()
+                    if len(compact) > 280:
+                        compact = compact[:280] + "…"
+                    turn_instruction = (
+                        "你在多人群聊中发言。\n"
+                        f"{last_msg.speaker}：{compact}\n"
+                        "请直接回应这条发言。\n"
+                        f"{style_line}\n"
+                        f"{wrap_part}"
+                        f"{concise_line}\n"
+                        f"{mention_part}"
+                        f"{pass_line}"
+                    )
 
-                ok, reply_text = self._run_model_turn(k, turn_instruction, visibility="public")
-                any_success = any_success or ok
+                turn_timeout_cap = _group_round_timeout_cap_s(len(current_keys))
+                if strict_topic_phase:
+                    turn_timeout_cap += 8
+                if k == "qwen":
+                    turn_timeout_cap += 4
+                ok, reply_text = self._run_model_turn(
+                    k,
+                    turn_instruction,
+                    visibility="public",
+                    record_reply=False,
+                    timeout_cap_s=turn_timeout_cap,
+                )
+                turn_has_visible = bool(ok and core.normalize_text(reply_text) and (not self._is_pass_reply(reply_text)))
+                any_turn_ok = any_turn_ok or turn_has_visible
                 if ok and reply_text:
+                    clean_reply = _strip_private_thoughts(reply_text) or core.normalize_text(reply_text)
+                    clean_reply = _strip_group_chatter_boilerplate(clean_reply) or clean_reply
+                    clean_reply = _sanitize_forward_payload(clean_reply) or clean_reply
+                    clean_reply = _dedupe_public_reply(clean_reply) or clean_reply
+                    clean_reply = _strip_trailing_solicit_line(clean_reply) or clean_reply
+                    if k in {"qwen", "doubao"}:
+                        clean_reply = _pick_best_semantic_fragment(clean_reply) or clean_reply
+                    clean_reply = _strip_trailing_solicit_line(clean_reply) or clean_reply
+                    clean_reply = _compact_public_reply(clean_reply, max_chars=190, max_lines=3)
+                    def _mark_topic_miss_if_needed() -> None:
+                        if not (strict_topic_phase and active_user_instruction and k in active_user_pending_models):
+                            return
+                        tries_local = int(active_user_pending_attempts.get(k, 0)) + 1
+                        active_user_pending_attempts[k] = tries_local
+                        if tries_local >= TOPIC_LOCK_MAX_ATTEMPTS_PER_MODEL:
+                            active_user_pending_models.discard(k)
+                            active_user_pending_attempts.pop(k, None)
+
+                    if self._is_pass_reply(clean_reply):
+                        _mark_topic_miss_if_needed()
+                        continue
+                    if _looks_prompt_leak_reply(clean_reply):
+                        _mark_topic_miss_if_needed()
+                        _trace_turn(k, "pass(loop_prompt_leak)", clean_reply)
+                        continue
+                    if k in {"qwen", "doubao"} and _looks_unfinished_public_reply(clean_reply):
+                        _mark_topic_miss_if_needed()
+                        _trace_turn(k, "pass(loop_unfinished)", clean_reply)
+                        continue
+                    if k in {"qwen", "doubao"} and _looks_like_suggestion_chip_reply(clean_reply):
+                        _mark_topic_miss_if_needed()
+                        _trace_turn(k, "pass(loop_chip)", clean_reply)
+                        continue
+                    if _LOW_VALUE_PROCESS_PAT.match(clean_reply) or _QWEN_STATUS_ONLY_PAT.match(clean_reply):
+                        _mark_topic_miss_if_needed()
+                        _trace_turn(k, "pass(loop_process_or_status)", clean_reply)
+                        continue
+                    if strict_topic_phase and active_user_instruction:
+                        if not _is_reply_aligned_with_user_topic(clean_reply, active_user_instruction, strict=False):
+                            if k in active_user_pending_models:
+                                tries = int(active_user_pending_attempts.get(k, 0)) + 1
+                                active_user_pending_attempts[k] = tries
+                                if tries >= TOPIC_LOCK_MAX_ATTEMPTS_PER_MODEL:
+                                    active_user_pending_models.discard(k)
+                                    active_user_pending_attempts.pop(k, None)
+                                    mk = self.state.get_model(k)
+                                    nm = mk.name if mk else k
+                                    self.state.add_system(f"{nm} 连续{tries}次未对齐新话题，已暂时跳过。")
+                            # Keep the reply visible (to preserve natural group flow),
+                            # only trace this as a soft warning instead of hard-dropping.
+                            _trace_turn(k, "warn(loop_off_topic_after_host_interject)", clean_reply)
+                    mcur = self.state.get_model(k)
+                    speaker_name = mcur.name if mcur else k
+                    self.state.add_message(
+                        "model",
+                        speaker_name,
+                        clean_reply,
+                        visibility="public",
+                        model_key=k,
+                    )
+                    round_visible_replies += 1
+                    round_latest = {
+                        "speaker": speaker_name,
+                        "model_key": k,
+                        "text": clean_reply,
+                    }
+                    if k in active_user_pending_models:
+                        active_user_pending_models.discard(k)
+                        active_user_pending_attempts.pop(k, None)
                     targets = self._extract_target_keys_from_text(
-                        reply_text,
+                        clean_reply,
                         [x for x in current_keys if x != k],
                     )
+                    new_focus: Optional[set[str]] = None
                     if targets:
-                        new_focus = set([k, *targets])
+                        # 仅锁定 2 人焦点，避免很快退化为固定全员轮转。
+                        new_focus = {k, targets[0]}
+                    elif counterpart_key and self._looks_like_disagreement(clean_reply):
+                        new_focus = {k, counterpart_key}
+
+                    if new_focus and len(new_focus) >= 2:
                         if focus_keys != new_focus:
                             ordered = [x for x in current_keys if x in new_focus]
                             names = []
@@ -2610,14 +5322,92 @@ class Worker:
                         focus_keys = new_focus
                         focus_idle_rounds = 0
                         mention_switched = True
+
+                    # 焦点讨论期间：旁听模型也收到增量消息，并可选择加入（PASS=继续旁听）。
+                    if False and focus_keys:
+                        observers = [x for x in current_keys if x not in focus_keys]
+                        if observers:
+                            sm = self.state.get_model(k)
+                            source_name = sm.name if sm else k
+                            payload = _pick_forward_payload(clean_reply) or clean_reply
+                            for observer in observers:
+                                if self.state.should_round_stop():
+                                    break
+                                om = self.state.get_model(observer)
+                                observer_mentions = self._mention_candidates_line(current_keys, exclude_key=observer)
+                                probe_instruction = self._build_observer_probe_instruction(
+                                    source_name,
+                                    payload,
+                                    observer_mentions,
+                                )
+                                ok_obs, observer_reply = self._run_model_turn(
+                                    observer,
+                                    probe_instruction,
+                                    visibility="shadow",
+                                    hidden_reply_hint=True,
+                                    record_reply=False,
+                                )
+                                observer_clean = _strip_private_thoughts(observer_reply)
+                                if not ok_obs or self._is_pass_reply(observer_clean):
+                                    continue
+
+                                speaker = om.name if om else observer
+                                self.state.add_message(
+                                    "model",
+                                    speaker,
+                                    observer_clean,
+                                    visibility="public",
+                                    model_key=observer,
+                                )
+                                round_visible_replies += 1
+                                join_targets = self._extract_target_keys_from_text(
+                                    observer_clean,
+                                    [x for x in current_keys if x != observer],
+                                )
+                                join_peer = join_targets[0] if join_targets else k
+                                observer_focus = {observer, join_peer}
+                                if focus_keys != observer_focus:
+                                    ordered = [x for x in current_keys if x in observer_focus]
+                                    names = []
+                                    for kk in ordered:
+                                        mm = self.state.get_model(kk)
+                                        names.append(mm.name if mm else kk)
+                                    self.state.add_system("旁听模型加入焦点讨论：" + " ↔ ".join(names))
+                                focus_keys = observer_focus
+                                focus_idle_rounds = 0
+                                mention_switched = True
+                                # 继续探测其他旁听者：允许同一回合多个模型依次加入。
+                                continue
                 core.jitter("模型轮转间隔")
+
+            if round_interrupted_by_host:
+                if round_no > 0:
+                    round_no -= 1
+                self.state.add_system("检测到群主新话题，正在切换到新一轮讨论。")
+                continue
+
+            # 群主插话至少影响后续 2 个完整回合，降低“说了但像没说”的体验。
+            if active_user_instruction:
+                if round_visible_replies > 0:
+                    active_user_force_rounds -= 1
+                if active_user_force_rounds <= 0 and not active_user_pending_models:
+                    active_user_instruction = None
+                    active_user_force_rounds = 0
 
             if self.state.should_round_stop():
                 self.state.add_system("已停止自动轮聊。")
                 break
-            if not any_success:
-                self.state.add_system("轮聊结束：本轮没有模型成功回复。")
+            if round_visible_replies <= 0:
+                silent_rounds += 1
+                if any_turn_ok and silent_rounds < 2:
+                    self.state.add_system("本轮暂无可见回复，正在自动重试下一轮。")
+                    continue
+                if any_turn_ok:
+                    self.state.add_system("轮聊结束：连续多轮没有可见回复。")
+                else:
+                    self.state.add_system("轮聊结束：本轮没有模型成功回复。")
                 break
+            silent_rounds = 0
             if focus_keys and not mention_switched:
                 focus_idle_rounds += 1
                 if focus_idle_rounds >= FOCUS_RECOVERY_ROUNDS:
@@ -2656,16 +5446,8 @@ class Worker:
         self.state.add_system(f"已请求 {m.name} 发言")
         self.state.set_status(f"nudge:{key}")
 
-        self._ensure_chat_surface(ad, m)
-
-        history = self.state.get_all_messages()
-        instruction = "请基于当前对话提出观点/反驳/补充，抓重点，像人聊天，尽量短。"
-        prompt = build_model_prompt(history, instruction)
-
-        before = ad.snapshot_conversation()
-        ad.send_user_text(prompt)
-        reply = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=MODEL_REPLY_TIMEOUT_S)) or "（未能提取到回复）"
-        self.state.add_message("model", m.name, reply, visibility="public", model_key=key)
+        instruction = "请基于当前对话提出观点/反驳/补充，抓重点，像人聊天，尽量短，并保留关键细节。"
+        self._run_model_turn(key, instruction, visibility="public")
         self.state.set_status("idle")
         self._safe_reply(action, {"ok": True})
 
@@ -2686,6 +5468,8 @@ def run_webui_app(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, *, no_open
     url = f"http://{host}:{port}/"
     state.set_status(f"webui ready: {url}")
     state.add_system(f"Web UI 已启动：{url}")
+    state.add_system(f"运行日志文件：{TURN_LOG_FILE.resolve()}")
+    state.add_system(f"群聊消息日志：{MESSAGE_LOG_FILE.resolve()}")
     state.add_system("请在左侧选择要启用的模型（未登录会弹出登录提示）。")
     state.add_system("底部请选择发送目标：请选择 / 群聊 / 单聊（仅已启用模型）。")
 
@@ -2717,49 +5501,146 @@ def _format_user(text: str) -> str:
     # 给模型看的“群主插话”，明确这是用户说的
     return f"【用户】\n{text}".strip()
 
+
+def _sanitize_forward_payload(text: str) -> str:
+    t = _strip_group_chatter_boilerplate(text)
+    t = core.normalize_text(t)
+    if not t:
+        return ""
+    wrapped_public, _wrapped_private = _extract_wrapped_reply(t)
+    if wrapped_public:
+        # If model returned explicit wrapper blocks, keep only public payload.
+        t = core.normalize_text(wrapped_public)
+        if not t:
+            return ""
+
+    prompt_hints = (
+        _PUBLIC_WRAP_OPEN,
+        _PUBLIC_WRAP_CLOSE,
+        _PRIVATE_WRAP_OPEN,
+        _PRIVATE_WRAP_CLOSE,
+        f"格式：{_PUBLIC_WRAP_OPEN}正文{_PUBLIC_WRAP_CLOSE}",
+        "请把公开发言放在",
+        "如需隐藏想法，可放在",
+        "你在多人群聊中发言",
+        "你在多人群聊中继续讨论",
+        "群主最新话题：",
+        "上一位发言（",
+        "优先级：必须先回应“群主最新话题”",
+        "最终发言要求：",
+        "只输出给群里的正文",
+        "如暂不发言，仅回复 [PASS]",
+        "只输出 [PASS]",
+        "可回应对象：",
+        "可点名对象：",
+        "只依据以下群聊消息回复",
+        "不要复述本提示",
+        "不要复述提示词",
+        "上下文边界",
+        "忽略网页里更早的旧对话",
+        "Gemini 应用",
+        "与 Gemini 对话",
+        "须遵守《Google 条款》",
+        "须遵守《Google 隐私权政策》",
+        "Gemini 是一款 AI 工具",
+    )
+    chip_hints = (
+        "造个句",
+        "有哪些技巧",
+        "有哪些规则",
+        "推荐一些",
+        "提供一些",
+        "成语接龙",
+        "视频生成",
+        "图片生成",
+        "图像生成",
+        "PPT生成",
+        "PPT 生成",
+        "帮我写作",
+        "写一份",
+        "生成",
+        "超能模式",
+        "免费",
+    )
+    out: list[str] = []
+    seen: set[str] = set()
+    for ln in t.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        segs = [s]
+        if ("|" in s or "｜" in s) and len(s) <= 180:
+            split_segs = [x.strip() for x in re.split(r"[|｜]+", s) if x.strip()]
+            if split_segs:
+                segs = split_segs
+        for seg in segs:
+            if _WRAP_TOKEN_PAT.search(seg):
+                continue
+            if any(h in seg for h in prompt_hints):
+                continue
+            if _GROUP_HOST_CHATTER_PAT.search(seg) and len(_line_dedupe_key(seg)) <= 56:
+                continue
+            if _GROUP_ORCHESTRATION_PAT.search(seg) and len(_line_dedupe_key(seg)) <= 56:
+                continue
+            if _TRIVIAL_PUBLIC_PAT.match(seg):
+                continue
+            if seg.startswith("【群聊") or seg.startswith("【用户】"):
+                continue
+            if re.match(r"^[（(][^）)]{1,16}[)）]\s*[:：]?\s*$", seg):
+                continue
+            if re.match(r"^【[^】]{1,12}】$", seg):
+                continue
+            if "→" in seg and len(seg) <= 42:
+                continue
+            if len(seg) <= 34 and any(h in seg for h in chip_hints):
+                continue
+            if len(seg) <= 26 and re.match(r"^(?:写一份|生成|推荐|提供|帮我)", seg):
+                continue
+            if len(seg) <= 22 and re.search(r"(?:视频|图片|图像|海报|插画|头像|PPT|文案)?生成$", seg):
+                continue
+            q_ratio = (seg.count("?") + seg.count("？")) / max(1, len(seg))
+            if q_ratio >= 0.35 and len(re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", seg.lower())) < 12:
+                continue
+            if re.match(r"^(?:@?[\w\u4e00-\u9fff-]{1,20}\s*)?(?:接|你接|请接|来接)\s*[~～!！。\.]*$", seg):
+                continue
+            if _LOW_VALUE_PROCESS_PAT.match(seg):
+                continue
+            if re.match(r"^\s*(?:现在)?我需要.{0,140}(?:然后|再)(?:回应|补充|给出|讨论)", seg):
+                continue
+            m_pref = re.match(r"^(?:@?[\w\u4e00-\u9fff-]{1,24})[：:]\s*(.+)$", seg)
+            if m_pref:
+                tail = core.normalize_text(m_pref.group(1))
+                if tail and _LOW_VALUE_PROCESS_PAT.match(tail):
+                    continue
+
+            key = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", seg.lower())
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            out.append(seg)
+
+    return core.normalize_text("\n".join(out))
+
+
 def _pick_forward_payload(full_reply: str) -> str:
     """
-    互怼转发时不直接把“整段长回复”扔给对方（会越来越长，且很难抓重点）。
-    优先从回复里提取【转发摘要】；没有则做一个保守截取。
+    只转发本轮原始发言，不做摘要提取。
+    仅做长度安全截断，避免网页输入框卡死。
     """
-    text = core.normalize_text(full_reply)
+    text = _strip_private_thoughts(full_reply) or core.normalize_text(full_reply)
+    text = _sanitize_forward_payload(text) or text
     if not text:
         return ""
-
-    # 取最后一个【转发摘要】（模型有时会重复输出）
-    matches = list(re.finditer(r"【转发摘要】\s*[:：]?\s*", text))
-    if matches:
-        start = matches[-1].end()
-        tail = text[start:].strip()
-        # 遇到下一个“【xxx】”段落就截断，避免把正文又带进去
-        parts = re.split(r"\n\s*【[^】]{1,12}】", tail, maxsplit=1)
-        summary = (parts[0] if parts else tail).strip()
-        if summary:
-            if len(summary) > FORWARD_MAX_CHARS:
-                return summary[:FORWARD_MAX_CHARS] + "\n...(省略)"
-            return summary
-
-    # fallback：抓前几行要点/结论
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    compact = "\n".join(lines[:10]).strip()
-    if len(compact) > FORWARD_MAX_CHARS:
-        return compact[:FORWARD_MAX_CHARS] + "\n...(省略)"
-    return compact
+    return _clip_text(text, FORWARD_MAX_CHARS)
 
 
 def _strip_forward_summary(full_reply: str) -> str:
     """
-    为了让 UI 里看起来更像“正常聊天”，把末尾的【转发摘要】从展示文本中移除。
-    该摘要仍会用于模型间转发（见 _pick_forward_payload）。
+    不再强制摘要，展示原始回复。
     """
     text = core.normalize_text(full_reply)
-    if not text:
-        return ""
-    matches = list(re.finditer(r"【转发摘要】\s*[:：]?\s*", text))
-    if not matches:
-        return text
-    body = text[: matches[-1].start()].rstrip()
-    return body or text
+    return text
 
 
 def _compose_shadow_sync_message(source_site: str, user_text: str, source_reply: str) -> str:
@@ -2782,7 +5663,6 @@ def _compose_shadow_sync_message(source_site: str, user_text: str, source_reply:
             "- 像正常人聊天：自然、有温度，但要短；不要用 1/2/3 模板。",
             "- 允许联网：仅在需要最新事实/数据时联网；只补充事实，不要复述网页当结论；不要贴 URL。",
             "- 抓重点：先用 1 句复述对方核心主张，再用 2-4 句回应（反驳/补充）。",
-            "- 末尾加【转发摘要】<=120字，只写关键观点。",
             "- 不要在回复中提及“隐藏/旁听/未读”等元信息，直接正常回答即可。",
         ]
     ).strip()

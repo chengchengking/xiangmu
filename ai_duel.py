@@ -15,11 +15,26 @@ CHATGPT_URL = "https://chatgpt.com/"
 GEMINI_URL = "https://gemini.google.com/app"
 
 # 反机械化随机延迟
-ACTION_DELAY_MIN = 1.5
-ACTION_DELAY_MAX = 3.5
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except Exception:
+        return default
+    if value < 0:
+        return default
+    return value
+
+
+ACTION_DELAY_MIN = _env_float("AI_DUEL_ACTION_DELAY_MIN", 0.15)
+ACTION_DELAY_MAX = _env_float("AI_DUEL_ACTION_DELAY_MAX", 0.35)
+if ACTION_DELAY_MAX < ACTION_DELAY_MIN:
+    ACTION_DELAY_MAX = ACTION_DELAY_MIN
 
 # 轮询参数
-POLL_SECONDS = 1.0
+POLL_SECONDS = _env_float("AI_DUEL_POLL_SECONDS", 0.4)
 MAX_WAIT_SECONDS = 600
 
 
@@ -337,24 +352,78 @@ def count_chatgpt_assistant_messages(page: Page) -> int:
     return page.locator("[data-message-author-role='assistant']").count()
 
 
+_GEMINI_REPLY_SELECTORS: list[str] = [
+    # Prefer explicit model reply containers; avoid broad "message-content" which can include sidebars/nav.
+    "main model-response",
+    "model-response",
+    "main [data-response-id]",
+    "main div[data-response-id]",
+]
+
+_GEMINI_UI_NOISE_PAT = re.compile(
+    r"(关于 Gemini|Gemini 应用|在新窗口中打开|订阅|企业应用场景|认识 Gemini|你的私人 AI 助理|"
+    r"写作|计划|研究|学习|工具|快速|历史记录|新对话|发现)",
+    re.I,
+)
+
+
+def _clean_gemini_candidate(text: str) -> str:
+    t = normalize_text(text)
+    if not t:
+        return ""
+    # Some layouts prepend speaker labels.
+    t = re.sub(r"^\s*Gemini\s*说\s*[:：]?\s*", "", t, flags=re.I)
+    # Prefer explicitly wrapped public payload if present.
+    m = re.search(r"(?is)\[\[\s*PUBLIC_REPLY\s*\]\]\s*(.*?)\s*\[\[\s*/\s*PUBLIC_REPLY\s*\]\]", t, re.I)
+    if m:
+        return normalize_text(m.group(1))
+    return t
+
+
+def _looks_like_gemini_ui_noise(text: str) -> bool:
+    t = normalize_text(text)
+    if not t:
+        return True
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if not lines:
+        return True
+    if len(lines) == 1 and len(lines[0]) <= 20 and _GEMINI_UI_NOISE_PAT.search(lines[0]):
+        return True
+    hit = sum(1 for ln in lines if _GEMINI_UI_NOISE_PAT.search(ln))
+    if hit >= max(2, len(lines) // 2):
+        return True
+    if "|" in t and hit >= 2:
+        return True
+    key_len = len(re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", t.lower()))
+    if key_len < 6 and hit >= 1:
+        return True
+    return False
+
+
 def count_gemini_responses(page: Page) -> int:
     """
-    Gemini 回答节点并非长期固定，这里做多候选统计，取较大值。
+    Gemini 回答节点统计：优先计算“看起来像真实回答”的节点数。
     """
-    selectors = [
-        "main model-response",
-        "model-response",
-        "main message-content",
-        "message-content",
-        "main div[data-response-id]",
-    ]
-    counts = []
-    for sel in selectors:
+    best = 0
+    for sel in _GEMINI_REPLY_SELECTORS:
         try:
-            counts.append(page.locator(sel).count())
+            loc = page.locator(sel)
+            cnt = loc.count()
         except Exception:
             continue
-    return max(counts) if counts else 0
+        if cnt <= 0:
+            continue
+        good = 0
+        start = max(0, cnt - 24)
+        for i in range(start, cnt):
+            try:
+                txt = _clean_gemini_candidate(loc.nth(i).inner_text())
+            except Exception:
+                continue
+            if txt and not _looks_like_gemini_ui_noise(txt):
+                good += 1
+        best = max(best, good if good > 0 else cnt)
+    return best
 
 
 def extract_chatgpt_last_reply(page: Page) -> str:
@@ -373,15 +442,8 @@ def extract_gemini_last_reply(page: Page) -> str:
     Gemini 最后一条回复提取：
     逐个候选结构逆序扫描，拿到最后一个非空文本。
     """
-    selectors = [
-        "main model-response",
-        "model-response",
-        "main message-content",
-        "message-content",
-        "main div[data-response-id]",
-    ]
-
-    for sel in selectors:
+    best = ""
+    for sel in _GEMINI_REPLY_SELECTORS:
         loc = page.locator(sel)
         count = loc.count()
         if count <= 0:
@@ -391,12 +453,19 @@ def extract_gemini_last_reply(page: Page) -> str:
             try:
                 if not node.is_visible(timeout=300):
                     continue
-                text = normalize_text(node.inner_text())
-                if text:
+                text = _clean_gemini_candidate(node.inner_text())
+                if not text:
+                    continue
+                if _looks_like_gemini_ui_noise(text):
+                    continue
+                # Prefer substantial semantic blocks first.
+                if len(text) >= 24:
                     return text
+                if len(text) > len(best):
+                    best = text
             except Exception:
                 continue
-    return ""
+    return best
 
 
 def read_stable_text(reader: Callable[[], str], site_name: str, rounds: int = 12) -> str:
