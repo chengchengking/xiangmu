@@ -2405,7 +2405,16 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": "missing target"}, status=400)
                 return
             rounds_raw = data.get("rounds", GROUP_DEFAULT_ROUNDS)
-            self.state.inbox.put({"kind": "send", "target": target, "text": text, "rounds": rounds_raw})
+            shadow_scope = str(data.get("shadow_scope") or "").strip().lower()
+            self.state.inbox.put(
+                {
+                    "kind": "send",
+                    "target": target,
+                    "text": text,
+                    "rounds": rounds_raw,
+                    "shadow_scope": shadow_scope,
+                }
+            )
             self._send_json({"ok": True})
             return
 
