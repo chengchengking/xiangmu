@@ -45,6 +45,7 @@ from model_adapters import (
     QwenAdapter,
     default_avatar_svg,
 )
+from protocol import parse_envelope
 
 
 def _env_int(name: str, default: int, *, min_v: int = 0, max_v: int = 86400) -> int:
@@ -60,6 +61,25 @@ def _env_int(name: str, default: int, *, min_v: int = 0, max_v: int = 86400) -> 
     if v > max_v:
         return max_v
     return v
+
+
+def _protocol_wrap_instruction_suffix(*, mode: str, hidden_reply_hint: bool) -> str:
+    # Keep this header short/stable to reduce prompt echo on web UIs.
+    private_line = (
+        "[[PRIVATE_REPLY]]可选：仅写不公开的想法[[/PRIVATE_REPLY]]\n"
+        if hidden_reply_hint
+        else "[[PRIVATE_REPLY]]可选[[/PRIVATE_REPLY]]\n"
+    )
+    return (
+        "\n\n请按以下格式输出（不要复述本提示）：\n"
+        "[[META]]\n"
+        f"mode={mode}\n"
+        "[[/META]]\n"
+        "[[PUBLIC_REPLY]]\n"
+        "这里写公开发言；若不发言写 [PASS]\n"
+        "[[/PUBLIC_REPLY]]\n"
+        f"{private_line}"
+    )
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -4522,6 +4542,9 @@ class Worker:
                 self.state.add_system(f"{m.name} 本轮跳过：空指令")
                 return False, ""
             strict_token = _extract_expected_short_literal(instruction)
+            if not strict_token:
+                mode_tag = "MULTI_ROUND" if (visibility == "public" and not record_reply) else "SINGLE_FAST"
+                prompt = (prompt + _protocol_wrap_instruction_suffix(mode=mode_tag, hidden_reply_hint=hidden_reply_hint)).strip()
 
             _trace_turn(key, "prompt", prompt)
             before = ad.snapshot_conversation()
@@ -4643,7 +4666,13 @@ class Worker:
                         return True, "[PASS]"
                 reply = "（未能提取到回复，可能仍在生成中或页面结构变化）"
 
-            public_reply, private_reply = _split_public_private_reply(reply)
+            env = parse_envelope(reply)
+            if env.public:
+                public_reply = env.public
+                private_reply = env.private
+                _trace_turn(key, "envelope", f"status={env.status} meta={env.meta}")
+            else:
+                public_reply, private_reply = _split_public_private_reply(reply)
             public_reply = core.normalize_text(public_reply) or reply
             private_reply = core.normalize_text(private_reply)
             public_reply = _strip_leading_status_noise(public_reply) or public_reply
