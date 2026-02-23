@@ -81,3 +81,9 @@ All selected models are treated equally. Use `群聊` to send to all selected mo
 - `install_playwright_chromium_fast.ps1` will probe multiple download hosts (including `npmmirror`) and pick the fastest for Chromium.
 - If download errors like `stream disconnected before completion: ... error decoding response body` occur, the script will back off and retry automatically.
 - `ai_duel.py` uses a persistent Playwright profile directory at `.\user_data\` so you can log in once and reuse the session.
+
+
+## Docs
+
+- Architecture (Frozen v1, root copy): `GROUPCHAT_ARCHITECTURE.md`
+- Architecture (docs copy): `docs/architecture/GROUPCHAT_ARCHITECTURE.md`
