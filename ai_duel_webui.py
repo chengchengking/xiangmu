@@ -5276,6 +5276,10 @@ class Worker:
         return "可回应对象：" + " / ".join(tags) + "（可直接写名字，不必使用@）。"
 
     @staticmethod
+    def _should_sync_shadow_to_peers(shadow_scope: str) -> bool:
+        return (shadow_scope or "shared").strip().lower() == "shared"
+
+    @staticmethod
     def _looks_like_disagreement(text: str) -> bool:
         raw = core.normalize_text(text).lower()
         if not raw:
@@ -5835,13 +5839,22 @@ class Worker:
             if ok_main and main_reply:
                 # Freeze peer targets at send-time snapshot to avoid mid-turn toggle races causing wrong sync targets.
                 peers = [k for k in selected_snapshot if k != target]
+                if visibility == "shadow" and not self._should_sync_shadow_to_peers(action_shadow_scope):
+                    peers = []
                 if peers:
                     sm = self.state.get_model(target)
                     source_name = sm.name if sm else target
                     payload = _pick_forward_payload(main_reply) or main_reply
                     for peer in peers:
                         # 让每个旁听模型也有同一条“用户消息”，便于后续切换到该模型时上下文完整。
-                        self.state.add_message("user", "用户", text, visibility="shadow", model_key=peer)
+                        self.state.add_message(
+                            "user",
+                            "用户",
+                            text,
+                            visibility="shadow",
+                            model_key=peer,
+                            shadow_scope="shared",
+                        )
                         instruction = self._build_shadow_sync_instruction(source_name, text, payload)
                         self._run_model_turn(peer, instruction, visibility="shadow", hidden_reply_hint=True)
             self.state.set_status("idle")
