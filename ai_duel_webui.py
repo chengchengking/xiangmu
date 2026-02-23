@@ -3943,6 +3943,23 @@ def _looks_unfinished_public_reply(text: str) -> bool:
     return False
 
 
+def _looks_protocol_placeholder_public_reply(text: str) -> bool:
+    t = core.normalize_text(text)
+    if not t:
+        return False
+    k = _line_dedupe_key(t)
+    if not k:
+        return False
+    # Reject placeholder body copied from the protocol template.
+    if re.search(r"(这里写公开发言|若不发言写\s*\[?\s*PASS\s*\]?|在此填写公开回复)", t, re.I):
+        return True
+    if re.search(r"(公开发言放在|请把公开发言放在).{0,40}(之间|PUBLIC_REPLY)", t, re.I):
+        return True
+    if re.search(r"^\s*(?:\[\[)?PUBLIC_REPLY(?:\]\])?\s*$", t, re.I):
+        return True
+    return False
+
+
 def _looks_like_suggestion_chip_reply(text: str) -> bool:
     t = core.normalize_text(text)
     if not t:
@@ -5023,6 +5040,9 @@ class Worker:
                             # In group mode, duplicated old text is usually stale extraction; skip this turn.
                             _trace_turn(key, "pass(history_duplicate)", public_reply)
                             return True, "[PASS]"
+            if visibility == "public" and not record_reply and _looks_protocol_placeholder_public_reply(public_reply):
+                _trace_turn(key, "pass(protocol_placeholder)", public_reply)
+                return True, "[PASS]"
             if key == "qwen" and re.search(
                 r"(internal server error|连接到[^\\n]{0,40}出现问题|网络错误|请求失败|暂时不可用)",
                 public_reply,
