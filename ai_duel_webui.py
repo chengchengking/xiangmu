@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import ast
+import hashlib
 import json
 import os
 import queue
@@ -70,7 +71,15 @@ def _env_int(name: str, default: int, *, min_v: int = 0, max_v: int = 86400) -> 
     return v
 
 
-def _protocol_wrap_instruction_suffix(*, mode: str, hidden_reply_hint: bool) -> str:
+def _protocol_wrap_instruction_suffix(
+    *,
+    mode: str,
+    hidden_reply_hint: bool,
+    turn_id: Optional[int] = None,
+    reply_to: str = "",
+    ack_in: str = "",
+    packet_hash: str = "",
+) -> str:
     # Keep this header short/stable to reduce prompt echo on web UIs.
     private_line = (
         "[[PRIVATE_REPLY]]可选：仅写不公开的想法[[/PRIVATE_REPLY]]\n"
@@ -80,7 +89,11 @@ def _protocol_wrap_instruction_suffix(*, mode: str, hidden_reply_hint: bool) -> 
     return (
         "\n\n请按以下格式输出（不要复述本提示）：\n"
         "[[META]]\n"
+        f"{(f'turn_id={turn_id}\n') if turn_id is not None else ''}"
         f"mode={mode}\n"
+        f"{(f'reply_to={reply_to}\n') if reply_to else ''}"
+        f"{(f'ack_in={ack_in}\n') if ack_in else ''}"
+        f"{(f'packet_hash={packet_hash}\n') if packet_hash else ''}"
         "[[/META]]\n"
         "[[PUBLIC_REPLY]]\n"
         "这里写公开发言；若不发言写 [PASS]\n"
@@ -4209,6 +4222,38 @@ class Worker:
         self._last_receipt_by_model[key_norm] = rec
         _trace_turn(key_norm, "receipt_final", json.dumps(rec.to_dict(), ensure_ascii=False))
 
+    def _build_authoritative_broadcast_packet(
+        self, *, max_items: int = 10, max_chars: int = 2400
+    ) -> tuple[str, str]:
+        msgs = self.state.get_all_messages()
+        pub = [
+            m
+            for m in msgs
+            if m.visibility == "public"
+            and m.role in {"user", "model"}
+            and core.normalize_text(m.text)
+        ]
+        items = pub[-max(1, int(max_items)) :]
+        lines = [f"【广播包 run_id={RUN_ID}】"]
+        for mm in items:
+            role = "U" if mm.role == "user" else "M"
+            speaker = core.normalize_text(mm.speaker)
+            text = core.normalize_text(mm.text).replace("\n", " ").strip()
+            if len(text) > 220:
+                text = text[:220] + "…"
+            lines.append(f"- {role}#{mm.id}({speaker}): {text}")
+        lines.append("【广播包结束】")
+        packet = "\n".join(lines)
+        if len(packet) > max_chars:
+            packet = packet[:max_chars] + "\n【广播包截断】"
+        h = hashlib.sha1(packet.encode("utf-8")).hexdigest()[:12]
+        return packet, h
+
+    def _ack_in_from_public_timeline(self) -> str:
+        msgs = self.state.get_all_messages()
+        pub_ids = [int(m.id) for m in msgs if m.visibility == "public"]
+        return str(max(pub_ids)) if pub_ids else "0"
+
     def start(self) -> None:
         self._thread.start()
 
@@ -4581,6 +4626,10 @@ class Worker:
         hidden_reply_hint: bool = False,
         record_reply: bool = True,
         timeout_cap_s: Optional[int] = None,
+        authoritative_packet_text: str = "",
+        authoritative_packet_hash: str = "",
+        ack_in: str = "",
+        reply_to_mid: str = "",
     ) -> tuple[bool, str]:
         m = self.state.get_model(key)
         if not m or not m.integrated:
@@ -4633,10 +4682,27 @@ class Worker:
             if not prompt:
                 self.state.add_system(f"{m.name} 本轮跳过：空指令")
                 return False, ""
+            if authoritative_packet_text:
+                prompt = f"{authoritative_packet_text}\n\n{prompt}".strip()
+                _trace_turn(
+                    key,
+                    "broadcast_packet",
+                    (
+                        f"turn_id={ctx.turn_id} mode={ctx.mode.value} packet_hash={authoritative_packet_hash} "
+                        f"ack_in={ack_in or ''}"
+                    ),
+                )
             if not strict_token:
                 prompt = (
                     prompt
-                    + _protocol_wrap_instruction_suffix(mode=ctx.mode.value, hidden_reply_hint=hidden_reply_hint)
+                    + _protocol_wrap_instruction_suffix(
+                        mode=ctx.mode.value,
+                        hidden_reply_hint=hidden_reply_hint,
+                        turn_id=ctx.turn_id,
+                        reply_to=reply_to_mid or "",
+                        ack_in=ack_in or "",
+                        packet_hash=authoritative_packet_hash or "",
+                    )
                 ).strip()
 
             _trace_turn(key, "prompt", f"turn_id={ctx.turn_id} mode={ctx.mode.value}\n{prompt}")
@@ -4771,7 +4837,10 @@ class Worker:
                 _trace_turn(
                     key,
                     "envelope",
-                    f"turn_id={ctx.turn_id} mode={ctx.mode.value} status={env.status} meta={env.meta}",
+                    (
+                        f"turn_id={ctx.turn_id} mode={ctx.mode.value} status={env.status} "
+                        f"meta={env.meta} ack_out={env.meta.get('ack_out') or env.meta.get('ack') or ''}"
+                    ),
                 )
             else:
                 public_reply, private_reply = _split_public_private_reply(reply)
@@ -5902,6 +5971,8 @@ class Worker:
             mention_switched = False
             round_interrupted_by_host = False
             round_context_chars = self._estimate_recent_public_context_chars()
+            authoritative_packet_text, authoritative_packet_hash = self._build_authoritative_broadcast_packet()
+            authoritative_ack_in = self._ack_in_from_public_timeline()
             for k in talk_keys:
                 if self.state.should_round_stop():
                     break
@@ -6056,6 +6127,9 @@ class Worker:
                     visibility="public",
                     record_reply=False,
                     timeout_cap_s=turn_timeout_cap,
+                    authoritative_packet_text=authoritative_packet_text,
+                    authoritative_packet_hash=authoritative_packet_hash,
+                    ack_in=authoritative_ack_in,
                 )
                 def _finalize_turn_receipt_local(
                     status: ReceiptStatus,
