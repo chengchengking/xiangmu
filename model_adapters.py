@@ -593,7 +593,9 @@ class GeminiAdapter(ModelAdapter):
         if self.page is None:
             return ""
         prev_count = core.count_gemini_responses(self.page)
-        before_last = core.normalize_text(self._extract_last_reply_candidate() or core.extract_gemini_last_reply(self.page))
+        before_last = core.normalize_text(
+            self._extract_last_reply_candidate() or core.extract_gemini_last_reply(self.page)
+        )
 
         timed_out = False
         try:
@@ -603,7 +605,11 @@ class GeminiAdapter(ModelAdapter):
             core.warn("Gemini 等待生成超时，进入提取兜底流程。")
 
         stable = core.normalize_text(
-            core.read_stable_text(lambda: self._extract_last_reply_candidate() or core.extract_gemini_last_reply(self.page), "Gemini", rounds=10)
+            core.read_stable_text(
+                lambda: self._extract_last_reply_candidate() or core.extract_gemini_last_reply(self.page),
+                "Gemini",
+                rounds=10,
+            )
         )
         if stable and stable != before_last and not self._looks_like_ui_noise(stable):
             return stable
@@ -619,7 +625,9 @@ class GeminiAdapter(ModelAdapter):
         if timed_out:
             grace_begin = time.time()
             while time.time() - grace_begin < 15:
-                cur = core.normalize_text(self._extract_last_reply_candidate() or core.extract_gemini_last_reply(self.page))
+                cur = core.normalize_text(
+                    self._extract_last_reply_candidate() or core.extract_gemini_last_reply(self.page)
+                )
                 cur = self._salvage_noisy_candidate(cur) or cur
                 if cur and cur != before_last and not self._looks_like_ui_noise(cur):
                     return cur
@@ -1293,7 +1301,9 @@ class GenericWebChatAdapter(ModelAdapter):
                     return diff
             time.sleep(0.8)
 
-        stable_snapshot = core.normalize_text(core.read_stable_text(lambda: self.snapshot_conversation(), self.meta.name, rounds=10))
+        stable_snapshot = core.normalize_text(
+            core.read_stable_text(lambda: self.snapshot_conversation(), self.meta.name, rounds=10)
+        )
         reply = self._clean_candidate_text(self._diff_reply(before_snapshot, stable_snapshot))
         if reply:
             return reply
@@ -1541,7 +1551,9 @@ class QwenAdapter(GenericWebChatAdapter):
             return False
 
         stop_candidates = (
-            self.page.get_by_role("button", name=re.compile(r"^(停止生成|停止回答|停止输出|Stop generating|Stop response)$", re.I)),
+            self.page.get_by_role(
+                "button", name=re.compile(r"^(停止生成|停止回答|停止输出|Stop generating|Stop response)$", re.I)
+            ),
             self.page.locator(
                 "button:has-text('停止生成'),"
                 "button:has-text('停止回答'),"
@@ -1570,9 +1582,15 @@ class QwenAdapter(GenericWebChatAdapter):
                 continue
             if self._QWEN_STATUS_PAT.match(s):
                 continue
-            if re.search(r"(谁先来|我们这就开始|先来(?:出)?第一个|我先来抛砖引玉)", s, re.I) and len(self._line_dedupe_key(s)) <= 56:
+            if (
+                re.search(r"(谁先来|我们这就开始|先来(?:出)?第一个|我先来抛砖引玉)", s, re.I)
+                and len(self._line_dedupe_key(s)) <= 56
+            ):
                 continue
-            if re.search(r"(?:好(?:的|嘞)?|收到|明白|ok|OK)[，,。!！~～\s]{0,3}(?:群主|主持人|老大|老板)", s, re.I) and len(self._line_dedupe_key(s)) <= 56:
+            if (
+                re.search(r"(?:好(?:的|嘞)?|收到|明白|ok|OK)[，,。!！~～\s]{0,3}(?:群主|主持人|老大|老板)", s, re.I)
+                and len(self._line_dedupe_key(s)) <= 56
+            ):
                 continue
             if self._QWEN_LOW_VALUE_PROCESS_PAT.match(s):
                 continue
@@ -2061,12 +2079,10 @@ class QwenAdapter(GenericWebChatAdapter):
                 return True
             if self._QWEN_SHORT_COMPLETE_PAT.match(t):
                 return False
-            if t.endswith(("。", "！", "？", "!", "?", "…", "）", ")", "】", "]", "\"", "'")):
+            if t.endswith(("。", "！", "？", "!", "?", "…", "）", ")", "】", "]", '"', "'")):
                 return False
             lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-            if len(lines) >= 2 and any(
-                ln.endswith(("。", "！", "？", "!", "?", "…")) for ln in lines[-2:]
-            ):
+            if len(lines) >= 2 and any(ln.endswith(("。", "！", "？", "!", "?", "…")) for ln in lines[-2:]):
                 return False
             return len(self._line_dedupe_key(t)) < 42
 
@@ -2133,7 +2149,9 @@ class QwenAdapter(GenericWebChatAdapter):
                     main_incr = _to_incremental(self._diff_reply(before_main, cur_main))
                     if main_incr and self._prompt_like_penalty(main_incr) <= 1:
                         now2 = time.time()
-                        if main_incr != best and (len(main_incr) > len(best) or len(main_incr) >= max(8, len(best) - 8)):
+                        if main_incr != best and (
+                            len(main_incr) > len(best) or len(main_incr) >= max(8, len(best) - 8)
+                        ):
                             best = main_incr
                             best_at = now2
                             last_change_at = now2
@@ -2144,7 +2162,12 @@ class QwenAdapter(GenericWebChatAdapter):
                             else:
                                 return _commit(best)
 
-            elif best and not self._is_qwen_generating() and (time.time() - best_at) >= 0.45 and not _looks_incomplete(best):
+            elif (
+                best
+                and not self._is_qwen_generating()
+                and (time.time() - best_at) >= 0.45
+                and not _looks_incomplete(best)
+            ):
                 if _looks_partial(best) and (time.time() - best_at) < 2.2:
                     pass
                 else:
@@ -2170,7 +2193,9 @@ class QwenAdapter(GenericWebChatAdapter):
             return _commit(last)
 
         # Last-resort diff (kept small and strict to avoid whole-thread contamination).
-        stable_snapshot = core.normalize_text(core.read_stable_text(lambda: self.snapshot_conversation(), "Qwen", rounds=2))
+        stable_snapshot = core.normalize_text(
+            core.read_stable_text(lambda: self.snapshot_conversation(), "Qwen", rounds=2)
+        )
         reply = _to_incremental(self._diff_reply(before_snapshot, stable_snapshot))
         if (
             reply
@@ -2831,12 +2856,10 @@ class DoubaoAdapter(GenericWebChatAdapter):
                 return True
             if self._DOUBAO_SHORT_COMPLETE_PAT.match(t):
                 return False
-            if t.endswith(("。", "！", "？", "!", "?", "…", "）", ")", "】", "]", "\"", "'")):
+            if t.endswith(("。", "！", "？", "!", "?", "…", "）", ")", "】", "]", '"', "'")):
                 return False
             lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-            if len(lines) >= 2 and any(
-                ln.endswith(("。", "！", "？", "!", "?", "…")) for ln in lines[-2:]
-            ):
+            if len(lines) >= 2 and any(ln.endswith(("。", "！", "？", "!", "?", "…")) for ln in lines[-2:]):
                 return False
             return len(self._line_dedupe_key(t)) < 56
 
@@ -2931,7 +2954,9 @@ class DoubaoAdapter(GenericWebChatAdapter):
         if incr_last:
             return _commit(incr_last)
         # Last resort only: strict snapshot diff to reduce contamination.
-        stable_snapshot = core.normalize_text(core.read_stable_text(lambda: self.snapshot_conversation(), "Doubao", rounds=3))
+        stable_snapshot = core.normalize_text(
+            core.read_stable_text(lambda: self.snapshot_conversation(), "Doubao", rounds=3)
+        )
         raw_reply = self._clean_candidate_text(self._diff_reply(before_snapshot, stable_snapshot))
         reply = _to_incremental(raw_reply) or core.normalize_text(raw_reply)
         if not reply:
@@ -2963,7 +2988,9 @@ class DoubaoAdapter(GenericWebChatAdapter):
             return False
 
         opt = core.pick_visible(
-            self.page.locator("button,[role='button'],[role='menuitem'],[role='option'],label", has_text=self._THINK_OPTION_PAT),
+            self.page.locator(
+                "button,[role='button'],[role='menuitem'],[role='option'],label", has_text=self._THINK_OPTION_PAT
+            ),
             prefer_last=True,
         )
         if opt is None:

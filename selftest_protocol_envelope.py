@@ -80,4 +80,3 @@ mode=MULTI_ROUND
 
 if __name__ == "__main__":
     unittest.main()
-

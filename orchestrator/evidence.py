@@ -13,10 +13,9 @@ def should_enter_evidence(recent_public: List[str], *, threshold: int = 3, windo
     if not recent_public:
         return False
     hits = 0
-    for t in recent_public[-max(1, int(window)):]:
+    for t in recent_public[-max(1, int(window)) :]:
         if not t:
             continue
         if _NEG.search(t):
             hits += 1
     return hits >= max(1, int(threshold))
-

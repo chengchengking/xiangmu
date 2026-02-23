@@ -87,4 +87,3 @@ def parse_envelope(raw_text: str) -> Envelope:
         status = status + "|" + "|".join(status_flags)
 
     return Envelope(meta=meta, public=public, private=private, status=status)
-

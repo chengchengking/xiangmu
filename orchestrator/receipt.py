@@ -34,4 +34,3 @@ class Receipt:
         if self.reason is not None:
             d["reason"] = self.reason.value
         return d
-

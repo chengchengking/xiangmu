@@ -14,4 +14,3 @@ class TurnContext:
     reply_to: Optional[str] = None
     ack: Optional[str] = None
     extra: Dict[str, Any] = field(default_factory=dict)
-
