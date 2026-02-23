@@ -4176,6 +4176,7 @@ class Worker:
         self._gemini_need_fresh_chat = True
         self._turn_seq = 0
         self._last_receipt_by_model: dict[str, Receipt] = {}
+        self._last_turn_ctx_by_model: dict[str, TurnContext] = {}
 
     def _control_plane_header_for_model(self, model_key: str) -> str:
         r = self._last_receipt_by_model.get((model_key or "").strip().lower())
@@ -4190,6 +4191,23 @@ class Worker:
             f"【系统回执】上一轮：REJECT（turn_id={r.turn_id}, reason={reason}）。"
             "若再次被 REJECT，请缩短输出或仅给 BLOCKER/DIFF。\n"
         )
+
+    def _finalize_receipt_for_model(
+        self,
+        model_key: str,
+        *,
+        status: ReceiptStatus,
+        reason: Optional[RejectReason] = None,
+        note: Optional[str] = None,
+    ) -> None:
+        key_norm = (model_key or "").strip().lower()
+        if not key_norm:
+            return
+        ctx = self._last_turn_ctx_by_model.get(key_norm)
+        turn_id = int(getattr(ctx, "turn_id", 0) or 0)
+        rec = Receipt(turn_id=turn_id, status=status, reason=reason, note=note)
+        self._last_receipt_by_model[key_norm] = rec
+        _trace_turn(key_norm, "receipt_final", json.dumps(rec.to_dict(), ensure_ascii=False))
 
     def start(self) -> None:
         self._thread.start()
@@ -4589,6 +4607,8 @@ class Worker:
             self._turn_seq += 1
             turn_mode = Mode.MULTI_ROUND if (visibility == "public" and not record_reply) else Mode.SINGLE_FAST
             ctx = TurnContext(turn_id=self._turn_seq, mode=turn_mode)
+            self._last_turn_ctx_by_model[(key or "").strip().lower()] = ctx
+            defer_final_receipt = bool(visibility == "public" and not record_reply)
             try:
                 if ctx.mode != Mode.EVIDENCE:
                     msgs = self.state.get_all_messages()
@@ -5088,14 +5108,25 @@ class Worker:
                 )
             try:
                 tid = getattr(ctx, "turn_id", 0) if "ctx" in locals() else 0
-                if self._is_pass_reply(public_reply):
-                    rec = Receipt(turn_id=tid, status=ReceiptStatus.PASS_)
-                elif public_reply and public_reply.strip():
-                    rec = Receipt(turn_id=tid, status=ReceiptStatus.ACCEPT)
+                if defer_final_receipt:
+                    status_hint = (
+                        "PASS" if self._is_pass_reply(public_reply)
+                        else ("HAS_PUBLIC" if (public_reply and public_reply.strip()) else "NO_PUBLIC")
+                    )
+                    _trace_turn(
+                        key,
+                        "receipt_provisional",
+                        json.dumps({"turn_id": tid, "status_hint": status_hint}, ensure_ascii=False),
+                    )
                 else:
-                    rec = Receipt(turn_id=tid, status=ReceiptStatus.REJECT, reason=RejectReason.NO_PUBLIC_TAG)
-                self._last_receipt_by_model[(key or "").strip().lower()] = rec
-                _trace_turn(key, "receipt", json.dumps(rec.to_dict(), ensure_ascii=False))
+                    if self._is_pass_reply(public_reply):
+                        rec = Receipt(turn_id=tid, status=ReceiptStatus.PASS_)
+                    elif public_reply and public_reply.strip():
+                        rec = Receipt(turn_id=tid, status=ReceiptStatus.ACCEPT)
+                    else:
+                        rec = Receipt(turn_id=tid, status=ReceiptStatus.REJECT, reason=RejectReason.NO_PUBLIC_TAG)
+                    self._last_receipt_by_model[(key or "").strip().lower()] = rec
+                    _trace_turn(key, "receipt_final", json.dumps(rec.to_dict(), ensure_ascii=False))
             except Exception:
                 pass
             _trace_turn(
@@ -5108,10 +5139,18 @@ class Worker:
         except Exception as exc:
             self.state.add_system(f"{m.name} 本轮失败：{exc}")
             try:
-                tid = getattr(ctx, "turn_id", 0) if "ctx" in locals() else 0
-                rec = Receipt(turn_id=tid, status=ReceiptStatus.REJECT, reason=RejectReason.PARSE_FAIL)
-                self._last_receipt_by_model[(key or "").strip().lower()] = rec
-                _trace_turn(key, "receipt", json.dumps(rec.to_dict(), ensure_ascii=False))
+                if "ctx" in locals():
+                    tid = getattr(ctx, "turn_id", 0)
+                    if not defer_final_receipt:
+                        rec = Receipt(turn_id=tid, status=ReceiptStatus.REJECT, reason=RejectReason.PARSE_FAIL)
+                        self._last_receipt_by_model[(key or "").strip().lower()] = rec
+                        _trace_turn(key, "receipt_final", json.dumps(rec.to_dict(), ensure_ascii=False))
+                    else:
+                        _trace_turn(
+                            key,
+                            "receipt_provisional",
+                            json.dumps({"turn_id": tid, "status_hint": "ERROR"}, ensure_ascii=False),
+                        )
             except Exception:
                 pass
             return False, ""
@@ -6018,6 +6057,15 @@ class Worker:
                     record_reply=False,
                     timeout_cap_s=turn_timeout_cap,
                 )
+                def _finalize_turn_receipt_local(
+                    status: ReceiptStatus,
+                    reason: Optional[RejectReason] = None,
+                    note: Optional[str] = None,
+                ) -> None:
+                    try:
+                        self._finalize_receipt_for_model(k, status=status, reason=reason, note=note)
+                    except Exception:
+                        pass
                 def _mark_delivered(ids: list[int]) -> None:
                     if not ids:
                         return
@@ -6053,22 +6101,27 @@ class Worker:
                             active_user_pending_attempts.pop(k, None)
 
                     if self._is_pass_reply(clean_reply):
+                        _finalize_turn_receipt_local(ReceiptStatus.PASS_)
                         _mark_topic_miss_if_needed()
                         _mark_delivered(delivered_ids)
                         continue
                     if _looks_prompt_leak_reply(clean_reply):
+                        _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.LOW_VALUE, "prompt_leak")
                         _mark_topic_miss_if_needed()
                         _trace_turn(k, "pass(loop_prompt_leak)", clean_reply)
                         continue
                     if k in {"qwen", "doubao"} and _looks_unfinished_public_reply(clean_reply):
+                        _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.LOW_VALUE, "unfinished")
                         _mark_topic_miss_if_needed()
                         _trace_turn(k, "pass(loop_unfinished)", clean_reply)
                         continue
                     if k in {"qwen", "doubao"} and _looks_like_suggestion_chip_reply(clean_reply):
+                        _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.LOW_VALUE, "chip_reply")
                         _mark_topic_miss_if_needed()
                         _trace_turn(k, "pass(loop_chip)", clean_reply)
                         continue
                     if _LOW_VALUE_PROCESS_PAT.match(clean_reply) or _QWEN_STATUS_ONLY_PAT.match(clean_reply):
+                        _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.LOW_VALUE, "process_or_status")
                         _mark_topic_miss_if_needed()
                         _trace_turn(k, "pass(loop_process_or_status)", clean_reply)
                         continue
@@ -6084,6 +6137,7 @@ class Worker:
                                     nm = mk.name if mk else k
                                     self.state.add_system(f"{nm} 连续{tries}次未对齐新话题，已暂时跳过。")
                             # Topic-lock phase: drop off-topic content to avoid stale-thread pollution.
+                            _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.OFF_TOPIC)
                             _trace_turn(k, "pass(loop_off_topic_after_host_interject)", clean_reply)
                             continue
                     mcur = self.state.get_model(k)
@@ -6096,6 +6150,7 @@ class Worker:
                         model_key=k,
                     )
                     if reply_mid:
+                        _finalize_turn_receipt_local(ReceiptStatus.ACCEPT)
                         _mark_delivered(delivered_ids)
                         # 广播到其他模型的待分发队列（发送者本人不回传）。
                         _enqueue_broadcast(reply_mid, current_keys, exclude_key=k)
@@ -6181,6 +6236,8 @@ class Worker:
                                 mention_switched = True
                                 # 继续探测其他旁听者：允许同一回合多个模型依次加入。
                                 continue
+                else:
+                    _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.PARSE_FAIL)
                 core.jitter("模型轮转间隔")
 
             if round_interrupted_by_host:
