@@ -50,6 +50,10 @@ from orchestrator.evidence import should_enter_evidence
 from orchestrator.receipt import Receipt, ReceiptStatus, RejectReason
 from protocol import parse_envelope
 
+SHADOW_SCOPE_DEFAULT = (os.environ.get("AI_DUEL_SHADOW_SCOPE_DEFAULT") or "shared").strip().lower()
+if SHADOW_SCOPE_DEFAULT not in {"shared", "local"}:
+    SHADOW_SCOPE_DEFAULT = "shared"
+
 
 def _env_int(name: str, default: int, *, min_v: int = 0, max_v: int = 86400) -> int:
     raw = (os.environ.get(name) or "").strip()
@@ -412,6 +416,7 @@ class UiMessage:
     text: str
     visibility: str  # public | shadow
     model_key: Optional[str] = None  # 私聊线程归属；或 model 回复来源
+    shadow_scope: str = "shared"  # shadow: shared | local
 
 
 @dataclass
@@ -468,6 +473,7 @@ class SharedState:
         *,
         visibility: str,
         model_key: Optional[str] = None,
+        shadow_scope: str = "shared",
     ) -> int:
         t = core.normalize_text(text)
         if not t:
@@ -484,6 +490,7 @@ class SharedState:
                     text=t,
                     visibility=visibility,
                     model_key=model_key,
+                    shadow_scope=(shadow_scope or "shared"),
                 )
             )
             if len(self._messages) > MAX_MESSAGES:
@@ -498,6 +505,7 @@ class SharedState:
                     "speaker": speaker,
                     "visibility": visibility,
                     "model_key": model_key,
+                    "shadow_scope": (shadow_scope or "shared"),
                     "text": t,
                 },
             )
@@ -5056,6 +5064,7 @@ class Worker:
                     _clip_text(private_reply, 1200),
                     visibility="shadow",
                     model_key=key,
+                    shadow_scope="local",
                 )
             try:
                 tid = getattr(ctx, "turn_id", 0) if "ctx" in locals() else 0
@@ -5664,8 +5673,21 @@ class Worker:
             keys = [target]
             visibility = "shadow"
             thread_key = target
+            action_shadow_scope = (str(action.get("shadow_scope") or "")).strip().lower()
+            if action_shadow_scope not in {"shared", "local"}:
+                action_shadow_scope = SHADOW_SCOPE_DEFAULT
 
-        user_mid = self.state.add_message("user", "用户", text, visibility=visibility, model_key=thread_key)
+        if visibility == "shadow":
+            user_mid = self.state.add_message(
+                "user",
+                "用户",
+                text,
+                visibility=visibility,
+                model_key=thread_key,
+                shadow_scope=action_shadow_scope,
+            )
+        else:
+            user_mid = self.state.add_message("user", "用户", text, visibility=visibility, model_key=thread_key)
 
         self._ensure_playwright()
         assert self._pw is not None
