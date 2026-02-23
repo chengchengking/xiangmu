@@ -126,6 +126,7 @@ MESSAGE_LOG_FILE = Path(
 TURN_LOG_FILE = Path(
     os.environ.get("AI_DUEL_TURN_LOG_FILE", str(TRACE_DIR / f"ai_group_turns_{RUN_ID}.jsonl"))
 )
+SELECTED_MODELS_FILE = Path(os.environ.get("AI_DUEL_SELECTED_MODELS_FILE", str(TRACE_DIR / "selected_models.json")))
 _JSONL_LOCK = threading.Lock()
 GROUP_PUBLIC_TURN_SOFT_TIMEOUT_S = {
     "qwen": _env_int("AI_DUEL_GROUP_TIMEOUT_SOFT_QWEN", 30, min_v=12, max_v=240),
@@ -472,9 +473,36 @@ class SharedState:
                 selected=False,  # 需求：初始 0 模型启用
                 authenticated=False,
             )
+        self._load_selected_models()
 
         # 后端动作队列（Playwright 只能在同一线程执行）
         self.inbox: "queue.Queue[dict[str, Any]]" = queue.Queue()
+
+    def _load_selected_models(self) -> None:
+        try:
+            if not SELECTED_MODELS_FILE.exists():
+                return
+            data = json.loads(SELECTED_MODELS_FILE.read_text(encoding="utf-8", errors="replace"))
+            selected = data.get("selected_keys") if isinstance(data, dict) else None
+            if not isinstance(selected, list):
+                return
+            wanted = {(str(x or "").strip().lower()) for x in selected if str(x or "").strip()}
+            for k, m in self._models.items():
+                if not m.integrated:
+                    continue
+                m.selected = k in wanted
+        except Exception:
+            return
+
+    def _save_selected_models_locked(self) -> None:
+        try:
+            SELECTED_MODELS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            selected = [k for k, m in self._models.items() if m.selected]
+            selected.sort(key=lambda k: self._models[k].slot if k in self._models else 9999)
+            payload = {"selected_keys": selected}
+            SELECTED_MODELS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            return
 
     # --- messages ------------------------------------------------------
 
@@ -581,6 +609,7 @@ class SharedState:
                 m.selected = False
                 self._pending_enable.discard(key)
                 self._append_system_locked(f"{m.name} 已退出群聊")
+                self._save_selected_models_locked()
                 items = [asdict(mm) for mm in self._models.values()]
                 items.sort(key=lambda x: x["slot"])
                 return {"ok": True, "need_auth": False, "models": items}
@@ -594,6 +623,7 @@ class SharedState:
 
             m.selected = True
             self._append_system_locked(f"{m.name} 已加入群聊")
+            self._save_selected_models_locked()
             items = [asdict(mm) for mm in self._models.values()]
             items.sort(key=lambda x: x["slot"])
             return {"ok": True, "need_auth": False, "models": items}
@@ -610,6 +640,7 @@ class SharedState:
             if not m.selected:
                 m.selected = True
                 self._append_system_locked(f"{m.name} 已加入群聊")
+                self._save_selected_models_locked()
             return True
 
     # --- status / stop -------------------------------------------------
