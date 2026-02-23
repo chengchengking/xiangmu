@@ -45,6 +45,7 @@ from model_adapters import (
     QwenAdapter,
     default_avatar_svg,
 )
+from orchestrator import Mode, TurnContext
 from protocol import parse_envelope
 
 
@@ -4146,6 +4147,7 @@ class Worker:
         # ChatGPT / Gemini 在长会话下也会明显串旧话题；群任务开始时尽量新开对话。
         self._chatgpt_need_fresh_chat = True
         self._gemini_need_fresh_chat = True
+        self._turn_seq = 0
 
     def start(self) -> None:
         self._thread.start()
@@ -4542,11 +4544,16 @@ class Worker:
                 self.state.add_system(f"{m.name} 本轮跳过：空指令")
                 return False, ""
             strict_token = _extract_expected_short_literal(instruction)
+            self._turn_seq += 1
+            turn_mode = Mode.MULTI_ROUND if (visibility == "public" and not record_reply) else Mode.SINGLE_FAST
+            ctx = TurnContext(turn_id=self._turn_seq, mode=turn_mode)
             if not strict_token:
-                mode_tag = "MULTI_ROUND" if (visibility == "public" and not record_reply) else "SINGLE_FAST"
-                prompt = (prompt + _protocol_wrap_instruction_suffix(mode=mode_tag, hidden_reply_hint=hidden_reply_hint)).strip()
+                prompt = (
+                    prompt
+                    + _protocol_wrap_instruction_suffix(mode=ctx.mode.value, hidden_reply_hint=hidden_reply_hint)
+                ).strip()
 
-            _trace_turn(key, "prompt", prompt)
+            _trace_turn(key, "prompt", f"turn_id={ctx.turn_id} mode={ctx.mode.value}\n{prompt}")
             before = ad.snapshot_conversation()
             before_last_reply = ""
             try:
@@ -4590,7 +4597,12 @@ class Worker:
                 except Exception:
                     pass
             reply = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=timeout_s))
-            _trace_turn(key, "extract", reply, elapsed_s=(time.time() - turn_start))
+            _trace_turn(
+                key,
+                "extract",
+                f"turn_id={ctx.turn_id} mode={ctx.mode.value}\n{reply}",
+                elapsed_s=(time.time() - turn_start),
+            )
             if key in {"doubao", "gemini"} and _looks_prompt_leak_reply(reply):
                 # Fast retry can often pick finalized assistant content
                 # instead of transient prompt-echo/nav blocks.
@@ -4670,7 +4682,11 @@ class Worker:
             if env.public:
                 public_reply = env.public
                 private_reply = env.private
-                _trace_turn(key, "envelope", f"status={env.status} meta={env.meta}")
+                _trace_turn(
+                    key,
+                    "envelope",
+                    f"turn_id={ctx.turn_id} mode={ctx.mode.value} status={env.status} meta={env.meta}",
+                )
             else:
                 public_reply, private_reply = _split_public_private_reply(reply)
             public_reply = core.normalize_text(public_reply) or reply
@@ -4989,7 +5005,12 @@ class Worker:
                     visibility="shadow",
                     model_key=key,
                 )
-            _trace_turn(key, "final", public_reply, elapsed_s=(time.time() - turn_start))
+            _trace_turn(
+                key,
+                "final",
+                f"turn_id={ctx.turn_id} mode={ctx.mode.value}\n{public_reply}",
+                elapsed_s=(time.time() - turn_start),
+            )
             return True, public_reply
         except Exception as exc:
             self.state.add_system(f"{m.name} 本轮失败：{exc}")
