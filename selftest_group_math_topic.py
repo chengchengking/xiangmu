@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -13,6 +14,13 @@ from typing import Any
 
 def norm(text: str) -> str:
     return (text or "").replace("\u200b", "").strip()
+
+
+def _setup_stdout_utf8() -> None:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 
 class Api:
@@ -112,6 +120,13 @@ def ensure_selected_models(api: Api, target_keys: list[str]) -> list[str]:
 
 def parse_ints(text: str) -> list[int]:
     vals: list[int] = []
+    # Do not rely on trailing word boundary; CJK immediately after digits is common.
+    m = re.search(r"(?i)(?<![A-Za-z0-9_])ANSWER\s*[:=]\s*(-?\d+)", norm(text))
+    if m:
+        try:
+            return [int(m.group(1))]
+        except Exception:
+            pass
     for tok in re.findall(r"-?\d+", norm(text)):
         try:
             vals.append(int(tok))
@@ -213,6 +228,7 @@ def collect_case_replies(
 
 
 def main() -> int:
+    _setup_stdout_utf8()
     ap = argparse.ArgumentParser(description="Deterministic group-chat selftest (math + topic switch)")
     ap.add_argument("--base", default="http://127.0.0.1:8765", help="webui base url")
     ap.add_argument(
@@ -222,6 +238,11 @@ def main() -> int:
     )
     ap.add_argument("--rounds", type=int, default=1, help="group rounds per test case")
     ap.add_argument("--timeout", type=int, default=180, help="timeout seconds per test case")
+    ap.add_argument(
+        "--cases",
+        default="",
+        help="comma-separated case names to run (default: all)",
+    )
     args = ap.parse_args()
 
     api = Api(args.base)
@@ -246,11 +267,53 @@ def main() -> int:
     print(f"[INFO] selected={selected}")
 
     cases = [
-        Case("math_a", "SELFTEST-MATH-A: New topic. Reply with only one integer. 1+1=?", 2),
-        Case("math_b", "SELFTEST-MATH-B: Switch topic now. Reply with only one integer. 9+6=?", 15),
-        Case("math_c", "SELFTEST-MATH-C: Switch topic again. Reply with only one integer. 100-37=?", 63),
-        Case("math_d", "SELFTEST-MATH-D: Final switch. Reply with only one integer. 8*7=?", 56),
+        Case(
+            "hard_math_a",
+            "SELFTEST-HARD-A: New topic. Compute (73*89) - (47*31) + 125. Output ANSWER=<integer> only.",
+            5165,
+        ),
+        Case(
+            "hard_math_b",
+            "SELFTEST-HARD-B: Switch topic now. A machine runs in cycles: 18 minutes work + 6 minutes rest. In exactly 5 hours, total work minutes = ? Output ANSWER=<integer> only.",
+            228,
+        ),
+        Case(
+            "hard_math_c",
+            "SELFTEST-HARD-C: Switch topic again. Find the smallest positive x such that x mod 4 = 1, x mod 5 = 3, x mod 7 = 2. Output ANSWER=<integer> only.",
+            93,
+        ),
+        Case(
+            "hard_math_d",
+            "SELFTEST-HARD-D: Count 4-digit numbers with all distinct digits, first digit nonzero, and divisible by 5. Output ANSWER=<integer> only.",
+            952,
+        ),
+        Case(
+            "hard_math_e",
+            "SELFTEST-HARD-E: Find the least positive n such that n mod 2 = 1, n mod 3 = 2, n mod 4 = 3, n mod 5 = 4, n mod 6 = 5. Output ANSWER=<integer> only.",
+            59,
+        ),
+        Case(
+            "hard_math_f",
+            "SELFTEST-HARD-F: Work rates: A finishes in 12 days, B in 18, C in 36. All three work 4 days, then B leaves. Additional days for A and C to finish = ? Output ANSWER=<integer> only.",
+            3,
+        ),
+        Case(
+            "hard_math_g",
+            "SELFTEST-HARD-G: Sequence: a1=2, a(n+1)=3*a(n)+2. Find a5. Output ANSWER=<integer> only.",
+            242,
+        ),
+        Case(
+            "hard_math_h",
+            "SELFTEST-HARD-H: Count integers from 1 to 5000 that are divisible by 6 or 10, but NOT divisible by 15. Output ANSWER=<integer> only.",
+            1001,
+        ),
     ]
+    if args.cases.strip():
+        wanted = {x.strip().lower() for x in args.cases.split(",") if x.strip()}
+        cases = [c for c in cases if c.name.lower() in wanted]
+        if not cases:
+            print(f"[FAIL] no matching cases for --cases={args.cases!r}")
+            return 2
 
     all_rows: list[ModelCaseResult] = []
     for case in cases:

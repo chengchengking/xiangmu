@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import base64
+import ast
 import json
 import os
 import queue
@@ -68,6 +69,7 @@ MAX_CONTEXT_MESSAGES = 120
 MAX_MODEL_PROMPT_CHARS = 12000
 MODEL_REPLY_TIMEOUT_S = 180
 MODEL_REPLY_TIMEOUT_OVERRIDES: dict[str, int] = {
+    "gemini": 90,
     "qwen": 42,
 }
 TURN_TRACE_ENABLED = os.environ.get("AI_DUEL_TURN_TRACE", "1").strip().lower() not in {"0", "false", "off", "no"}
@@ -75,6 +77,7 @@ GROUP_CONTINUOUS_MAX_ROUNDS = 60
 GROUP_DEFAULT_ROUNDS = -1  # -1 means continuous rounds until manual stop/safety cap
 FOCUS_RECOVERY_ROUNDS = 4
 TOPIC_LOCK_MAX_ATTEMPTS_PER_MODEL = 2
+TOPIC_INTERJECT_PENDING_KEEP = _env_int("AI_DUEL_TOPIC_INTERJECT_PENDING_KEEP", 2, min_v=2, max_v=80)
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 TRACE_DIR = Path(".tmp")
 MESSAGE_LOG_FILE = Path(
@@ -95,16 +98,63 @@ GROUP_PUBLIC_ROUND_CAP_BY_COUNT = {
     4: _env_int("AI_DUEL_GROUP_TIMEOUT_CAP_4", 42, min_v=12, max_v=280),
     5: _env_int("AI_DUEL_GROUP_TIMEOUT_CAP_5", 46, min_v=12, max_v=320),
 }
+GROUP_TIMEOUT_GROWTH_ROUND_STEP = _env_int("AI_DUEL_GROUP_TIMEOUT_GROWTH_ROUND_STEP", 3, min_v=1, max_v=20)
+GROUP_TIMEOUT_GROWTH_PER_STEP_S = _env_int("AI_DUEL_GROUP_TIMEOUT_GROWTH_PER_STEP_S", 3, min_v=1, max_v=30)
+GROUP_TIMEOUT_GROWTH_MAX_ROUND_BONUS_S = _env_int(
+    "AI_DUEL_GROUP_TIMEOUT_GROWTH_MAX_ROUND_BONUS_S", 28, min_v=0, max_v=180
+)
+GROUP_TIMEOUT_CONTEXT_UNIT_CHARS = _env_int("AI_DUEL_GROUP_TIMEOUT_CONTEXT_UNIT_CHARS", 900, min_v=200, max_v=5000)
+GROUP_TIMEOUT_CONTEXT_PER_UNIT_S = _env_int("AI_DUEL_GROUP_TIMEOUT_CONTEXT_PER_UNIT_S", 2, min_v=0, max_v=20)
+GROUP_TIMEOUT_CONTEXT_MAX_BONUS_S = _env_int("AI_DUEL_GROUP_TIMEOUT_CONTEXT_MAX_BONUS_S", 20, min_v=0, max_v=180)
+GROUP_TIMEOUT_DYNAMIC_MAX_S = _env_int("AI_DUEL_GROUP_TIMEOUT_DYNAMIC_MAX_S", 120, min_v=20, max_v=360)
+GROUP_TIMEOUT_CONTEXT_WINDOW_MSGS = _env_int("AI_DUEL_GROUP_TIMEOUT_CONTEXT_WINDOW_MSGS", 20, min_v=6, max_v=100)
+GROUP_TIMEOUT_CONTEXT_PER_MSG_CHAR_CAP = _env_int(
+    "AI_DUEL_GROUP_TIMEOUT_CONTEXT_PER_MSG_CHAR_CAP", 420, min_v=80, max_v=4000
+)
+GROUP_PUBLIC_REPLY_MAX_CHARS = _env_int("AI_DUEL_GROUP_PUBLIC_REPLY_MAX_CHARS", 420, min_v=120, max_v=2000)
+GROUP_PUBLIC_REPLY_MAX_LINES = _env_int("AI_DUEL_GROUP_PUBLIC_REPLY_MAX_LINES", 8, min_v=2, max_v=24)
+GROUP_PUBLIC_REPLY_MAX_SENTENCES = _env_int("AI_DUEL_GROUP_PUBLIC_REPLY_MAX_SENTENCES", 6, min_v=2, max_v=16)
+GROUP_BROADCAST_MAX_MSGS = _env_int("AI_DUEL_GROUP_BROADCAST_MAX_MSGS", 20, min_v=6, max_v=120)
+GROUP_BROADCAST_MAX_CHARS = _env_int("AI_DUEL_GROUP_BROADCAST_MAX_CHARS", 3600, min_v=1000, max_v=12000)
+GROUP_BROADCAST_PER_MSG_CHAR_CAP = _env_int("AI_DUEL_GROUP_BROADCAST_PER_MSG_CHAR_CAP", 320, min_v=100, max_v=2400)
+GROUP_BROADCAST_RECENT_MAX_MSGS = _env_int("AI_DUEL_GROUP_BROADCAST_RECENT_MAX_MSGS", 12, min_v=4, max_v=80)
+GROUP_BROADCAST_RECENT_MAX_CHARS = _env_int("AI_DUEL_GROUP_BROADCAST_RECENT_MAX_CHARS", 2200, min_v=600, max_v=12000)
+CONTEXT_MODEL_DIGEST_MAX_CHARS = _env_int("AI_DUEL_CONTEXT_MODEL_DIGEST_MAX_CHARS", 560, min_v=240, max_v=2400)
+CONTEXT_MODEL_DIGEST_MAX_LINES = _env_int("AI_DUEL_CONTEXT_MODEL_DIGEST_MAX_LINES", 10, min_v=4, max_v=28)
+CONTEXT_USER_DIGEST_MAX_CHARS = _env_int("AI_DUEL_CONTEXT_USER_DIGEST_MAX_CHARS", 420, min_v=180, max_v=1800)
+CONTEXT_USER_DIGEST_MAX_LINES = _env_int("AI_DUEL_CONTEXT_USER_DIGEST_MAX_LINES", 8, min_v=3, max_v=24)
 
 
-def _group_round_timeout_cap_s(model_count: int) -> int:
+def _group_round_timeout_cap_s(model_count: int, *, round_no: int = 1, context_chars: int = 0) -> int:
     if model_count <= 2:
-        return int(GROUP_PUBLIC_ROUND_CAP_BY_COUNT[2])
-    if model_count == 3:
-        return int(GROUP_PUBLIC_ROUND_CAP_BY_COUNT[3])
-    if model_count == 4:
-        return int(GROUP_PUBLIC_ROUND_CAP_BY_COUNT[4])
-    return int(GROUP_PUBLIC_ROUND_CAP_BY_COUNT[5])
+        base = int(GROUP_PUBLIC_ROUND_CAP_BY_COUNT[2])
+    elif model_count == 3:
+        base = int(GROUP_PUBLIC_ROUND_CAP_BY_COUNT[3])
+    elif model_count == 4:
+        base = int(GROUP_PUBLIC_ROUND_CAP_BY_COUNT[4])
+    else:
+        base = int(GROUP_PUBLIC_ROUND_CAP_BY_COUNT[5])
+
+    rn = max(1, int(round_no))
+    round_steps = max(0, rn - 1) // max(1, int(GROUP_TIMEOUT_GROWTH_ROUND_STEP))
+    round_bonus = min(
+        int(GROUP_TIMEOUT_GROWTH_MAX_ROUND_BONUS_S),
+        round_steps * int(GROUP_TIMEOUT_GROWTH_PER_STEP_S),
+    )
+
+    ctx = max(0, int(context_chars))
+    if GROUP_TIMEOUT_CONTEXT_PER_UNIT_S <= 0:
+        context_bonus = 0
+    else:
+        context_units = ctx // max(1, int(GROUP_TIMEOUT_CONTEXT_UNIT_CHARS))
+        context_bonus = min(
+            int(GROUP_TIMEOUT_CONTEXT_MAX_BONUS_S),
+            context_units * int(GROUP_TIMEOUT_CONTEXT_PER_UNIT_S),
+        )
+
+    cap = base + round_bonus + context_bonus
+    cap = min(int(GROUP_TIMEOUT_DYNAMIC_MAX_S), cap)
+    return max(base, int(cap))
 
 
 def _topic_lock_rounds(model_count: int) -> int:
@@ -124,17 +174,17 @@ MODEL_MENTION_ALIASES: dict[str, tuple[str, ...]] = {
 # “对话规则”会被作为用户消息的一部分发送到网页端模型（无法真正注入 system prompt）。
 # 目标：更短、更像人说话；允许联网获取事实，但“结论/洞见/权衡”必须独立推理而非“搜索答案式”复述。
 DEFAULT_RULES = """【对话规则】
-- 语气像正常人聊天：自然、有温度，但不要废话。
-- 禁止“编号式模板”（不要 1/2/3/4 逐条报菜名）。可以分 2-4 个短段落，或极少量要点（<=3）。
-- 允许联网：仅在需要“最新事实/具体数据/可核验信息”时联网；联网只用于补充事实，不要把网页复述当结论。
-- 争论时要抓重点：先用 1 句复述对方核心主张（不超过 25 字），再用 2-4 句给出最关键的反驳/补充。
-- 必须给 1 个反例/边界条件（1 句即可），避免空泛。
-- 最后给 1 个追问，推动更深一步讨论。
-- 总长度尽量 <= 320 字。
+- 语气像正常人聊天：自然、有温度，避免空话套话。
+- 讨论要有“立场 + 依据 + 推论”：先给结论，再给关键理由。
+- 可以结构化表达（短段落/少量要点均可），不要机械模板化复读。
+- 允许联网：仅在需要“最新事实/具体数据/可核验信息”时联网；联网只补事实，不把检索结果直接当结论。
+- 尽量给出依据：可使用数字、区间、时间点、对比、边界条件（至少 1 个）。
+- 如存在不确定性，要明确写出假设与风险，而不是回避表态。
+- 字数不要卡死：常规建议 120-360 字；复杂议题可到 500 字，但保持聚焦。
 """.strip()
 
 # 每轮轻量提醒：避免模型“跑偏”回长文/检索式回答
-RULES_REMINDER = "【提醒】像人说话但要短；别用 1/2/3 模板；可联网补事实但结论要自己推理；抓住对方核心点反驳。"
+RULES_REMINDER = "【提醒】像真实辩论：先结论，后依据（可含数据/假设/边界）；可适度展开，但别跑题。"
 
 # 单条转发上限：只做安全截断，不做摘要拼装/历史重打包。
 FORWARD_MAX_CHARS = 3200
@@ -1081,7 +1131,7 @@ HTML_PAGE = r"""<!doctype html>
           </div>
           <div class="hint">
             <div>- 规则会在下一轮发送给两边（自动重新注入）。</div>
-            <div>- 过长会被截断，建议保持简短。</div>
+            <div>- 过长会被截断，建议聚焦“立场 + 依据 + 数据/假设”，不用刻意压到很短。</div>
           </div>
         </details>
 
@@ -2568,6 +2618,184 @@ def _looks_like_clarify_reply(text: str) -> bool:
     )
 
 
+def _looks_provider_error_reply(text: str) -> bool:
+    t = core.normalize_text(text)
+    if not t:
+        return False
+    # Web UI transient/server error banners that should not enter group dialogue.
+    if re.search(r"something went wrong", t, re.I) and re.search(r"help\.openai\.com", t, re.I):
+        return True
+    if re.search(r"(internal server error|service unavailable|temporarily unavailable)", t, re.I):
+        return True
+    if re.search(r"(网络错误|请求失败|服务暂时不可用|服务器错误)", t):
+        return True
+    if re.search(r"(重试|retry)$", t, re.I) and len(_line_dedupe_key(t)) <= 120:
+        return True
+    return False
+
+
+def _extract_expected_short_literal(topic: str) -> str:
+    """
+    从用户题目里提取“只输出某个固定短词”的期望值。
+    例：
+    - output only BLUE
+    - answer only 105
+    - 仅输出 BLUE
+    - 只回复 105
+    """
+    t = core.normalize_text(topic)
+    if not t:
+        return ""
+    patterns = [
+        re.compile(r"(?is)\b(?:output|answer|reply)\s+only\s+([A-Za-z0-9_-]{1,24})\b"),
+        re.compile(r"(?is)\b(?:output|answer|reply)\s+(?:exactly\s+)?([A-Za-z0-9_-]{1,24})\s+only\b"),
+        re.compile(r"(?is)\bonly\s+(?:output|answer|reply)\s+([A-Za-z0-9_-]{1,24})\b"),
+        re.compile(r"(?is)(?:仅输出|只输出|仅回复|只回复)\s*([A-Za-z0-9_-]{1,24})"),
+    ]
+    for pat in patterns:
+        m = pat.search(t)
+        if not m:
+            continue
+        token = core.normalize_text(m.group(1) or "")
+        token = re.sub(r"^[`'\"“”‘’\[\](){}<>]+|[`'\"“”‘’\[\](){}<>]+$", "", token)
+        if token:
+            return token
+    return ""
+
+
+def _extract_expected_numeric_answer(topic: str) -> Optional[float]:
+    """
+    从题目里提取算式的期望数值结果。
+    支持括号与多步运算；失败时退回旧的简单二元算式提取。
+    """
+    t = core.normalize_text(topic)
+    if not t:
+        return None
+    # Normalize common operator variants first.
+    t_norm = (
+        t.replace("×", "*")
+        .replace("÷", "/")
+        .replace("−", "-")
+        .replace("（", "(")
+        .replace("）", ")")
+    )
+
+    def _safe_eval(expr: str) -> Optional[float]:
+        expr2 = (expr or "").strip()
+        if not expr2:
+            return None
+        if len(expr2) > 120:
+            return None
+        if not re.fullmatch(r"[0-9\.\+\-\*\/\(\)\s]+", expr2):
+            return None
+        # Avoid malformed repeated operators that often come from noisy matches.
+        if re.search(r"[\+\*\/]{2,}", expr2):
+            return None
+        try:
+            tree = ast.parse(expr2, mode="eval")
+        except Exception:
+            return None
+
+        def _ev(node: ast.AST) -> float:
+            if isinstance(node, ast.Expression):
+                return _ev(node.body)
+            if isinstance(node, ast.Constant):
+                if isinstance(node.value, (int, float)):
+                    return float(node.value)
+                raise ValueError("bad const")
+            if isinstance(node, ast.Num):  # py<3.8 compat node shape
+                return float(node.n)
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+                v = _ev(node.operand)
+                return v if isinstance(node.op, ast.UAdd) else -v
+            if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+                a = _ev(node.left)
+                b = _ev(node.right)
+                if isinstance(node.op, ast.Add):
+                    return a + b
+                if isinstance(node.op, ast.Sub):
+                    return a - b
+                if isinstance(node.op, ast.Mult):
+                    return a * b
+                if abs(b) < 1e-12:
+                    raise ZeroDivisionError()
+                return a / b
+            raise ValueError("bad node")
+
+        try:
+            v = _ev(tree)
+        except Exception:
+            return None
+        if abs(v) > 1e12:
+            return None
+        return float(v)
+
+    # Try longest arithmetic-looking fragment first (supports "(73*89) - (47*31) + 125").
+    cands = re.findall(r"[\d\.\s\+\-\*\/\(\)]{7,}", t_norm)
+    cands = sorted({c.strip() for c in cands if c and re.search(r"\d", c)}, key=len, reverse=True)
+    for expr in cands:
+        # Require at least 2 numbers and 2 operators for "full expression" path.
+        if len(re.findall(r"\d+(?:\.\d+)?", expr)) < 2:
+            continue
+        if len(re.findall(r"[\+\-\*\/]", expr)) < 2:
+            continue
+        v = _safe_eval(expr)
+        if v is not None:
+            return v
+
+    # Fallback: simple binary operation.
+    m = re.search(r"(-?\d+(?:\.\d+)?)\s*([+\-−*/xX×÷])\s*(-?\d+(?:\.\d+)?)", t)
+    if not m:
+        return None
+    try:
+        a = float(m.group(1))
+        op = m.group(2)
+        b = float(m.group(3))
+    except Exception:
+        return None
+
+    if op in {"*", "x", "X", "×"}:
+        return a * b
+    if op in {"+", "＋"}:
+        return a + b
+    if op in {"-", "−"}:
+        return a - b
+    if op in {"/", "÷"}:
+        if abs(b) < 1e-12:
+            return None
+        return a / b
+    return None
+
+
+def _reply_contains_expected_number(reply: str, expected: float) -> bool:
+    rep = core.normalize_text(reply)
+    if not rep:
+        return False
+    nums = re.findall(r"-?\d+(?:\.\d+)?", rep)
+    if not nums:
+        return False
+    exp_is_int = abs(expected - round(expected)) < 1e-9
+    tol = 1e-6 if not exp_is_int else 1e-9
+    exp_i = int(round(expected)) if exp_is_int else None
+    for s in nums:
+        try:
+            v = float(s)
+        except Exception:
+            continue
+        if exp_is_int:
+            if abs(v - expected) <= tol:
+                return True
+            try:
+                if int(round(v)) == exp_i and abs(v - round(v)) < 1e-9:
+                    return True
+            except Exception:
+                pass
+        else:
+            if abs(v - expected) <= 1e-3:
+                return True
+    return False
+
+
 def _is_reply_aligned_with_user_topic(reply: str, user_text: str, *, strict: bool = False) -> bool:
     rep = core.normalize_text(reply)
     top = core.normalize_text(user_text)
@@ -2581,6 +2809,16 @@ def _is_reply_aligned_with_user_topic(reply: str, user_text: str, *, strict: boo
         return False
     if _QWEN_STATUS_ONLY_PAT.match(rep):
         return False
+    expect_token = _extract_expected_short_literal(top)
+    if expect_token:
+        rep_plain = core.normalize_text(re.sub(r"[。.!！?？,，:：;；\s]+$", "", rep))
+        if rep_plain.lower() == expect_token.lower():
+            return True
+        if strict:
+            return False
+    expected_numeric = _extract_expected_numeric_answer(top)
+    if expected_numeric is not None and _reply_contains_expected_number(rep, expected_numeric):
+        return True
     if _looks_like_clarify_reply(rep):
         return True
     score = _topic_overlap_score(rep, top)
@@ -2600,6 +2838,9 @@ def _is_reply_aligned_with_user_topic(reply: str, user_text: str, *, strict: boo
         if _GROUP_ORCHESTRATION_PAT.search(rep) and len(_line_dedupe_key(rep)) <= 72:
             return False
         if _looks_prompt_leak_reply(rep):
+            return False
+        if expected_numeric is not None:
+            # 算式题：若没给出正确数值，视为未对齐新话题。
             return False
         # Numeric topic: avoid hard-rejecting valid cross-language responses.
         # If host topic includes numbers, prefer "has any numeric grounding" first.
@@ -2673,22 +2914,29 @@ _LOW_VALUE_PROCESS_PAT = re.compile(
     r"基于当前信息提出预测与假设|先给区间和假设|首先[，,]先给区间和假设|"
     r"根据(?:群主)?最新话题.*(?:给出|回应|讨论)|给出一个简洁.*核心假设|"
     r"给出.*人民币.*黄金.*价格区间.*假设|"
+    r"思考问题的逻辑结构|确认计算结果无误|寻找(?:符合|满足)条件的三位数|"
     r"请把公开发言放在.*之间|如需隐藏想法.*之间|"
     r"(?:\d{1,3}\s*字(?:左右)?|字数)(?:[，,、\s]{0,4})(?:符合要求|可|即可)|"
     r"符合要求(?:即可)?|"
     r"按要求(?:输出|回复)|"
+    r"先结论(?:[，,、\\s\\-]*\\d+(?:-\\d+)?\\s*条?依据)?.*(?:群聊发言|不要复述规则)|"
+    r"结论在前.*(?:依据|群聊发言)|"
     r"先回应用户，再补充你对上一位的看法|先回应群主话题|如暂不发言，仅回复\s*\[?\s*PASS\s*\]?)\s*[。.!！~～]*\s*$",
     re.I,
 )
 
 
 def _trace_turn(model_key: str, stage: str, text: str, *, elapsed_s: Optional[float] = None) -> None:
-    body = _clip_text(text, 220).replace("\n", " | ").strip()
-    if not body:
-        body = "∅"
+    body_console = _clip_text(text, 220).replace("\n", " | ").strip()
+    if not body_console:
+        body_console = "∅"
+    # Keep richer prompt/reply snapshot in jsonl for postmortem debugging.
+    body_json = _clip_text(text, 2400).strip()
+    if not body_json:
+        body_json = "∅"
     tail = f", {elapsed_s:.2f}s" if elapsed_s is not None else ""
     if TURN_TRACE_ENABLED:
-        core.log(f"[TURN][{model_key}] {stage}{tail}: {body}")
+        core.log(f"[TURN][{model_key}] {stage}{tail}: {body_console}")
     _append_jsonl(
         TURN_LOG_FILE,
         {
@@ -2697,7 +2945,7 @@ def _trace_turn(model_key: str, stage: str, text: str, *, elapsed_s: Optional[fl
             "model_key": model_key,
             "stage": stage,
             "elapsed_s": round(float(elapsed_s), 3) if elapsed_s is not None else None,
-            "text": body,
+            "text": body_json,
         },
     )
 
@@ -2723,6 +2971,39 @@ def _strip_group_chatter_boilerplate(text: str) -> str:
 
     if not kept:
         return t
+    return core.normalize_text("\n".join(kept))
+
+
+_PROMPT_ECHO_LINE_PAT = re.compile(
+    r"(你在多人群聊中发言|群主最新话题|下面是群聊广播窗口|下面是你还没处理的群聊新消息|"
+    r"先回应群主最新话题|直接说你在群里要发的话|最终发言要求|可回应对象|"
+    r"不要输出思考过程|只输出群里的正文|优先级：必须先回应|如你这轮暂不发言)",
+    re.I,
+)
+_PROMPT_ECHO_MSG_LINE_PAT = re.compile(r"^\[\d+\]\s*(?:群主|ChatGPT|Gemini|DeepSeek|豆包|Qwen)\s*:", re.I)
+
+
+def _strip_instruction_echo_lines(text: str) -> str:
+    """
+    清除模型把提示词/广播窗口原样复述到回答里的噪声行。
+    """
+    t = core.normalize_text(text)
+    if not t:
+        return ""
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if not lines:
+        return t
+    kept: list[str] = []
+    for ln in lines:
+        if _PROMPT_ECHO_LINE_PAT.search(ln):
+            continue
+        if _PROMPT_ECHO_MSG_LINE_PAT.search(ln):
+            continue
+        if re.search(r"^(?:先结论|结论在前).*(?:依据|条依据).*(?:群聊发言|不要复述规则)", ln):
+            continue
+        if re.match(r"^(?:你说|你在说|请把|如需|如果你想|不想发言)\b", ln):
+            continue
+        kept.append(ln)
     return core.normalize_text("\n".join(kept))
 
 
@@ -2906,7 +3187,7 @@ def _split_public_private_reply(text: str) -> tuple[str, str]:
             or _LOW_VALUE_PROCESS_PAT.match(pub or "")
             or re.search(
                 r"(你的公开回复|公开回复|在此填写|示例|格式|标记|正文|PUBLIC_REPLY|END_PUBLIC_REPLY|"
-                r"群主最新话题|最终发言要求|如暂不发言|请把公开发言放在|公开发言放在|如需隐藏想法)",
+                r"群主最新话题|最终发言要求|如暂不发言|请把公开发言放在|公开发言放在|如需隐藏想法|只输出群里的正文|只输出给群里的正文)",
                 pub or "",
                 re.I,
             )
@@ -3098,9 +3379,17 @@ def _format_msg_for_context(msg: UiMessage) -> str:
     if msg.role == "model":
         main, summary = _split_forward_summary(msg.text)
         body_src = summary or (main or msg.text)
-        body = _detail_digest(body_src, max_chars=420, max_lines=8)
+        body = _detail_digest(
+            body_src,
+            max_chars=CONTEXT_MODEL_DIGEST_MAX_CHARS,
+            max_lines=CONTEXT_MODEL_DIGEST_MAX_LINES,
+        )
     else:
-        body = _detail_digest(msg.text, max_chars=360, max_lines=7)
+        body = _detail_digest(
+            msg.text,
+            max_chars=CONTEXT_USER_DIGEST_MAX_CHARS,
+            max_lines=CONTEXT_USER_DIGEST_MAX_LINES,
+        )
     prefix = "系统" if msg.role == "system" else msg.speaker
     return f"{prefix}: {body}".strip()
 
@@ -3109,6 +3398,18 @@ def _looks_prompt_leak_reply(text: str) -> bool:
     t = core.normalize_text(text)
     if not t:
         return True
+    # Hard prompt/broadcast markers: if any of these appear, treat as leaked prompt text.
+    if re.search(
+        r"(下面是群聊广播窗口|下面是你还没处理的群聊新消息|群主最新话题：|"
+        r"\[\d+\]\s*(?:群主|ChatGPT|Gemini|DeepSeek|Qwen|豆包|Doubao)\s*:)",
+        t,
+        re.I,
+    ):
+        return True
+    # Gemini home/welcome surface frequently contaminates the first-turn extraction.
+    if re.search(r"(需要我为你做些什么|制作图片|创作音乐|创作视频|给我的一天注入活力|随便写点什么)", t):
+        if re.search(r"(?:\bPRO\b|Gemini|快速|群主最新话题|下面是群聊广播窗口)", t, re.I):
+            return True
     hints = (
         _PUBLIC_WRAP_OPEN,
         _PUBLIC_WRAP_CLOSE,
@@ -3121,6 +3422,7 @@ def _looks_prompt_leak_reply(text: str) -> bool:
         "上一位发言（",
         "最终发言要求：",
         "只输出给群里的正文",
+        "只输出群里的正文",
         "请把公开发言放在",
         "如需隐藏想法，可放在",
         "如暂不发言，仅回复 [PASS]",
@@ -3271,7 +3573,13 @@ def _dedupe_public_reply(text: str) -> str:
     return core.normalize_text("\n".join(out))
 
 
-def _compact_public_reply(text: str, *, max_chars: int = 220, max_lines: int = 4) -> str:
+def _compact_public_reply(
+    text: str,
+    *,
+    max_chars: int = GROUP_PUBLIC_REPLY_MAX_CHARS,
+    max_lines: int = GROUP_PUBLIC_REPLY_MAX_LINES,
+    max_sentences: int = GROUP_PUBLIC_REPLY_MAX_SENTENCES,
+) -> str:
     t = core.normalize_text(text)
     if not t:
         return ""
@@ -3298,17 +3606,18 @@ def _compact_public_reply(text: str, *, max_chars: int = 220, max_lines: int = 4
     sentences = [x.strip() for x in re.split(r"(?<=[。！？?!；;])\s*", flat) if x.strip()]
     picked_sent: list[str] = []
     used = 0
-    for s in sentences[:8]:
+    scan_cap = max(4, int(max_sentences) * 2)
+    for s in sentences[:scan_cap]:
         extra = len(s) + (0 if not picked_sent else 0)
         if used + extra > max_chars:
             break
         picked_sent.append(s)
         used += extra
-        if len(picked_sent) >= 3:
+        if len(picked_sent) >= max(2, int(max_sentences)):
             break
     if picked_sent:
         out = core.normalize_text("".join(picked_sent))
-        if out:
+        if out and len(_line_dedupe_key(out)) >= max(18, min(60, max_chars // 3)):
             return out
 
     picked_lines: list[str] = []
@@ -3573,6 +3882,12 @@ def _looks_unfinished_public_reply(text: str) -> bool:
     if m_pref and _LOW_VALUE_PROCESS_PAT.match(core.normalize_text(m_pref.group(1))):
         return True
     if re.fullmatch(r"[\u4e00-\u9fff]{4,10}(?:\n@[\w\u4e00-\u9fff-]{1,24})?", t):
+        # Keep idiom-like short answers, but reject generic process/title fragments.
+        if re.search(
+            r"(确认|寻找|评估|分析|讨论|回应|回复|计算|接龙|开始|继续|推进|聚焦|专注|启动|承接|保持|优化|理解|权衡|组织|整理|结果|条件|思考|逻辑|结构|框架|过程|步骤)",
+            t,
+        ):
+            return True
         return False
     k = _line_dedupe_key(t)
     klen = len(k)
@@ -4206,6 +4521,7 @@ class Worker:
             if not prompt:
                 self.state.add_system(f"{m.name} 本轮跳过：空指令")
                 return False, ""
+            strict_token = _extract_expected_short_literal(instruction)
 
             _trace_turn(key, "prompt", prompt)
             before = ad.snapshot_conversation()
@@ -4230,9 +4546,19 @@ class Worker:
                         before_full_snapshot = ""
             ad.send_user_text(prompt)
             timeout_s = int(MODEL_REPLY_TIMEOUT_OVERRIDES.get(key, MODEL_REPLY_TIMEOUT_S))
+            if timeout_cap_s is not None:
+                try:
+                    timeout_s = max(timeout_s, max(6, int(timeout_cap_s)))
+                except Exception:
+                    pass
             # Group public turns must stay responsive; avoid one model blocking the whole round too long.
             if visibility == "public" and not record_reply:
                 soft_cap = int(GROUP_PUBLIC_TURN_SOFT_TIMEOUT_S.get(key, GROUP_PUBLIC_TURN_SOFT_TIMEOUT_S["default"]))
+                if timeout_cap_s is not None:
+                    try:
+                        soft_cap = max(soft_cap, int(timeout_cap_s))
+                    except Exception:
+                        pass
                 timeout_s = min(timeout_s, max(8, soft_cap))
             if timeout_cap_s is not None:
                 try:
@@ -4312,20 +4638,6 @@ class Worker:
                         retry_empty = ""
                     if retry_empty:
                         reply = retry_empty
-                    elif key == "qwen":
-                        # Qwen occasionally misses one extraction window right after topic switch.
-                        # One resend-without-context-change improves first-turn capture reliability.
-                        try:
-                            ad.send_user_text(prompt)
-                            resend = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=18))
-                        except Exception:
-                            resend = ""
-                        if resend:
-                            _trace_turn(key, "retry(resend_after_empty)", resend)
-                            reply = resend
-                        else:
-                            _trace_turn(key, "pass(empty)", "")
-                            return True, "[PASS]"
                     else:
                         _trace_turn(key, "pass(empty)", "")
                         return True, "[PASS]"
@@ -4431,6 +4743,13 @@ class Worker:
                                 public_reply = r3_pub
                                 sanitized_public = r3_pub
                     if not sanitized_public:
+                        if strict_token and re.search(
+                            rf"(?i)(?:^|[^A-Za-z0-9_-]){re.escape(strict_token)}(?:[^A-Za-z0-9_-]|$)",
+                            core.normalize_text(public_reply or ""),
+                        ):
+                            public_reply = strict_token
+                            sanitized_public = strict_token
+                    if not sanitized_public:
                         _trace_turn(key, "pass(prompt_echo)", public_reply)
                         return True, "[PASS]"
             if key == "gemini":
@@ -4439,6 +4758,10 @@ class Worker:
                 sanitized_g = _sanitize_forward_payload(public_reply)
                 if sanitized_g:
                     public_reply = sanitized_g
+                elif visibility == "public" and not record_reply:
+                    # sanitize-empty means we likely extracted only UI/prompt echo.
+                    # Force retry path below instead of keeping the polluted raw block.
+                    public_reply = ""
                 if visibility == "public" and not record_reply and _looks_prompt_leak_reply(public_reply):
                     try:
                         retry_g = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=18))
@@ -4468,6 +4791,10 @@ class Worker:
                 # For Gemini/ChatGPT/DeepSeek, keep full public semantic blocks.
                 public_reply = _pick_best_semantic_fragment(public_reply) or public_reply
             public_reply = _strip_trailing_solicit_line(public_reply) or public_reply
+            if _looks_provider_error_reply(public_reply):
+                self.state.add_system(f"{m.name} 本轮失败：网页端返回错误提示")
+                _trace_turn(key, "provider_error", public_reply)
+                return False, ""
             if key == "qwen" and _QWEN_STATUS_ONLY_PAT.match(public_reply or ""):
                 # Qwen occasionally exposes "已完成思考/已经完成" status pills as text.
                 # Retry once for final answer block before giving up.
@@ -4610,7 +4937,12 @@ class Worker:
                 self.state.add_system(f"{m.name} 本轮失败：{_clip_text(public_reply, 140)}")
                 return False, ""
             if visibility == "public":
-                public_reply = _compact_public_reply(public_reply, max_chars=220, max_lines=4)
+                public_reply = _compact_public_reply(
+                    public_reply,
+                    max_chars=GROUP_PUBLIC_REPLY_MAX_CHARS,
+                    max_lines=GROUP_PUBLIC_REPLY_MAX_LINES,
+                    max_sentences=GROUP_PUBLIC_REPLY_MAX_SENTENCES,
+                )
 
             if record_reply:
                 self.state.add_message(
@@ -4887,6 +5219,224 @@ class Worker:
                 break
         return out
 
+    def _estimate_recent_public_context_chars(self, *, limit_msgs: Optional[int] = None) -> int:
+        """
+        估算近期公开群聊上下文体量（字符数），用于动态放宽单轮等待时长。
+        只看 user/model 的 public 消息，避免系统提示干扰。
+        """
+        max_msgs = int(limit_msgs if limit_msgs is not None else GROUP_TIMEOUT_CONTEXT_WINDOW_MSGS)
+        max_msgs = max(1, max_msgs)
+        per_msg_cap = max(40, int(GROUP_TIMEOUT_CONTEXT_PER_MSG_CHAR_CAP))
+        total = 0
+        used = 0
+        msgs = self.state.get_all_messages()
+        for msg in reversed(msgs):
+            if msg.visibility != "public":
+                continue
+            if msg.role not in {"user", "model"}:
+                continue
+            t = _strip_private_thoughts(msg.text) or core.normalize_text(msg.text)
+            t = core.normalize_text(t)
+            if not t:
+                continue
+            total += min(per_msg_cap, len(t))
+            used += 1
+            if used >= max_msgs:
+                break
+        return total
+
+    def _build_group_unseen_packet(
+        self,
+        *,
+        after_id: int,
+        floor_id: int = 0,
+        max_msgs: int = GROUP_BROADCAST_MAX_MSGS,
+        max_chars: int = GROUP_BROADCAST_MAX_CHARS,
+    ) -> tuple[str, int, int]:
+        """
+        为单个模型构建“未读群消息增量包”。
+        - 只包含 public 且 role in {user, model} 的消息。
+        - 从 after_id 之后开始，按时间顺序发送。
+        - 受 max_msgs/max_chars 限制；若超出，remaining>0 表示还有未同步消息。
+        返回: (packet_text, delivered_upto_id, remaining_count)
+        """
+        start_after = max(int(after_id), int(floor_id) - 1)
+        msgs = self.state.get_all_messages()
+        unseen = [
+            m
+            for m in msgs
+            if m.visibility == "public" and m.role in {"user", "model"} and int(m.id) > start_after
+        ]
+        if not unseen:
+            return "", start_after, 0
+
+        per_msg_cap = max(80, int(GROUP_BROADCAST_PER_MSG_CHAR_CAP))
+        rows: list[str] = []
+        used = 0
+        delivered_upto = start_after
+        delivered_count = 0
+
+        for msg in unseen:
+            speaker = "群主" if msg.role == "user" else core.normalize_text(msg.speaker)
+            body = _pick_forward_payload(msg.text) or (_strip_private_thoughts(msg.text) or "")
+            body = core.normalize_text(body)
+            if not body:
+                continue
+            body = _clip_text(body.replace("\n", " "), per_msg_cap)
+            row = f"[{msg.id}] {speaker}: {body}"
+            cost = len(row) + 1
+            # 至少保证送达 1 条，避免首条超长时被整包丢弃。
+            if rows and (delivered_count >= max_msgs or used + cost > max_chars):
+                break
+            rows.append(row)
+            used += cost
+            delivered_count += 1
+            delivered_upto = int(msg.id)
+            if delivered_count >= max_msgs or used >= max_chars:
+                break
+
+        if not rows:
+            first = unseen[0]
+            speaker = "群主" if first.role == "user" else core.normalize_text(first.speaker)
+            body = _pick_forward_payload(first.text) or (_strip_private_thoughts(first.text) or "")
+            body = _clip_text(core.normalize_text(body).replace("\n", " "), per_msg_cap)
+            rows = [f"[{first.id}] {speaker}: {body}"]
+            delivered_upto = int(first.id)
+            delivered_count = 1
+
+        remaining = max(0, len(unseen) - delivered_count)
+        return "\n".join(rows), delivered_upto, remaining
+
+    def _seed_group_pending_ids(self, *, floor_id: int, target_key: str) -> list[int]:
+        """
+        为某个模型初始化“待广播消息队列”。
+        - 包含本次群任务起点以来的 public user/model 消息；
+        - 排除该模型自己发出的消息（避免自回显）。
+        """
+        out: list[int] = []
+        floor = max(1, int(floor_id))
+        key_norm = (target_key or "").strip().lower()
+        for msg in self.state.get_all_messages():
+            if msg.visibility != "public" or msg.role not in {"user", "model"}:
+                continue
+            mid = int(msg.id)
+            if mid < floor:
+                continue
+            if msg.role == "model" and (msg.model_key or "").strip().lower() == key_norm:
+                continue
+            out.append(mid)
+        return out
+
+    def _build_group_pending_packet(
+        self,
+        *,
+        model_key: str,
+        pending_ids: list[int],
+        max_msgs: int = GROUP_BROADCAST_MAX_MSGS,
+        max_chars: int = GROUP_BROADCAST_MAX_CHARS,
+    ) -> tuple[str, list[int], int]:
+        """
+        从“待广播消息队列”构造本轮分发包。
+        返回: (packet_text, delivered_ids, remaining_count)
+        - delivered_ids: 本轮已成功分发（或可安全丢弃）的消息 id。
+        """
+        if not pending_ids:
+            return "", [], 0
+
+        key_norm = (model_key or "").strip().lower()
+        msg_map: dict[int, UiMessage] = {}
+        for msg in self.state.get_all_messages():
+            if msg.visibility != "public" or msg.role not in {"user", "model"}:
+                continue
+            msg_map[int(msg.id)] = msg
+
+        per_msg_cap = max(80, int(GROUP_BROADCAST_PER_MSG_CHAR_CAP))
+        rows: list[str] = []
+        delivered_ids: list[int] = []
+        used = 0
+
+        for mid_raw in pending_ids:
+            mid = int(mid_raw)
+            msg = msg_map.get(mid)
+            if msg is None:
+                # 已不存在的消息视作可清理，避免队列阻塞。
+                delivered_ids.append(mid)
+                continue
+            if msg.role == "model" and (msg.model_key or "").strip().lower() == key_norm:
+                # 自己发过的消息无需回传给自己。
+                delivered_ids.append(mid)
+                continue
+
+            speaker = "群主" if msg.role == "user" else core.normalize_text(msg.speaker)
+            body = _pick_forward_payload(msg.text) or (_strip_private_thoughts(msg.text) or "")
+            body = core.normalize_text(body)
+            if not body:
+                # 清洗后空内容（噪声/提示词泄漏）直接跳过并出队。
+                delivered_ids.append(mid)
+                continue
+            body = _clip_text(body.replace("\n", " "), per_msg_cap)
+            row = f"[{mid}] {speaker}: {body}"
+            cost = len(row) + 1
+            # 至少发送 1 条，避免首条超长导致整包丢弃。
+            if rows and (len(rows) >= max_msgs or used + cost > max_chars):
+                break
+            rows.append(row)
+            used += cost
+            delivered_ids.append(mid)
+            if len(rows) >= max_msgs or used >= max_chars:
+                break
+
+        remaining = max(0, len(pending_ids) - len(delivered_ids))
+        return "\n".join(rows), delivered_ids, remaining
+
+    def _build_group_recent_packet(
+        self,
+        *,
+        floor_id: int,
+        exclude_key: Optional[str],
+        max_msgs: int = GROUP_BROADCAST_RECENT_MAX_MSGS,
+        max_chars: int = GROUP_BROADCAST_RECENT_MAX_CHARS,
+    ) -> str:
+        """
+        构建最近公开消息窗口（广播回放）。
+        用于兜底：即使某轮未读包较小，模型也能看到最近群聊全貌。
+        """
+        floor = max(1, int(floor_id))
+        ex = (exclude_key or "").strip().lower()
+        candidates: list[UiMessage] = []
+        for msg in self.state.get_all_messages():
+            if msg.visibility != "public" or msg.role not in {"user", "model"}:
+                continue
+            if int(msg.id) < floor:
+                continue
+            if ex and msg.role == "model" and (msg.model_key or "").strip().lower() == ex:
+                continue
+            candidates.append(msg)
+        if not candidates:
+            return ""
+
+        per_msg_cap = max(80, int(GROUP_BROADCAST_PER_MSG_CHAR_CAP))
+        rows_rev: list[str] = []
+        used = 0
+        for msg in reversed(candidates):
+            speaker = "群主" if msg.role == "user" else core.normalize_text(msg.speaker)
+            body = _pick_forward_payload(msg.text) or (_strip_private_thoughts(msg.text) or "")
+            body = core.normalize_text(body)
+            if not body:
+                continue
+            body = _clip_text(body.replace("\n", " "), per_msg_cap)
+            row = f"[{msg.id}] {speaker}: {body}"
+            cost = len(row) + 1
+            if rows_rev and (len(rows_rev) >= max_msgs or used + cost > max_chars):
+                break
+            rows_rev.append(row)
+            used += cost
+            if len(rows_rev) >= max_msgs or used >= max_chars:
+                break
+        if not rows_rev:
+            return ""
+        return "\n".join(reversed(rows_rev))
+
     def _drain_group_interjections(self, max_items: int = 20) -> list[str]:
         """
         在群聊自动轮转期间，抽取队列里的 send(group) 作为插话。
@@ -4940,7 +5490,7 @@ class Worker:
             "你在同一个群聊中，下面是刚发生的一轮消息：\n\n"
             f"群主：{user_part}\n"
             f"{source_name}：{reply_part}\n\n"
-            "请像正常群聊一样直接回复，简短清晰即可。\n"
+            "请像正常群聊一样直接回复：先给结论，再补1-2条依据（可含数据/假设），信息充分但不跑题。\n"
             "若你这轮不想发言，只输出 [PASS]。\n"
             "可选：使用【对外】...【内心】...（内心不会公开）。"
         ).strip()
@@ -4994,7 +5544,7 @@ class Worker:
             visibility = "shadow"
             thread_key = target
 
-        self.state.add_message("user", "用户", text, visibility=visibility, model_key=thread_key)
+        user_mid = self.state.add_message("user", "用户", text, visibility=visibility, model_key=thread_key)
 
         self._ensure_playwright()
         assert self._pw is not None
@@ -5031,7 +5581,48 @@ class Worker:
         focus_idle_rounds = 0
         silent_rounds = 0
         round_no = 0
+        group_floor_id = max(1, int(user_mid or 1))
+        group_pending_ids: dict[str, list[int]] = {
+            k: self._seed_group_pending_ids(floor_id=group_floor_id, target_key=k) for k in selected_snapshot
+        }
+
+        def _enqueue_broadcast(mid: Optional[int], targets: list[str], *, exclude_key: Optional[str] = None) -> None:
+            if not mid:
+                return
+            mid_i = int(mid)
+            ex = (exclude_key or "").strip().lower()
+            for tk in targets:
+                tkn = (tk or "").strip().lower()
+                if not tkn:
+                    continue
+                if ex and tkn == ex:
+                    continue
+                q = group_pending_ids.setdefault(tkn, [])
+                if mid_i not in q:
+                    q.append(mid_i)
+
+        def _rebase_pending_for_topic(targets: list[str], *, latest_user_mid: Optional[int]) -> None:
+            """
+            群主插话后，裁剪待广播积压，优先让模型先处理新话题。
+            避免“旧 backlog 太大导致看起来没听到群主插话”。
+            """
+            keep_n = max(2, int(TOPIC_INTERJECT_PENDING_KEEP))
+            lm = int(latest_user_mid or 0)
+            for tk in targets:
+                # 从“最新群主插话”开始重建，硬切断旧话题 backlog。
+                floor_local = lm if lm > 0 else group_floor_id
+                seed = self._seed_group_pending_ids(floor_id=floor_local, target_key=tk)
+                if lm > 0:
+                    seed = [mid for mid in seed if int(mid) >= lm]
+                if len(seed) > keep_n:
+                    seed = seed[-keep_n:]
+                if lm > 0 and lm not in seed:
+                    seed.append(lm)
+                group_pending_ids[tk] = seed
+
         active_user_instruction: Optional[str] = text
+        active_user_hard_literal = _extract_expected_short_literal(active_user_instruction or "")
+        active_topic_floor_id = max(group_floor_id, int(user_mid or group_floor_id))
         active_user_force_rounds = _topic_lock_rounds(len(selected_snapshot))
         active_user_pending_models: set[str] = set(selected_snapshot)
         active_user_pending_attempts: dict[str, int] = {}
@@ -5042,10 +5633,16 @@ class Worker:
 
             queued_user_msgs = self._drain_group_interjections()
             if queued_user_msgs:
-                for extra in queued_user_msgs:
-                    self.state.add_message("user", "用户", extra, visibility="public", model_key=None)
-                active_user_instruction = queued_user_msgs[-1]
                 now_selected = self.state.selected_keys()
+                latest_mid = 0
+                for extra in queued_user_msgs:
+                    extra_mid = self.state.add_message("user", "用户", extra, visibility="public", model_key=None)
+                    _enqueue_broadcast(extra_mid, now_selected)
+                    latest_mid = int(extra_mid or latest_mid)
+                _rebase_pending_for_topic(now_selected, latest_user_mid=latest_mid)
+                active_user_instruction = queued_user_msgs[-1]
+                active_user_hard_literal = _extract_expected_short_literal(active_user_instruction or "")
+                active_topic_floor_id = max(group_floor_id, int(latest_mid or active_topic_floor_id))
                 active_user_force_rounds = _topic_lock_rounds(len(now_selected))
                 active_user_pending_models = set(now_selected)
                 active_user_pending_attempts = {}
@@ -5057,6 +5654,12 @@ class Worker:
             if not current_keys:
                 self.state.add_system("轮聊结束：当前没有已启用模型。")
                 break
+            for kk in current_keys:
+                if kk not in group_pending_ids:
+                    # 新加入群聊的模型从本次群任务起点开始补同步。
+                    group_pending_ids[kk] = self._seed_group_pending_ids(floor_id=group_floor_id, target_key=kk)
+            for kk in [x for x in list(group_pending_ids.keys()) if x not in current_keys]:
+                group_pending_ids.pop(kk, None)
             if active_user_pending_models:
                 active_user_pending_models = {x for x in active_user_pending_models if x in current_keys}
                 for stale in [x for x in list(active_user_pending_attempts.keys()) if x not in active_user_pending_models]:
@@ -5096,17 +5699,22 @@ class Worker:
             round_visible_replies = 0
             mention_switched = False
             round_interrupted_by_host = False
-            # Keep this round's latest accepted model message so later speakers can see fresh context immediately.
-            round_latest: Optional[dict[str, str]] = None
+            round_context_chars = self._estimate_recent_public_context_chars()
             for k in talk_keys:
                 if self.state.should_round_stop():
                     break
 
                 mid_round_msgs = self._drain_group_interjections(max_items=8)
                 if mid_round_msgs:
+                    latest_mid = 0
                     for extra in mid_round_msgs:
-                        self.state.add_message("user", "用户", extra, visibility="public", model_key=None)
+                        extra_mid = self.state.add_message("user", "用户", extra, visibility="public", model_key=None)
+                        _enqueue_broadcast(extra_mid, current_keys)
+                        latest_mid = int(extra_mid or latest_mid)
+                    _rebase_pending_for_topic(current_keys, latest_user_mid=latest_mid)
                     active_user_instruction = mid_round_msgs[-1]
+                    active_user_hard_literal = _extract_expected_short_literal(active_user_instruction or "")
+                    active_topic_floor_id = max(group_floor_id, int(latest_mid or active_topic_floor_id))
                     active_user_force_rounds = _topic_lock_rounds(len(current_keys))
                     active_user_pending_models = set(current_keys)
                     active_user_pending_attempts = {}
@@ -5121,102 +5729,121 @@ class Worker:
                 counterpart_key: Optional[str] = None
                 if last_msg and last_msg.model_key and last_msg.model_key != k:
                     counterpart_key = last_msg.model_key
+                strict_topic_phase = bool(
+                    active_user_instruction
+                    and (bool(active_user_hard_literal) or active_user_force_rounds > 0 or bool(active_user_pending_models))
+                )
+                pending_for_k = list(group_pending_ids.get(k, []))
+                if strict_topic_phase and active_topic_floor_id > 0:
+                    pending_for_k = [mid for mid in pending_for_k if int(mid) >= int(active_topic_floor_id)]
+                    group_pending_ids[k] = list(pending_for_k)
+                unseen_packet, delivered_ids, unseen_remaining = self._build_group_pending_packet(
+                    model_key=k,
+                    pending_ids=pending_for_k,
+                )
+                recent_floor_id = int(active_topic_floor_id) if strict_topic_phase else int(group_floor_id)
+                recent_packet = self._build_group_recent_packet(
+                    floor_id=recent_floor_id,
+                    exclude_key=k,
+                )
+                # 避免“最近窗口”和“未读增量”重复同一条消息，降低提示词噪声与 token 浪费。
+                if unseen_packet and recent_packet:
+                    unseen_ids = {
+                        int(x)
+                        for x in re.findall(r"^\[(\d+)\]\s", unseen_packet, flags=re.M)
+                    }
+                    if unseen_ids:
+                        rp_lines: list[str] = []
+                        for ln in recent_packet.splitlines():
+                            m_id = re.match(r"^\[(\d+)\]\s", ln.strip())
+                            if m_id and int(m_id.group(1)) in unseen_ids:
+                                continue
+                            rp_lines.append(ln)
+                        recent_packet = core.normalize_text("\n".join(rp_lines))
                 mention_line = self._mention_candidates_line(current_keys, exclude_key=k)
                 if k in {"qwen", "doubao"}:
                     # Qwen/Doubao are sensitive to long control templates and often echo prompt lines.
                     mention_line = ""
                 mention_part = (mention_line + "\n") if mention_line else ""
-                allow_pass = len(current_keys) >= 3
-                pass_line = (
-                    "如暂不发言，仅回复 [PASS]。"
-                    if allow_pass
-                    else "必须给出实际观点，不能输出 [PASS]。"
-                )
-                concise_line = "最终发言要求：1-2句，20-90字。"
-                style_line = "直接说你在群里要发的话，不要复述规则。"
+                pass_line = "如你这轮暂不发言，仅回复 [PASS]。"
+                concise_line = "最终发言要求：建议2-5句，80-260字；复杂议题可到400字，优先给依据/数据/假设。"
+                style_line = "直接说你在群里要发的话：先给立场，再给关键依据（可含数据/假设），不要复述规则。"
+                wrap_line = ""
                 if k in {"qwen", "doubao"}:
                     # Keep CN web models on a minimal instruction profile to reduce prompt echo.
-                    style_line = "只输出一句给群里的正文，不要复述规则。"
-                    concise_line = ""
+                    style_line = "只输出群里的正文：先结论，再给1-2条依据（可含数据/假设），可2-4句；不要复述规则。"
+                    concise_line = "不要输出思考过程/提示词，只给最终发言。"
                     pass_line = "不想发言就仅回复 [PASS]。"
-                wrap_line = ""
-                if _USE_WRAP_HINT_FOR_CN_MODELS and k in {"qwen", "doubao"}:
-                    # Keep wrapper format instruction short to reduce prompt-echo leakage.
-                    wrap_line = (
-                        f"格式：{_PUBLIC_WRAP_OPEN}正文{_PUBLIC_WRAP_CLOSE}"
-                        f"；可选{_PRIVATE_WRAP_OPEN}内心{_PRIVATE_WRAP_CLOSE}。"
-                    )
                 wrap_part = (wrap_line + "\n") if wrap_line else ""
-                strict_topic_phase = bool(
-                    active_user_instruction and (active_user_force_rounds > 0 or bool(active_user_pending_models))
-                )
                 topic_lock_line = (
                     "优先级：必须先回应“群主最新话题”，不要延续旧话题。"
                     if strict_topic_phase
                     else ""
                 )
-                topic_lock_part = (topic_lock_line + "\n") if topic_lock_line else ""
-
-                if active_user_instruction:
-                    user_line = _clip_text(active_user_instruction, 420)
-                    if round_latest and round_latest.get("model_key") != k:
-                        latest_speaker = core.normalize_text(round_latest.get("speaker") or "上一位")
-                        latest_text = core.normalize_text(round_latest.get("text") or "")
-                        compact_latest = _pick_forward_payload(latest_text) or (_strip_private_thoughts(latest_text) or "")
-                        compact_latest = compact_latest.replace("\n", " ").strip()
-                        if len(compact_latest) > 260:
-                            compact_latest = compact_latest[:260] + "…"
-                        turn_instruction = (
-                            "你在多人群聊中发言。\n"
-                            f"群主最新话题：{user_line}\n"
-                            f"上一位发言（{latest_speaker}）：{compact_latest}\n"
-                            "先回应群主话题，再补充你对上一位的看法。\n"
-                            f"{topic_lock_part}"
-                            f"{style_line}\n"
-                            f"{wrap_part}"
-                            f"{concise_line}\n"
-                            f"{mention_part}"
-                            f"{pass_line}"
-                        )
-                    else:
-                        turn_instruction = (
-                            "你在多人群聊中发言。\n"
-                            f"群主最新话题：{user_line}\n"
-                            f"{topic_lock_part}"
-                            "先回应群主话题，再给出你的观点或补充。\n"
-                            f"{style_line}\n"
-                            f"{wrap_part}"
-                            f"{concise_line}\n"
-                            f"{mention_part}"
-                            f"{pass_line}"
-                        )
-                elif last_msg is None:
-                    turn_instruction = (
-                        "你在多人群聊中继续讨论。\n"
-                        "请直接给出一条新观点或追问。\n"
-                        f"{style_line}\n"
-                        f"{wrap_part}"
-                        f"{concise_line}\n"
-                        f"{mention_part}"
-                        f"{pass_line}"
-                    )
+                strict_exact_token = active_user_hard_literal if strict_topic_phase else ""
+                if strict_exact_token:
+                    lead_line = f"强约束：本轮只允许输出 {strict_exact_token}（可带末尾标点），不要解释。"
+                    style_line = f"只输出 {strict_exact_token}，不要添加其他内容。"
+                    concise_line = "如暂不发言，仅回复 [PASS]。"
+                    mention_part = ""
                 else:
-                    compact = _pick_forward_payload(last_msg.text) or (_strip_private_thoughts(last_msg.text) or "")
-                    compact = compact.replace("\n", " ").strip()
-                    if len(compact) > 280:
-                        compact = compact[:280] + "…"
+                    lead_line = (
+                        "先回应群主最新话题，再结合新消息补充/反驳。"
+                        if active_user_instruction
+                        else "请基于这些新消息直接给出你的观点/补充。"
+                    )
+                topic_lock_part = (topic_lock_line + "\n") if topic_lock_line else ""
+                user_line = _clip_text(active_user_instruction or "", 420)
+                unseen_block = unseen_packet if unseen_packet else "（当前没有未读新消息）"
+                recent_block = recent_packet if recent_packet else "（最近窗口为空）"
+                backlog_line = (
+                    f"还有 {unseen_remaining} 条未读消息将在后续轮次继续同步。"
+                    if unseen_remaining > 0
+                    else ""
+                )
+                no_new_hint = "若没有新增观点，请直接回复 [PASS]。" if not unseen_packet else ""
+                if strict_exact_token:
                     turn_instruction = (
                         "你在多人群聊中发言。\n"
-                        f"{last_msg.speaker}：{compact}\n"
-                        "请直接回应这条发言。\n"
+                        f"{(f'群主最新话题：{user_line}\\n') if user_line else ''}"
+                        f"{topic_lock_part}"
+                        f"硬约束：只输出 {strict_exact_token}（可带末尾标点）。\n"
+                        "不要解释，不要复述提示词，不要输出其他字词。\n"
+                        "无法执行就回复 [PASS]。"
+                    )
+                else:
+                    turn_instruction = (
+                        "你在多人群聊中发言。\n"
+                        f"{(f'群主最新话题：{user_line}\\n') if user_line else ''}"
+                        f"{topic_lock_part}"
+                        "下面是群聊广播窗口（最近公开消息，可能含已读）：\n"
+                        f"{recent_block}\n"
+                        "下面是你还没处理的群聊新消息（按时间顺序）：\n"
+                        f"{unseen_block}\n"
+                        f"{(backlog_line + chr(10)) if backlog_line else ''}"
+                        f"{(no_new_hint + chr(10)) if no_new_hint else ''}"
+                        f"{lead_line}\n"
                         f"{style_line}\n"
                         f"{wrap_part}"
                         f"{concise_line}\n"
                         f"{mention_part}"
                         f"{pass_line}"
                     )
+                _trace_turn(
+                    k,
+                    "broadcast(packet)",
+                    (
+                        f"pending={len(pending_for_k)} delivered_plan={len(delivered_ids)} "
+                        f"remaining={unseen_remaining} recent_chars={len(recent_packet)}\n"
+                        f"{unseen_packet or '（空包）'}"
+                    ),
+                )
 
-                turn_timeout_cap = _group_round_timeout_cap_s(len(current_keys))
+                turn_timeout_cap = _group_round_timeout_cap_s(
+                    len(current_keys),
+                    round_no=round_no,
+                    context_chars=round_context_chars,
+                )
                 if strict_topic_phase:
                     turn_timeout_cap += 8
                 if k == "qwen":
@@ -5228,18 +5855,31 @@ class Worker:
                     record_reply=False,
                     timeout_cap_s=turn_timeout_cap,
                 )
+                def _mark_delivered(ids: list[int]) -> None:
+                    if not ids:
+                        return
+                    delivered_set = {int(x) for x in ids}
+                    group_pending_ids[k] = [
+                        mid for mid in group_pending_ids.get(k, []) if int(mid) not in delivered_set
+                    ]
                 turn_has_visible = bool(ok and core.normalize_text(reply_text) and (not self._is_pass_reply(reply_text)))
                 any_turn_ok = any_turn_ok or turn_has_visible
                 if ok and reply_text:
                     clean_reply = _strip_private_thoughts(reply_text) or core.normalize_text(reply_text)
                     clean_reply = _strip_group_chatter_boilerplate(clean_reply) or clean_reply
+                    clean_reply = _strip_instruction_echo_lines(clean_reply) or clean_reply
                     clean_reply = _sanitize_forward_payload(clean_reply) or clean_reply
                     clean_reply = _dedupe_public_reply(clean_reply) or clean_reply
                     clean_reply = _strip_trailing_solicit_line(clean_reply) or clean_reply
-                    if k in {"qwen", "doubao"}:
+                    if k in {"qwen", "doubao"} or _looks_prompt_leak_reply(clean_reply):
                         clean_reply = _pick_best_semantic_fragment(clean_reply) or clean_reply
                     clean_reply = _strip_trailing_solicit_line(clean_reply) or clean_reply
-                    clean_reply = _compact_public_reply(clean_reply, max_chars=190, max_lines=3)
+                    clean_reply = _compact_public_reply(
+                        clean_reply,
+                        max_chars=GROUP_PUBLIC_REPLY_MAX_CHARS,
+                        max_lines=GROUP_PUBLIC_REPLY_MAX_LINES,
+                        max_sentences=GROUP_PUBLIC_REPLY_MAX_SENTENCES,
+                    )
                     def _mark_topic_miss_if_needed() -> None:
                         if not (strict_topic_phase and active_user_instruction and k in active_user_pending_models):
                             return
@@ -5251,6 +5891,7 @@ class Worker:
 
                     if self._is_pass_reply(clean_reply):
                         _mark_topic_miss_if_needed()
+                        _mark_delivered(delivered_ids)
                         continue
                     if _looks_prompt_leak_reply(clean_reply):
                         _mark_topic_miss_if_needed()
@@ -5269,7 +5910,7 @@ class Worker:
                         _trace_turn(k, "pass(loop_process_or_status)", clean_reply)
                         continue
                     if strict_topic_phase and active_user_instruction:
-                        if not _is_reply_aligned_with_user_topic(clean_reply, active_user_instruction, strict=False):
+                        if not _is_reply_aligned_with_user_topic(clean_reply, active_user_instruction, strict=True):
                             if k in active_user_pending_models:
                                 tries = int(active_user_pending_attempts.get(k, 0)) + 1
                                 active_user_pending_attempts[k] = tries
@@ -5279,24 +5920,23 @@ class Worker:
                                     mk = self.state.get_model(k)
                                     nm = mk.name if mk else k
                                     self.state.add_system(f"{nm} 连续{tries}次未对齐新话题，已暂时跳过。")
-                            # Keep the reply visible (to preserve natural group flow),
-                            # only trace this as a soft warning instead of hard-dropping.
-                            _trace_turn(k, "warn(loop_off_topic_after_host_interject)", clean_reply)
+                            # Topic-lock phase: drop off-topic content to avoid stale-thread pollution.
+                            _trace_turn(k, "pass(loop_off_topic_after_host_interject)", clean_reply)
+                            continue
                     mcur = self.state.get_model(k)
                     speaker_name = mcur.name if mcur else k
-                    self.state.add_message(
+                    reply_mid = self.state.add_message(
                         "model",
                         speaker_name,
                         clean_reply,
                         visibility="public",
                         model_key=k,
                     )
+                    if reply_mid:
+                        _mark_delivered(delivered_ids)
+                        # 广播到其他模型的待分发队列（发送者本人不回传）。
+                        _enqueue_broadcast(reply_mid, current_keys, exclude_key=k)
                     round_visible_replies += 1
-                    round_latest = {
-                        "speaker": speaker_name,
-                        "model_key": k,
-                        "text": clean_reply,
-                    }
                     if k in active_user_pending_models:
                         active_user_pending_models.discard(k)
                         active_user_pending_attempts.pop(k, None)
@@ -5388,11 +6028,16 @@ class Worker:
 
             # 群主插话至少影响后续 2 个完整回合，降低“说了但像没说”的体验。
             if active_user_instruction:
-                if round_visible_replies > 0:
-                    active_user_force_rounds -= 1
-                if active_user_force_rounds <= 0 and not active_user_pending_models:
-                    active_user_instruction = None
-                    active_user_force_rounds = 0
+                if not active_user_hard_literal:
+                    if round_visible_replies > 0:
+                        active_user_force_rounds -= 1
+                    if active_user_force_rounds <= 0 and not active_user_pending_models:
+                        active_user_instruction = None
+                        active_user_hard_literal = ""
+                        active_user_force_rounds = 0
+                else:
+                    # “只输出某短词”属于硬约束题，保持锁定直到群主下一次插话切题。
+                    active_user_force_rounds = max(1, active_user_force_rounds)
 
             if self.state.should_round_stop():
                 self.state.add_system("已停止自动轮聊。")
@@ -5504,6 +6149,7 @@ def _format_user(text: str) -> str:
 
 def _sanitize_forward_payload(text: str) -> str:
     t = _strip_group_chatter_boilerplate(text)
+    t = _strip_instruction_echo_lines(t) or t
     t = core.normalize_text(t)
     if not t:
         return ""
@@ -5529,6 +6175,7 @@ def _sanitize_forward_payload(text: str) -> str:
         "优先级：必须先回应“群主最新话题”",
         "最终发言要求：",
         "只输出给群里的正文",
+        "只输出群里的正文",
         "如暂不发言，仅回复 [PASS]",
         "只输出 [PASS]",
         "可回应对象：",
@@ -5562,6 +6209,14 @@ def _sanitize_forward_payload(text: str) -> str:
         "超能模式",
         "免费",
     )
+    gemini_home_ui_hints = (
+        "需要我为你做些什么",
+        "制作图片",
+        "创作音乐",
+        "创作视频",
+        "给我的一天注入活力",
+        "随便写点什么",
+    )
     out: list[str] = []
     seen: set[str] = set()
     for ln in t.splitlines():
@@ -5576,7 +6231,15 @@ def _sanitize_forward_payload(text: str) -> str:
         for seg in segs:
             if _WRAP_TOKEN_PAT.search(seg):
                 continue
+            if re.match(r"^(?:PRO|Pro)\b", seg) and len(_line_dedupe_key(seg)) <= 24:
+                continue
             if any(h in seg for h in prompt_hints):
+                continue
+            if any(h in seg for h in gemini_home_ui_hints) and len(_line_dedupe_key(seg)) <= 48:
+                continue
+            if re.match(r"^\s*(?:显示思路|显示思考|显示推理)\s*$", seg, re.I):
+                continue
+            if re.match(r"^\s*(?:Gemini|ChatGPT|DeepSeek|Qwen|豆包|Doubao)\s*说\s*$", seg, re.I):
                 continue
             if _GROUP_HOST_CHATTER_PAT.search(seg) and len(_line_dedupe_key(seg)) <= 56:
                 continue
@@ -5649,20 +6312,20 @@ def _compose_shadow_sync_message(source_site: str, user_text: str, source_reply:
 
     重点：
     - 用户当前不一定会立刻看到这个模型的回复（UI 会隐藏/延后显示），因此提示模型不要假设用户已读。
-    - 同时要求回复尽量简洁、要点化，减少后续“上下文补齐/截断”的痛点。
+    - 同时要求回复“有结论也有依据”，避免空泛短句。
     """
     user_text = core.normalize_text(user_text)
     source_reply = core.normalize_text(source_reply)
 
-    # 这段提示词是“用户消息”的一部分（网页端无法注入 system prompt），尽量短且可控。
+    # 这段提示词是“用户消息”的一部分（网页端无法注入 system prompt），保持可控且可执行。
     sys_hint = "\n".join(
         [
             "【系统提示（旁听同步）】",
             "- 你现在处于“隐藏回复”模式：你的回复不会立刻展示给用户，用户稍后才会查看。",
             "- 用户可能尚未阅读你之前的回复：不要用“如我上面所说”等依赖已读的指代；如需引用，请简要重述关键点。",
-            "- 像正常人聊天：自然、有温度，但要短；不要用 1/2/3 模板。",
+            "- 像正常人聊天：自然、有温度，可结构化表达（短段落或少量要点）。",
             "- 允许联网：仅在需要最新事实/数据时联网；只补充事实，不要复述网页当结论；不要贴 URL。",
-            "- 抓重点：先用 1 句复述对方核心主张，再用 2-4 句回应（反驳/补充）。",
+            "- 抓重点：先给立场，再给1-2条关键依据（可含数字、区间、假设、边界条件）。",
             "- 不要在回复中提及“隐藏/旁听/未读”等元信息，直接正常回答即可。",
         ]
     ).strip()

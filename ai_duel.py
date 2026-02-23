@@ -583,15 +583,18 @@ def wait_chatgpt_generation_done(page: Page, previous_count: int, timeout_s: int
 
 def wait_gemini_generation_done(page: Page, previous_count: int, timeout_s: int = MAX_WAIT_SECONDS) -> None:
     """
-    Gemini 生成结束判断（核心逻辑）：
-    - 观察 Stop 按钮与 Send 状态变化
-    - 只有在“回答条数增长”后，才允许进入完成判定
-    - 使用 stable_hits 连续命中避免瞬态误判
+    Gemini generation-done detection using both UI state and reply text movement.
+
+    Why:
+    - Some Gemini layouts fail `count_gemini_responses()` updates even when a reply is already visible.
+    - If we only wait on count growth, we can block for the full timeout and then extract garbage/partial text.
     """
-    log("等待 Gemini 生成完成（Stop/Send 状态机）...")
+    log("?? Gemini ?????Stop/Send ??? + ?????...")
     begin = time.time()
     started = False
     stable_hits = 0
+    prev_last_text = normalize_text(extract_gemini_last_reply(page))
+    last_status_log = 0.0
 
     while time.time() - begin < timeout_s:
         current_count = count_gemini_responses(page)
@@ -601,24 +604,40 @@ def wait_gemini_generation_done(page: Page, previous_count: int, timeout_s: int 
         stop_visible = stop_btn is not None
         send_visible = send_btn is not None
 
-        if current_count > previous_count:
+        last_text = normalize_text(extract_gemini_last_reply(page))
+        has_new_reply = (current_count > previous_count) or (
+            last_text and last_text != prev_last_text and (not _looks_like_gemini_ui_noise(last_text))
+        )
+
+        if has_new_reply:
             started = True
 
         if stop_visible:
             started = True
             stable_hits = 0
-        elif started and current_count > previous_count and (send_visible or not stop_visible):
+        elif started and has_new_reply and (send_visible or not stop_visible):
             stable_hits += 1
         else:
             stable_hits = 0
 
+        now = time.time()
+        if now - last_status_log > 5:
+            log(
+                "Gemini ??: "
+                f"resp_count={current_count} prev={previous_count} "
+                f"has_new_reply={has_new_reply} stop_visible={stop_visible} "
+                f"send_visible={send_visible} stable_hits={stable_hits} "
+                f"last_reply_len={len(last_text)}"
+            )
+            last_status_log = now
+
         if started and stable_hits >= 3:
-            log("Gemini 判定生成完成")
+            log("Gemini ??????")
             return
 
         time.sleep(POLL_SECONDS)
 
-    raise TimeoutError("等待 Gemini 生成超时")
+    raise TimeoutError("?? Gemini ????")
 
 
 def run_duel_loop() -> None:

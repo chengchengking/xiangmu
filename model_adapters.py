@@ -271,11 +271,19 @@ class GeminiAdapter(ModelAdapter):
         "main [data-response-id]",
         "main div[data-response-id]",
         "model-response",
+        "main [data-message-author-role='model']",
+        "main [data-message-author-role='assistant']",
+        "main [data-turn-role='model']",
+        "main [data-turn-role='assistant']",
     )
     _GEMINI_FALLBACK_SELECTORS: tuple[str, ...] = (
         "main [data-message-author-role='assistant']",
         "main [data-message-role='assistant']",
         "main [data-role='assistant']",
+        "main [role='article'] [class*='markdown' i]",
+        "main article [class*='markdown' i]",
+        "main article",
+        "main [class*='response' i] [class*='content' i]",
         "main [class*='assistant' i] [class*='markdown' i]",
         "main [class*='model-response' i]",
     )
@@ -308,6 +316,11 @@ class GeminiAdapter(ModelAdapter):
         r"gemini\s*是.?款\s*ai\s*工具|写作|计划|研究|学习|工具|历史记录|新对话|发现)",
         re.I,
     )
+    _GEMINI_HOME_UI_PAT = re.compile(
+        r"(?:需要我为你做些什么|制作图片|创作音乐|创作视频|给我的一天注入活力|随便写点什么|"
+        r"^\s*PRO(?:\s+\S+)?\s*[，,]?\s*你好\s*$)",
+        re.I,
+    )
     _GEMINI_THINK_TOGGLE_PAT = re.compile(
         r"^\s*(?:显示思路|显示思考|显示推理|思路展开|show\s*(?:thinking|reasoning)|thinking)\s*$",
         re.I,
@@ -316,6 +329,13 @@ class GeminiAdapter(ModelAdapter):
         r"^\s*gemini\s*(?:说|says|said)?\s*[:：]?\s*$",
         re.I,
     )
+    _GEMINI_MODE_CHIP_PAT = re.compile(r"^\s*(?:快速|标准|思考|专家|beta)\s*$", re.I)
+    _MOJIBAKE_GLYPH_PAT = re.compile(r"[鈭锛锟�]")
+
+    def __init__(self, meta: ModelMeta) -> None:
+        super().__init__(meta)
+        self._last_sent_text: str = ""
+        self._last_extract_debug: list[dict[str, object]] = []
 
     def find_input(self) -> Optional[Locator]:
         if self.page is None:
@@ -325,11 +345,53 @@ class GeminiAdapter(ModelAdapter):
     def send_user_text(self, text: str) -> None:
         if self.page is None:
             raise RuntimeError("page not ready")
+        self._last_sent_text = core.normalize_text(text)
         core.send_message(self.page, "Gemini", text)
 
     @staticmethod
     def _line_key(text: str) -> str:
-        return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", core.normalize_text(text).lower())
+        t = core.normalize_text(text).lower()
+        # Common mojibake glyphs must not count as semantic CJK content.
+        t = re.sub(r"[鈭锛锟�]", "", t)
+        return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", t)
+
+    def _looks_like_recent_prompt_echo(self, text: str) -> bool:
+        t = core.normalize_text(text)
+        sent = core.normalize_text(self._last_sent_text)
+        if not t or not sent:
+            return False
+        tk = self._line_key(t)
+        sk = self._line_key(sent)
+        if not tk or not sk:
+            return False
+        if sk in tk:
+            return True
+        # If candidate is a short single-line answer, allow it even if it reuses a
+        # fragment from the prompt (e.g. "Reply with exactly: ANSWER=37" -> "ANSWER=37").
+        t_lines = [x.strip() for x in t.splitlines() if x.strip()]
+        if len(t_lines) == 1 and len(t) <= 160 and len(tk) >= 4:
+            return False
+        # Line-level overlap for mixed UI blocks containing the user's latest prompt.
+        sent_lines = [self._line_key(x) for x in sent.splitlines() if self._line_key(x)]
+        cur_lines = [self._line_key(x) for x in t.splitlines() if self._line_key(x)]
+        if not sent_lines or not cur_lines:
+            return False
+        hit = 0
+        for ck in cur_lines:
+            for sk2 in sent_lines:
+                if len(sk2) < 8:
+                    continue
+                sameish = ck == sk2
+                superstr = sk2 in ck  # candidate contains most/all of a prompt line
+                near = False
+                if ck and sk2:
+                    mn = min(len(ck), len(sk2))
+                    mx = max(len(ck), len(sk2))
+                    near = mn >= 8 and (mn / mx) >= 0.8 and (ck in sk2 or sk2 in ck)
+                if sameish or superstr or near:
+                    hit += 1
+                    break
+        return hit >= 1
 
     def _clean_candidate_text(self, text: str) -> str:
         t = core.normalize_text(text)
@@ -349,6 +411,10 @@ class GeminiAdapter(ModelAdapter):
                 continue
             if self._GEMINI_SPEAKER_LABEL_PAT.match(s):
                 continue
+            if self._GEMINI_MODE_CHIP_PAT.match(s):
+                continue
+            if self._GEMINI_HOME_UI_PAT.search(s) and len(self._line_key(s)) <= 40:
+                continue
             kept.append(ln)
 
         t = core.normalize_text("\n".join(kept))
@@ -367,6 +433,8 @@ class GeminiAdapter(ModelAdapter):
                 continue
             if any(h in s for h in self._GEMINI_PROMPT_HINTS):
                 continue
+            if self._GEMINI_HOME_UI_PAT.search(s) and len(self._line_key(s)) <= 48:
+                continue
             if self._GEMINI_UI_NOISE_PAT.search(s) and len(self._line_key(s)) <= 18:
                 continue
             k = self._line_key(s)
@@ -381,12 +449,36 @@ class GeminiAdapter(ModelAdapter):
         t = self._clean_candidate_text(text)
         if not t:
             return True
+        if self._looks_like_recent_prompt_echo(t):
+            return True
+        if re.search(r"(下面是群聊广播窗口|下面是你还没处理的群聊新消息|群主最新话题：)", t):
+            return True
         if any(h in t for h in self._GEMINI_PROMPT_HINTS):
             return True
         lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
         if not lines:
             return True
+        if self._MOJIBAKE_GLYPH_PAT.search(t) and len(self._line_key(t)) <= 4:
+            return True
+        # Guard against mojibake/placeholder glyphs such as "鈭?" that can appear in
+        # partial DOM nodes or icon text; they have no semantic key content.
+        if len(self._line_key(t)) == 0:
+            return True
         key_len = len(self._line_key(t))
+        if len(lines) == 1 and key_len <= 2:
+            # Treat ultra-short non-protocol tokens as noise (common when Gemini DOM
+            # yields icon/placeholder mojibake). Keep PASS and compact ASCII answers.
+            if not re.fullmatch(r"\s*\[?PASS\]?\s*", t, re.I) and not re.fullmatch(r"\s*[0-9A-Za-z]{1,4}\s*", t):
+                return True
+        if len(lines) == 1 and len(t) <= 6 and key_len <= 2 and re.search(r"[^\w\u4e00-\u9fff]", t):
+            return True
+        if len(lines) == 1 and key_len <= 2 and ("?" in t or "？" in t):
+            return True
+        home_hit = sum(1 for ln in lines if self._GEMINI_HOME_UI_PAT.search(ln))
+        if home_hit >= 2:
+            return True
+        if home_hit >= 1 and key_len <= 120:
+            return True
         if len(lines) == 1 and self._GEMINI_UI_NOISE_PAT.search(lines[0]) and key_len <= 220:
             return True
         hit = sum(1 for ln in lines if self._GEMINI_UI_NOISE_PAT.search(ln))
@@ -397,6 +489,45 @@ class GeminiAdapter(ModelAdapter):
         if hit >= 1 and key_len <= 42:
             return True
         return False
+
+    def _capture_extract_debug_samples(self, limit_nodes: int = 16) -> None:
+        samples: list[dict[str, object]] = []
+        if self.page is None:
+            self._last_extract_debug = samples
+            return
+        try:
+            for sel in self._iter_reply_selectors():
+                if len(samples) >= limit_nodes:
+                    break
+                try:
+                    loc = self.page.locator(sel)
+                    cnt = loc.count()
+                except Exception:
+                    continue
+                if cnt <= 0:
+                    continue
+                start = max(0, cnt - 6)
+                for i in range(cnt - 1, start - 1, -1):
+                    if len(samples) >= limit_nodes:
+                        break
+                    try:
+                        raw = core.normalize_text(loc.nth(i).inner_text())
+                    except Exception:
+                        continue
+                    cleaned = self._clean_candidate_text(raw)
+                    samples.append(
+                        {
+                            "selector": sel,
+                            "index": i,
+                            "raw": raw[:500],
+                            "cleaned": cleaned[:500],
+                            "is_noise": self._looks_like_ui_noise(cleaned) if cleaned else True,
+                            "key_len": len(self._line_key(cleaned)),
+                        }
+                    )
+        except Exception:
+            pass
+        self._last_extract_debug = samples
 
     def _iter_reply_selectors(self) -> list[str]:
         out: list[str] = []
@@ -502,6 +633,29 @@ class GeminiAdapter(ModelAdapter):
             return diff
         if stable and not self._looks_like_ui_noise(stable):
             return stable
+        self._capture_extract_debug_samples()
+        if self._last_extract_debug:
+            try:
+                dbg_path = Path(".tmp") / "gemini_extract_debug_latest.json"
+                dbg_path.parent.mkdir(parents=True, exist_ok=True)
+                dbg_path.write_text(
+                    json.dumps(
+                        {
+                            "model": self.meta.key,
+                            "before_last": before_last,
+                            "stable": stable,
+                            "diff_now": diff_now,
+                            "diff_final": diff,
+                            "samples": self._last_extract_debug,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                core.warn(f"Gemini 提取失败，已写诊断样本: {dbg_path}")
+            except Exception as exc:
+                core.warn(f"Gemini 提取失败，写诊断样本失败: {exc}")
         return ""
 
 
