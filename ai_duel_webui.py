@@ -46,6 +46,7 @@ from model_adapters import (
     default_avatar_svg,
 )
 from orchestrator import Mode, TurnContext
+from orchestrator.evidence import should_enter_evidence
 from orchestrator.receipt import Receipt, ReceiptStatus, RejectReason
 from protocol import parse_envelope
 
@@ -4559,14 +4560,34 @@ class Worker:
             except Exception:
                 pass
             page = self._ensure_chat_surface(ad, m)
-            prompt = self._compose_turn_input(instruction, hidden_reply_hint=hidden_reply_hint)
-            if not prompt:
-                self.state.add_system(f"{m.name} 本轮跳过：空指令")
-                return False, ""
             strict_token = _extract_expected_short_literal(instruction)
             self._turn_seq += 1
             turn_mode = Mode.MULTI_ROUND if (visibility == "public" and not record_reply) else Mode.SINGLE_FAST
             ctx = TurnContext(turn_id=self._turn_seq, mode=turn_mode)
+            try:
+                if ctx.mode != Mode.EVIDENCE:
+                    msgs = self.state.get_all_messages()
+                    recent = [
+                        core.normalize_text(mm.text)
+                        for mm in msgs
+                        if mm.visibility == "public" and mm.role == "model"
+                    ]
+                    if should_enter_evidence(recent):
+                        ctx.mode = Mode.EVIDENCE
+            except Exception:
+                pass
+            try:
+                if ctx.mode == Mode.EVIDENCE:
+                    instruction = (instruction or "") + (
+                        "\n【证据模式】若你要反驳/质疑，必须在 PRIVATE_REPLY 写一行 "
+                        "evidence_hook=（引用msg_id/原句/可验证条件）。否则输出 [PASS]。\n"
+                    )
+            except Exception:
+                pass
+            prompt = self._compose_turn_input(instruction, hidden_reply_hint=hidden_reply_hint)
+            if not prompt:
+                self.state.add_system(f"{m.name} 本轮跳过：空指令")
+                return False, ""
             if not strict_token:
                 prompt = (
                     prompt
@@ -5008,6 +5029,17 @@ class Worker:
                     max_lines=GROUP_PUBLIC_REPLY_MAX_LINES,
                     max_sentences=GROUP_PUBLIC_REPLY_MAX_SENTENCES,
                 )
+            try:
+                if ctx.mode == Mode.EVIDENCE:
+                    if self._looks_like_disagreement(public_reply) and "evidence_hook=" not in (private_reply or "").lower():
+                        _trace_turn(
+                            key,
+                            "pass(no_evidence_hook)",
+                            f"turn_id={ctx.turn_id} mode={ctx.mode.value}\n{public_reply}",
+                        )
+                        public_reply = "[PASS]"
+            except Exception:
+                pass
 
             if record_reply:
                 self.state.add_message(
