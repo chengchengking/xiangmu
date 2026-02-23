@@ -64,17 +64,24 @@ The WebUI has a left model bar (slots `1..10`):
   - **Open login window** (official site)
   - **Recheck** after you finish manual login
 - Send requires explicit target selection in the bottom dropdown:
-  - `请选择` / `群聊 (public)` / `单聊 (shadow, only selected models)`
+  - `???` / `?? (public)` / `?? (shadow, only selected models)`
 
 Integrated models (current):
 
 - `1=ChatGPT` `2=Gemini` `3=DeepSeek`
-- `4=豆包` `5=Qwen` `6=Kimi` (generic adapter template; may need selector tweaks)
+- `4=??` `5=Qwen` `6=Kimi` (generic adapter template; may need selector tweaks)
 - `7..10` are locked placeholders
 
 ### Model Equality
 
-All selected models are treated equally. Use `群聊` to send to all selected models, or `单聊` to talk to one model (messages are stored as `shadow` but still go into global context for later understanding).
+All selected models are treated equally. Use `??` to send to all selected models, or `??` to talk to one model.
+
+Shadow semantics:
+
+- `shadow_shared`: stored as `shadow` and may be synchronized to other selected models (compatibility mode / broader context sharing).
+- `shadow_local`: stored as `shadow` but kept local to the target model (useful for game-like/private strategies; not synchronized to peers).
+
+The default shadow behavior can be configured with `AI_DUEL_SHADOW_SCOPE_DEFAULT=shared|local`.
 
 ## Notes
 
