@@ -47,7 +47,7 @@ from model_adapters import (
     default_avatar_svg,
 )
 from orchestrator import Mode, TurnContext
-from orchestrator.evidence import should_enter_evidence
+from orchestrator.evidence import has_valid_evidence_hook, should_enter_evidence
 from orchestrator.receipt import Receipt, ReceiptStatus, RejectReason
 from protocol import parse_envelope
 
@@ -4673,8 +4673,8 @@ class Worker:
             try:
                 if ctx.mode == Mode.EVIDENCE:
                     instruction = (instruction or "") + (
-                        "\n【证据模式】若你要反驳/质疑，必须在 PRIVATE_REPLY 写一行 "
-                        "evidence_hook=（引用msg_id/原句/可验证条件）。否则输出 [PASS]。\n"
+                        "\n【证据模式】若你要反驳/质疑，PRIVATE_REPLY 必须包含一行："
+                        "evidence_hook=ref:M#123 或 evidence_hook=check:可验证条件。否则输出 [PASS]。\n"
                     )
             except Exception:
                 pass
@@ -5160,10 +5160,10 @@ class Worker:
                 )
             try:
                 if ctx.mode == Mode.EVIDENCE:
-                    if self._looks_like_disagreement(public_reply) and "evidence_hook=" not in (private_reply or "").lower():
+                    if self._looks_like_disagreement(public_reply) and not has_valid_evidence_hook(private_reply or ""):
                         _trace_turn(
                             key,
-                            "pass(no_evidence_hook)",
+                            "pass(no_valid_evidence_hook)",
                             f"turn_id={ctx.turn_id} mode={ctx.mode.value}\n{public_reply}",
                         )
                         public_reply = "[PASS]"
