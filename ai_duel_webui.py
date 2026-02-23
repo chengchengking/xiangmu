@@ -4832,6 +4832,18 @@ class Worker:
 
             env = parse_envelope(reply)
             if env.public:
+                meta_packet_hash = core.normalize_text(str(env.meta.get("packet_hash") or ""))
+                if authoritative_packet_hash and meta_packet_hash and meta_packet_hash != authoritative_packet_hash:
+                    self.state.add_system(f"{m.name} 本轮广播包校验失败：packet_hash 不一致，已隔离该回复。")
+                    _trace_turn(
+                        key,
+                        "ERROR(packet_hash_mismatch_meta)",
+                        (
+                            f"turn_id={ctx.turn_id} mode={ctx.mode.value} "
+                            f"expected={authoritative_packet_hash} got={meta_packet_hash}"
+                        ),
+                    )
+                    return True, "[PASS]"
                 public_reply = env.public
                 private_reply = env.private
                 _trace_turn(
@@ -5278,6 +5290,20 @@ class Worker:
     @staticmethod
     def _should_sync_shadow_to_peers(shadow_scope: str) -> bool:
         return (shadow_scope or "shared").strip().lower() == "shared"
+
+    @staticmethod
+    def _check_round_packet_hash_consistency(seen: dict[str, str], model_key: str, packet_hash: str) -> tuple[bool, str]:
+        h = (packet_hash or "").strip()
+        if not h:
+            return True, ""
+        if not seen:
+            seen[(model_key or "").strip().lower()] = h
+            return True, h
+        expected = next(iter(seen.values()))
+        if h != expected:
+            return False, expected
+        seen[(model_key or "").strip().lower()] = h
+        return True, expected
 
     @staticmethod
     def _looks_like_disagreement(text: str) -> bool:
@@ -5986,6 +6012,7 @@ class Worker:
             round_context_chars = self._estimate_recent_public_context_chars()
             authoritative_packet_text, authoritative_packet_hash = self._build_authoritative_broadcast_packet()
             authoritative_ack_in = self._ack_in_from_public_timeline()
+            round_packet_hash_seen: dict[str, str] = {}
             for k in talk_keys:
                 if self.state.should_round_stop():
                     break
@@ -6144,6 +6171,24 @@ class Worker:
                     authoritative_packet_hash=authoritative_packet_hash,
                     ack_in=authoritative_ack_in,
                 )
+                pkt_ok, pkt_expected = self._check_round_packet_hash_consistency(
+                    round_packet_hash_seen, k, authoritative_packet_hash
+                )
+                if not pkt_ok:
+                    self.state.add_system(f"广播包不一致告警：{k} 收到异常 packet_hash，已隔离本轮输出。")
+                    _trace_turn(
+                        k,
+                        "ERROR(packet_hash_mismatch)",
+                        (
+                            f"round_no={round_no} turn_id_hint={getattr(self._last_turn_ctx_by_model.get(k), 'turn_id', 0)} "
+                            f"expected={pkt_expected} got={authoritative_packet_hash}"
+                        ),
+                    )
+                    try:
+                        self._finalize_receipt_for_model(k, status=ReceiptStatus.REJECT, reason=RejectReason.PARSE_FAIL)
+                    except Exception:
+                        pass
+                    continue
                 def _finalize_turn_receipt_local(
                     status: ReceiptStatus,
                     reason: Optional[RejectReason] = None,
