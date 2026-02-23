@@ -46,6 +46,7 @@ from model_adapters import (
     default_avatar_svg,
 )
 from orchestrator import Mode, TurnContext
+from orchestrator.receipt import Receipt, ReceiptStatus, RejectReason
 from protocol import parse_envelope
 
 
@@ -4148,6 +4149,21 @@ class Worker:
         self._chatgpt_need_fresh_chat = True
         self._gemini_need_fresh_chat = True
         self._turn_seq = 0
+        self._last_receipt_by_model: dict[str, Receipt] = {}
+
+    def _control_plane_header_for_model(self, model_key: str) -> str:
+        r = self._last_receipt_by_model.get((model_key or "").strip().lower())
+        if r is None:
+            return "【系统回执】无（首次发言）。\n"
+        if r.status == ReceiptStatus.ACCEPT:
+            return f"【系统回执】上一轮：ACCEPT（turn_id={r.turn_id}）。继续正常输出。\n"
+        if r.status == ReceiptStatus.PASS_:
+            return f"【系统回执】上一轮：PASS（turn_id={r.turn_id}）。\n"
+        reason = r.reason.value if r.reason is not None else "UNKNOWN"
+        return (
+            f"【系统回执】上一轮：REJECT（turn_id={r.turn_id}, reason={reason}）。"
+            "若再次被 REJECT，请缩短输出或仅给 BLOCKER/DIFF。\n"
+        )
 
     def start(self) -> None:
         self._thread.start()
@@ -4538,6 +4554,10 @@ class Worker:
         try:
             turn_start = time.time()
             self.state.set_status(f"sending:{key}")
+            try:
+                instruction = self._control_plane_header_for_model(key) + (instruction or "")
+            except Exception:
+                pass
             page = self._ensure_chat_surface(ad, m)
             prompt = self._compose_turn_input(instruction, hidden_reply_hint=hidden_reply_hint)
             if not prompt:
@@ -5005,6 +5025,18 @@ class Worker:
                     visibility="shadow",
                     model_key=key,
                 )
+            try:
+                tid = getattr(ctx, "turn_id", 0) if "ctx" in locals() else 0
+                if self._is_pass_reply(public_reply):
+                    rec = Receipt(turn_id=tid, status=ReceiptStatus.PASS_)
+                elif public_reply and public_reply.strip():
+                    rec = Receipt(turn_id=tid, status=ReceiptStatus.ACCEPT)
+                else:
+                    rec = Receipt(turn_id=tid, status=ReceiptStatus.REJECT, reason=RejectReason.NO_PUBLIC_TAG)
+                self._last_receipt_by_model[(key or "").strip().lower()] = rec
+                _trace_turn(key, "receipt", json.dumps(rec.to_dict(), ensure_ascii=False))
+            except Exception:
+                pass
             _trace_turn(
                 key,
                 "final",
@@ -5014,6 +5046,13 @@ class Worker:
             return True, public_reply
         except Exception as exc:
             self.state.add_system(f"{m.name} 本轮失败：{exc}")
+            try:
+                tid = getattr(ctx, "turn_id", 0) if "ctx" in locals() else 0
+                rec = Receipt(turn_id=tid, status=ReceiptStatus.REJECT, reason=RejectReason.PARSE_FAIL)
+                self._last_receipt_by_model[(key or "").strip().lower()] = rec
+                _trace_turn(key, "receipt", json.dumps(rec.to_dict(), ensure_ascii=False))
+            except Exception:
+                pass
             return False, ""
 
     def _extract_target_keys_from_text(self, text: str, candidates: list[str]) -> list[str]:
