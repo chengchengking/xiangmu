@@ -3482,6 +3482,8 @@ def _looks_prompt_leak_reply(text: str) -> bool:
     t = core.normalize_text(text)
     if not t:
         return True
+    if any(tok in t for tok in ("[[META]]", "[[/META]]", "ack_in=", "packet_hash=", "evidence_hook=")):
+        return True
     # Hard prompt/broadcast markers: if any of these appear, treat as leaked prompt text.
     if re.search(
         r"(下面是群聊广播窗口|下面是你还没处理的群聊新消息|群主最新话题：|"
@@ -3514,6 +3516,11 @@ def _looks_prompt_leak_reply(text: str) -> bool:
         "只依据以下群聊消息回复",
         "不要复述本提示",
         "不要复述提示词",
+        "[[META]]",
+        "[[/META]]",
+        "ack_in=",
+        "packet_hash=",
+        "evidence_hook=",
         "可回应对象：",
         "可点名对象：",
         "上下文边界",

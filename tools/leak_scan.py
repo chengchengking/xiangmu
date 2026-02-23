@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 
 
@@ -29,14 +30,29 @@ def _scan_text(text: str) -> list[str]:
     return hits
 
 
-def _iter_jsonl(path: Path):
+def _row_ts_unix(obj: dict) -> float | None:
+    ts = obj.get("ts")
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts)).timestamp()
+    except Exception:
+        return None
+
+
+def _iter_jsonl(path: Path, *, since_unix: float | None):
     with path.open("r", encoding="utf-8", errors="replace") as f:
         for ln_no, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
-                yield ln_no, json.loads(line)
+                obj = json.loads(line)
+                if since_unix is not None:
+                    row_ts = _row_ts_unix(obj)
+                    if row_ts is not None and row_ts < since_unix:
+                        continue
+                yield ln_no, obj
             except Exception:
                 continue
 
@@ -53,7 +69,7 @@ def _pick_logs(pattern: str, tmp_dir: Path, all_files: bool, since_unix: float |
 def scan_message_logs(tmp_dir: Path, *, all_files: bool, since_unix: float | None) -> list[str]:
     issues: list[str] = []
     for path in _pick_logs("ai_group_messages_*.jsonl", tmp_dir, all_files, since_unix):
-        for ln, obj in _iter_jsonl(path):
+        for ln, obj in _iter_jsonl(path, since_unix=since_unix):
             if obj.get("visibility") != "public":
                 continue
             text = str(obj.get("text") or "")
@@ -66,7 +82,7 @@ def scan_message_logs(tmp_dir: Path, *, all_files: bool, since_unix: float | Non
 def scan_turn_logs(tmp_dir: Path, *, all_files: bool, since_unix: float | None) -> list[str]:
     issues: list[str] = []
     for path in _pick_logs("ai_group_turns_*.jsonl", tmp_dir, all_files, since_unix):
-        for ln, obj in _iter_jsonl(path):
+        for ln, obj in _iter_jsonl(path, since_unix=since_unix):
             if str(obj.get("stage") or "") != "final":
                 continue
             payload = str(obj.get("text") or obj.get("payload") or "")
