@@ -134,6 +134,9 @@ MESSAGE_LOG_FILE = Path(
 TURN_LOG_FILE = Path(
     os.environ.get("AI_DUEL_TURN_LOG_FILE", str(TRACE_DIR / f"ai_group_turns_{RUN_ID}.jsonl"))
 )
+WORKER_STATE_LOG_FILE = Path(
+    os.environ.get("AI_DUEL_WORKER_STATE_LOG_FILE", str(TRACE_DIR / f"ai_worker_states_{RUN_ID}.jsonl"))
+)
 SELECTED_MODELS_FILE = Path(os.environ.get("AI_DUEL_SELECTED_MODELS_FILE", str(TRACE_DIR / "selected_models.json")))
 _JSONL_LOCK = threading.Lock()
 GROUP_PUBLIC_TURN_SOFT_TIMEOUT_S = {
@@ -453,6 +456,11 @@ class ModelRuntime:
     login_help: str
     selected: bool = False
     authenticated: bool = False
+    runtime_state: str = "INIT"  # INIT|IDLE|GENERATING|STALE|CAPTCHA_BLOCKED|NEEDS_HUMAN|COOLING_DOWN|DEAD
+    runtime_reason: str = ""
+    runtime_fail_count: int = 0
+    runtime_cooldown_until: float = 0.0
+    runtime_updated_ts: str = ""
 
 
 class SharedState:
@@ -603,6 +611,69 @@ class SharedState:
                 return
             m.authenticated = bool(value)
 
+    def set_model_runtime_state(
+        self,
+        key: str,
+        new_state: str,
+        *,
+        reason: str = "",
+        fail_delta: int = 0,
+        reset_fail: bool = False,
+        cooldown_s: float = 0.0,
+        turn_id: int = 0,
+    ) -> None:
+        key = (key or "").strip().lower()
+        with self._lock:
+            m = self._models.get(key)
+            if not m:
+                return
+            old_state = m.runtime_state or "INIT"
+            if reset_fail:
+                m.runtime_fail_count = 0
+            if fail_delta:
+                m.runtime_fail_count = max(0, int(m.runtime_fail_count) + int(fail_delta))
+            now = time.time()
+            if cooldown_s and float(cooldown_s) > 0:
+                m.runtime_cooldown_until = max(float(m.runtime_cooldown_until or 0.0), now + float(cooldown_s))
+            elif new_state != "COOLING_DOWN":
+                m.runtime_cooldown_until = 0.0
+            m.runtime_state = str(new_state or m.runtime_state or "INIT")
+            m.runtime_reason = core.normalize_text(reason)
+            m.runtime_updated_ts = _now_iso()
+            _append_jsonl(
+                WORKER_STATE_LOG_FILE,
+                {
+                    "run_id": RUN_ID,
+                    "ts": m.runtime_updated_ts,
+                    "model_key": key,
+                    "model_name": m.name,
+                    "old_state": old_state,
+                    "new_state": m.runtime_state,
+                    "reason": m.runtime_reason,
+                    "fail_count": int(m.runtime_fail_count),
+                    "cooldown_until": float(m.runtime_cooldown_until or 0.0),
+                    "turn_id": int(turn_id or 0),
+                },
+            )
+
+    def get_model_runtime_state(self, key: str) -> dict[str, Any]:
+        key = (key or "").strip().lower()
+        with self._lock:
+            m = self._models.get(key)
+            if not m:
+                return {"ok": False, "error": "unknown_model"}
+            now = time.time()
+            remain = max(0.0, float(m.runtime_cooldown_until or 0.0) - now)
+            return {
+                "ok": True,
+                "key": m.key,
+                "state": m.runtime_state,
+                "reason": m.runtime_reason,
+                "fail_count": int(m.runtime_fail_count),
+                "cooldown_remaining_s": round(remain, 2),
+                "updated_ts": m.runtime_updated_ts,
+            }
+
     def toggle_selected(self, key: str) -> dict[str, Any]:
         key = (key or "").strip().lower()
         with self._lock:
@@ -659,7 +730,17 @@ class SharedState:
 
     def get_state(self) -> dict[str, Any]:
         with self._lock:
-            return {"ok": True, "status": self._status, "stop": self._stop}
+            runtimes = {
+                k: {
+                    "state": m.runtime_state,
+                    "reason": m.runtime_reason,
+                    "fail_count": int(m.runtime_fail_count),
+                    "cooldown_remaining_s": round(max(0.0, float(m.runtime_cooldown_until or 0.0) - time.time()), 2),
+                    "updated_ts": m.runtime_updated_ts,
+                }
+                for k, m in self._models.items()
+            }
+            return {"ok": True, "status": self._status, "stop": self._stop, "worker_runtime": runtimes}
 
     def request_stop(self) -> None:
         with self._lock:
@@ -2411,6 +2492,15 @@ class _Handler(BaseHTTPRequestHandler):
             key = str(data.get("key") or "")
             self.state.inbox.put({"kind": "nudge", "key": key})
             self._send_json({"ok": True})
+            return
+
+        if parsed.path == "/api/models/recover":
+            key = str(data.get("key") or "")
+            ev = threading.Event()
+            box: dict[str, Any] = {}
+            self.state.inbox.put({"kind": "recover_model", "key": key, "_ev": ev, "_reply": box})
+            ev.wait(timeout=45)
+            self._send_json(box or {"ok": False, "error": "recover_timeout"})
             return
 
         if parsed.path == "/api/send":
@@ -4343,6 +4433,21 @@ class Worker:
         if isinstance(ev, threading.Event):
             ev.set()
 
+    @staticmethod
+    def _classify_worker_failure(exc_or_text: Any) -> str:
+        t = core.normalize_text(str(exc_or_text or "")).lower()
+        if not t:
+            return "unknown"
+        if any(x in t for x in ["captcha", "验证", "人机", "cloudflare", "cf", "风控", "过盾"]):
+            return "captcha"
+        if any(x in t for x in ["timeout", "timed out", "超时"]):
+            return "timeout"
+        if any(x in t for x in ["stale", "detached", "execution context was destroyed"]):
+            return "stale"
+        if any(x in t for x in ["selector", "locator", "input", "对话输入框不可用"]):
+            return "selector_miss"
+        return "unknown"
+
     def _run(self) -> None:
         while not self.state.should_stop():
             try:
@@ -4360,6 +4465,8 @@ class Worker:
                     self._handle_send(action)
                 elif kind == "nudge":
                     self._handle_nudge(action)
+                elif kind == "recover_model":
+                    self._handle_recover_model(action)
                 elif kind == "stop":
                     self.state.request_stop()
                 else:
@@ -4395,6 +4502,7 @@ class Worker:
         assert self._pw is not None
 
         self.state.set_status(f"opening_login:{key}")
+        self.state.set_model_runtime_state(key, "INITIALIZING", reason="login_open")
         page = ad.ensure_page(self._pw)
         try:
             page.goto(ad.meta.url, wait_until="domcontentloaded")
@@ -4417,6 +4525,7 @@ class Worker:
         assert self._pw is not None
 
         self.state.set_status(f"checking_login:{key}")
+        self.state.set_model_runtime_state(key, "INITIALIZING", reason="login_check")
         page = ad.ensure_page(self._pw)
         m = self.state.get_model(key)
 
@@ -4440,8 +4549,49 @@ class Worker:
         self.state.set_authenticated(key, ok)
         if ok:
             self.state.mark_pending_enable_done(key)
+            self.state.set_model_runtime_state(key, "IDLE", reason="login_check_ok", reset_fail=True)
+        else:
+            self.state.set_model_runtime_state(key, "NEEDS_HUMAN", reason="login_check_failed", fail_delta=1)
+            if m:
+                self.state.add_system(f"{m.name} 需要人工介入：请打开登录窗口完成验证/登录后点击恢复。")
         self.state.set_status("idle")
         self._safe_reply(action, {"ok": True, "authenticated": bool(ok)})
+
+    def _handle_recover_model(self, action: dict[str, Any]) -> None:
+        key = str(action.get("key") or "").strip().lower()
+        ad = self._get_adapter(key)
+        if ad is None:
+            self._safe_reply(action, {"ok": False, "error": "unknown_or_not_integrated"})
+            return
+        self._ensure_playwright()
+        assert self._pw is not None
+        self.state.set_status(f"recover:{key}")
+        self.state.set_model_runtime_state(key, "INITIALIZING", reason="manual_recover")
+        page = ad.ensure_page(self._pw)
+        try:
+            try:
+                page.reload(wait_until="domcontentloaded")
+            except Exception:
+                pass
+            ok = bool(ad.is_authenticated_now())
+            self.state.set_authenticated(key, ok)
+            if ok:
+                self.state.set_model_runtime_state(key, "IDLE", reason="manual_recover_ok", reset_fail=True)
+                self._safe_reply(action, {"ok": True, "recovered": True})
+            else:
+                self.state.set_model_runtime_state(key, "NEEDS_HUMAN", reason="manual_recover_needs_login", fail_delta=1)
+                self._safe_reply(action, {"ok": True, "recovered": False, "needs_human": True})
+        except Exception as exc:
+            cls = self._classify_worker_failure(exc)
+            if cls == "captcha":
+                self.state.set_model_runtime_state(key, "NEEDS_HUMAN", reason=f"recover:{cls}", fail_delta=1)
+            elif cls in {"timeout", "stale", "selector_miss"}:
+                self.state.set_model_runtime_state(key, "COOLING_DOWN", reason=f"recover:{cls}", fail_delta=1, cooldown_s=30)
+            else:
+                self.state.set_model_runtime_state(key, "DEAD", reason=f"recover:{cls}", fail_delta=1)
+            self._safe_reply(action, {"ok": False, "error": str(exc), "class": cls})
+        finally:
+            self.state.set_status("idle")
 
     @staticmethod
     def _click_generic_new_chat(page: Any) -> bool:
@@ -4761,6 +4911,7 @@ class Worker:
         try:
             turn_start = time.time()
             self.state.set_status(f"sending:{key}")
+            self.state.set_model_runtime_state(key, "GENERATING", reason="turn_start")
             try:
                 instruction = self._control_plane_header_for_model(key) + (instruction or "")
             except Exception:
@@ -5370,6 +5521,7 @@ class Worker:
                 f"turn_id={ctx.turn_id} mode={ctx.mode.value}\n{public_reply}",
                 elapsed_s=(time.time() - turn_start),
             )
+            self.state.set_model_runtime_state(key, "IDLE", reason="turn_ok", reset_fail=True, turn_id=(ctx.turn_id if ctx else 0))
             return _tr_success(
                 public_reply,
                 raw_reply=reply,
@@ -5380,6 +5532,21 @@ class Worker:
             )
         except Exception as exc:
             self.state.add_system(f"{m.name} 本轮失败：{exc}")
+            cls = self._classify_worker_failure(exc)
+            if cls == "captcha":
+                self.state.set_model_runtime_state(key, "NEEDS_HUMAN", reason=f"turn:{cls}", fail_delta=1, turn_id=(ctx.turn_id if ctx else 0))
+                self.state.add_system(f"{m.name} 触发风控/验证码：请在浏览器中手动处理后点击恢复。")
+            elif cls in {"timeout", "stale", "selector_miss"}:
+                self.state.set_model_runtime_state(
+                    key,
+                    "COOLING_DOWN",
+                    reason=f"turn:{cls}",
+                    fail_delta=1,
+                    cooldown_s=30 if cls != "timeout" else 20,
+                    turn_id=(ctx.turn_id if ctx else 0),
+                )
+            else:
+                self.state.set_model_runtime_state(key, "STALE", reason=f"turn:{cls}", fail_delta=1, turn_id=(ctx.turn_id if ctx else 0))
             try:
                 if "ctx" in locals():
                     tid = getattr(ctx, "turn_id", 0)
