@@ -1,6 +1,12 @@
 import unittest
 
-from orchestrator.guards import apply_turn_guards, error_like, pass_like
+from orchestrator.guards import (
+    apply_turn_guards,
+    error_like,
+    map_turn_error_to_reject_reason,
+    pass_like,
+)
+from orchestrator.receipt import RejectReason
 from orchestrator.turn_result import TurnErrorType, TurnResult, TurnResultStatus
 
 
@@ -29,7 +35,13 @@ class TurnGuardTests(unittest.TestCase):
         self.assertEqual(r1.public_text, "[PASS]")
         self.assertEqual(r1.error_msg, "filtered")
 
+    def test_error_mapping_covers_common_types(self):
+        self.assertEqual(map_turn_error_to_reject_reason(TurnErrorType.TIMEOUT), RejectReason.TIMEOUT)
+        self.assertEqual(map_turn_error_to_reject_reason(TurnErrorType.LEAK), RejectReason.LOW_VALUE)
+        self.assertEqual(map_turn_error_to_reject_reason(TurnErrorType.EVIDENCE_INVALID), RejectReason.LOW_VALUE)
+        self.assertEqual(map_turn_error_to_reject_reason(TurnErrorType.PARSE_FAIL), RejectReason.PARSE_FAIL)
+        self.assertEqual(map_turn_error_to_reject_reason(None), RejectReason.PARSE_FAIL)
+
 
 if __name__ == "__main__":
     unittest.main()
-

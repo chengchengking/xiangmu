@@ -46,7 +46,15 @@ from model_adapters import (
     QwenAdapter,
     default_avatar_svg,
 )
-from orchestrator import Mode, TurnContext, TurnErrorType, TurnResult, apply_turn_guards, error_like
+from orchestrator import (
+    Mode,
+    TurnContext,
+    TurnErrorType,
+    TurnResult,
+    apply_turn_guards,
+    error_like,
+    map_turn_error_to_reject_reason,
+)
 from orchestrator.evidence import has_valid_evidence_hook, should_enter_evidence
 from orchestrator.receipt import Receipt, ReceiptStatus, RejectReason
 from protocol import parse_envelope
@@ -5459,18 +5467,16 @@ class Worker:
         seen[(model_key or "").strip().lower()] = h
         return True, expected
 
-    @staticmethod
-    def _reject_reason_from_turn_result(result: TurnResult) -> RejectReason:
+    def _reject_reason_from_turn_result(self, result: TurnResult) -> RejectReason:
         et = result.error_type
-        if et == TurnErrorType.TIMEOUT:
-            return RejectReason.TIMEOUT
-        if et == TurnErrorType.LEAK:
-            return RejectReason.LOW_VALUE
-        if et == TurnErrorType.HASH_MISMATCH:
-            return RejectReason.PARSE_FAIL
-        if et in {TurnErrorType.PROVIDER_ERROR, TurnErrorType.PARSE_FAIL}:
-            return RejectReason.PARSE_FAIL
-        return RejectReason.PARSE_FAIL
+        rr = map_turn_error_to_reject_reason(et)
+        if et in {TurnErrorType.UNKNOWN, None}:
+            _trace_turn(
+                result.model_key or "unknown",
+                "WARN(reject_reason_unmapped)",
+                f"error_type={et.value if isinstance(et, TurnErrorType) else et} error_msg={result.error_msg or ''}",
+            )
+        return rr
 
     def _apply_outer_turn_guards(
         self,
@@ -5480,6 +5486,8 @@ class Worker:
         round_no: int,
         round_packet_hash_seen: dict[str, str],
         authoritative_packet_hash: str,
+        enable_packet_hash: bool = True,
+        enable_leak: bool = True,
     ) -> TurnResult:
         def _guard_packet_hash(r: TurnResult) -> TurnResult:
             pkt_ok, pkt_expected = self._check_round_packet_hash_consistency(
@@ -5504,7 +5512,12 @@ class Worker:
                 return error_like(r, error_type=TurnErrorType.LEAK, error_msg="prompt leak after outer clean")
             return r
 
-        return apply_turn_guards(result, _guard_packet_hash, _guard_leak)
+        guard_fns = []
+        if enable_packet_hash:
+            guard_fns.append(_guard_packet_hash)
+        if enable_leak:
+            guard_fns.append(_guard_leak)
+        return apply_turn_guards(result, *guard_fns)
 
     @staticmethod
     def _looks_like_disagreement(text: str) -> bool:
@@ -6063,6 +6076,15 @@ class Worker:
 
         if target != "group":
             main_res = self._run_model_turn(keys[0], text, visibility=visibility, hidden_reply_hint=False)
+            main_res = self._apply_outer_turn_guards(
+                key=keys[0],
+                result=main_res,
+                round_no=0,
+                round_packet_hash_seen={},
+                authoritative_packet_hash="",
+                enable_packet_hash=False,
+                enable_leak=True,
+            )
             if main_res.ok and main_res.public_text:
                 # Freeze peer targets at send-time snapshot to avoid mid-turn toggle races causing wrong sync targets.
                 peers = [k for k in selected_snapshot if k != target]
@@ -6083,7 +6105,16 @@ class Worker:
                             shadow_scope="shared",
                         )
                         instruction = self._build_shadow_sync_instruction(source_name, text, payload)
-                        _ = self._run_model_turn(peer, instruction, visibility="shadow", hidden_reply_hint=True)
+                        peer_res = self._run_model_turn(peer, instruction, visibility="shadow", hidden_reply_hint=True)
+                        _ = self._apply_outer_turn_guards(
+                            key=peer,
+                            result=peer_res,
+                            round_no=0,
+                            round_packet_hash_seen={},
+                            authoritative_packet_hash="",
+                            enable_packet_hash=False,
+                            enable_leak=True,
+                        )
             self.state.set_status("idle")
             self._safe_reply(action, {"ok": True})
             return
@@ -6529,6 +6560,15 @@ class Worker:
                                     hidden_reply_hint=True,
                                     record_reply=False,
                                 )
+                                obs_res = self._apply_outer_turn_guards(
+                                    key=observer,
+                                    result=obs_res,
+                                    round_no=round_no,
+                                    round_packet_hash_seen={},
+                                    authoritative_packet_hash="",
+                                    enable_packet_hash=False,
+                                    enable_leak=True,
+                                )
                                 observer_clean = _strip_private_thoughts(obs_res.public_text)
                                 if not obs_res.ok or self._is_pass_reply(observer_clean):
                                     continue
@@ -6640,7 +6680,16 @@ class Worker:
         self.state.set_status(f"nudge:{key}")
 
         instruction = "请基于当前对话提出观点/反驳/补充，抓重点，像人聊天，尽量短，并保留关键细节。"
-        _ = self._run_model_turn(key, instruction, visibility="public")
+        nudge_res = self._run_model_turn(key, instruction, visibility="public")
+        _ = self._apply_outer_turn_guards(
+            key=key,
+            result=nudge_res,
+            round_no=0,
+            round_packet_hash_seen={},
+            authoritative_packet_hash="",
+            enable_packet_hash=False,
+            enable_leak=True,
+        )
         self.state.set_status("idle")
         self._safe_reply(action, {"ok": True})
 
