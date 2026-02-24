@@ -46,7 +46,7 @@ from model_adapters import (
     QwenAdapter,
     default_avatar_svg,
 )
-from orchestrator import Mode, TurnContext, TurnErrorType, TurnResult
+from orchestrator import Mode, TurnContext, TurnErrorType, TurnResult, apply_turn_guards, error_like
 from orchestrator.evidence import has_valid_evidence_hook, should_enter_evidence
 from orchestrator.receipt import Receipt, ReceiptStatus, RejectReason
 from protocol import parse_envelope
@@ -5460,6 +5460,53 @@ class Worker:
         return True, expected
 
     @staticmethod
+    def _reject_reason_from_turn_result(result: TurnResult) -> RejectReason:
+        et = result.error_type
+        if et == TurnErrorType.TIMEOUT:
+            return RejectReason.TIMEOUT
+        if et == TurnErrorType.LEAK:
+            return RejectReason.LOW_VALUE
+        if et == TurnErrorType.HASH_MISMATCH:
+            return RejectReason.PARSE_FAIL
+        if et in {TurnErrorType.PROVIDER_ERROR, TurnErrorType.PARSE_FAIL}:
+            return RejectReason.PARSE_FAIL
+        return RejectReason.PARSE_FAIL
+
+    def _apply_outer_turn_guards(
+        self,
+        *,
+        key: str,
+        result: TurnResult,
+        round_no: int,
+        round_packet_hash_seen: dict[str, str],
+        authoritative_packet_hash: str,
+    ) -> TurnResult:
+        def _guard_packet_hash(r: TurnResult) -> TurnResult:
+            pkt_ok, pkt_expected = self._check_round_packet_hash_consistency(
+                round_packet_hash_seen, key, r.packet_hash or authoritative_packet_hash
+            )
+            if pkt_ok:
+                return r
+            self.state.add_system(f"广播包不一致告警：{key} 收到异常 packet_hash，已隔离本轮输出。")
+            _trace_turn(
+                key,
+                "ERROR(packet_hash_mismatch)",
+                (
+                    f"round_no={round_no} turn_id_hint={r.turn_id} "
+                    f"expected={pkt_expected} got={r.packet_hash or authoritative_packet_hash}"
+                ),
+            )
+            return error_like(r, error_type=TurnErrorType.HASH_MISMATCH, error_msg="packet_hash_mismatch")
+
+        def _guard_leak(r: TurnResult) -> TurnResult:
+            if _looks_prompt_leak_reply(r.public_text):
+                _trace_turn(key, "ERROR(loop_prompt_leak_guard)", r.public_text)
+                return error_like(r, error_type=TurnErrorType.LEAK, error_msg="prompt leak after outer clean")
+            return r
+
+        return apply_turn_guards(result, _guard_packet_hash, _guard_leak)
+
+    @staticmethod
     def _looks_like_disagreement(text: str) -> bool:
         raw = core.normalize_text(text).lower()
         if not raw:
@@ -6325,26 +6372,15 @@ class Worker:
                     authoritative_packet_hash=authoritative_packet_hash,
                     ack_in=authoritative_ack_in,
                 )
+                turn_res = self._apply_outer_turn_guards(
+                    key=k,
+                    result=turn_res,
+                    round_no=round_no,
+                    round_packet_hash_seen=round_packet_hash_seen,
+                    authoritative_packet_hash=authoritative_packet_hash,
+                )
                 ok = turn_res.ok
                 reply_text = turn_res.public_text
-                pkt_ok, pkt_expected = self._check_round_packet_hash_consistency(
-                    round_packet_hash_seen, k, authoritative_packet_hash
-                )
-                if not pkt_ok:
-                    self.state.add_system(f"广播包不一致告警：{k} 收到异常 packet_hash，已隔离本轮输出。")
-                    _trace_turn(
-                        k,
-                        "ERROR(packet_hash_mismatch)",
-                        (
-                            f"round_no={round_no} turn_id_hint={getattr(self._last_turn_ctx_by_model.get(k), 'turn_id', 0)} "
-                            f"expected={pkt_expected} got={authoritative_packet_hash}"
-                        ),
-                    )
-                    try:
-                        self._finalize_receipt_for_model(k, status=ReceiptStatus.REJECT, reason=RejectReason.PARSE_FAIL)
-                    except Exception:
-                        pass
-                    continue
                 def _finalize_turn_receipt_local(
                     status: ReceiptStatus,
                     reason: Optional[RejectReason] = None,
@@ -6525,7 +6561,11 @@ class Worker:
                                 # 继续探测其他旁听者：允许同一回合多个模型依次加入。
                                 continue
                 else:
-                    _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.PARSE_FAIL)
+                    _finalize_turn_receipt_local(
+                        ReceiptStatus.REJECT,
+                        self._reject_reason_from_turn_result(turn_res),
+                        note=(turn_res.error_type.value if turn_res.error_type else (turn_res.error_msg or "")),
+                    )
                 core.jitter("模型轮转间隔")
 
             if round_interrupted_by_host:
