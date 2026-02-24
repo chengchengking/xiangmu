@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from typing import Callable
 
@@ -8,6 +9,9 @@ from .turn_result import TurnErrorType, TurnResult, TurnResultStatus
 
 
 GuardFn = Callable[[TurnResult], TurnResult]
+
+_PACKET_HASH_RE = re.compile(r"^[0-9a-f]{12}$")
+_ACK_TOKEN_RE = re.compile(r"^(?:\d+|watermark:\d+)$", re.I)
 
 
 def apply_turn_guards(result: TurnResult, *guards: GuardFn) -> TurnResult:
@@ -57,3 +61,17 @@ def map_turn_error_to_reject_reason(error_type: TurnErrorType | None) -> RejectR
             return RejectReason.PARSE_FAIL
         case _:
             return RejectReason.PARSE_FAIL
+
+
+def is_valid_packet_hash_token(v: str | None) -> bool:
+    t = (v or "").strip().lower()
+    if not t:
+        return True
+    return bool(_PACKET_HASH_RE.fullmatch(t))
+
+
+def is_valid_ack_token(v: str | None) -> bool:
+    t = (v or "").strip()
+    if not t:
+        return True
+    return bool(_ACK_TOKEN_RE.fullmatch(t))

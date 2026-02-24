@@ -3,6 +3,8 @@ import unittest
 from orchestrator.guards import (
     apply_turn_guards,
     error_like,
+    is_valid_ack_token,
+    is_valid_packet_hash_token,
     map_turn_error_to_reject_reason,
     pass_like,
 )
@@ -41,6 +43,15 @@ class TurnGuardTests(unittest.TestCase):
         self.assertEqual(map_turn_error_to_reject_reason(TurnErrorType.EVIDENCE_INVALID), RejectReason.LOW_VALUE)
         self.assertEqual(map_turn_error_to_reject_reason(TurnErrorType.PARSE_FAIL), RejectReason.PARSE_FAIL)
         self.assertEqual(map_turn_error_to_reject_reason(None), RejectReason.PARSE_FAIL)
+
+    def test_protocol_meta_token_validators(self):
+        self.assertTrue(is_valid_packet_hash_token("abcdef012345"))
+        self.assertFalse(is_valid_packet_hash_token("abc"))
+        self.assertFalse(is_valid_packet_hash_token("zzzzzzzzzzzz"))
+        self.assertTrue(is_valid_ack_token("123"))
+        self.assertTrue(is_valid_ack_token("watermark:123"))
+        self.assertFalse(is_valid_ack_token("watermark:x"))
+        self.assertFalse(is_valid_ack_token("1,2,3"))
 
 
 if __name__ == "__main__":

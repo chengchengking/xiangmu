@@ -54,6 +54,8 @@ from orchestrator import (
     TurnResult,
     apply_turn_guards,
     error_like,
+    is_valid_ack_token,
+    is_valid_packet_hash_token,
     map_turn_error_to_reject_reason,
 )
 from orchestrator.evidence import has_valid_evidence_hook, should_enter_evidence
@@ -5898,6 +5900,22 @@ class Worker:
         enable_packet_hash: bool = True,
         enable_leak: bool = True,
     ) -> TurnResult:
+        def _guard_meta_tokens(r: TurnResult) -> TurnResult:
+            meta = r.meta or {}
+            pkt = core.normalize_text(str(meta.get("packet_hash") or ""))
+            ack = core.normalize_text(str(meta.get("ack") or meta.get("ack_out") or ""))
+            ack_in = core.normalize_text(str(meta.get("ack_in") or ""))
+            if not is_valid_packet_hash_token(pkt):
+                _trace_turn(key, "ERROR(protocol_meta_invalid)", f"bad packet_hash={pkt!r} meta={meta}")
+                return error_like(r, error_type=TurnErrorType.PARSE_FAIL, error_msg="invalid_meta_packet_hash")
+            if not is_valid_ack_token(ack):
+                _trace_turn(key, "ERROR(protocol_meta_invalid)", f"bad ack/ack_out={ack!r} meta={meta}")
+                return error_like(r, error_type=TurnErrorType.PARSE_FAIL, error_msg="invalid_meta_ack")
+            if not is_valid_ack_token(ack_in):
+                _trace_turn(key, "ERROR(protocol_meta_invalid)", f"bad ack_in={ack_in!r} meta={meta}")
+                return error_like(r, error_type=TurnErrorType.PARSE_FAIL, error_msg="invalid_meta_ack_in")
+            return r
+
         def _guard_packet_hash(r: TurnResult) -> TurnResult:
             pkt_ok, pkt_expected = self._check_round_packet_hash_consistency(
                 round_packet_hash_seen, key, r.packet_hash or authoritative_packet_hash
@@ -5922,6 +5940,7 @@ class Worker:
             return r
 
         guard_fns = []
+        guard_fns.append(_guard_meta_tokens)
         if enable_packet_hash:
             guard_fns.append(_guard_packet_hash)
         if enable_leak:
