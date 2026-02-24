@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import ast
+import atexit
 import hashlib
 import json
 import os
@@ -4335,6 +4336,7 @@ class Worker:
         self._turn_seq = 0
         self._last_receipt_by_model: dict[str, Receipt] = {}
         self._last_turn_ctx_by_model: dict[str, TurnContext] = {}
+        self._atexit_registered = False
 
     def _control_plane_header_for_model(self, model_key: str) -> str:
         r = self._last_receipt_by_model.get((model_key or "").strip().lower())
@@ -4400,7 +4402,31 @@ class Worker:
         return str(max(pub_ids)) if pub_ids else "0"
 
     def start(self) -> None:
+        if not self._atexit_registered:
+            try:
+                atexit.register(self._cleanup_playwright_best_effort)
+                self._atexit_registered = True
+            except Exception:
+                pass
         self._thread.start()
+
+    def _cleanup_playwright_best_effort(self) -> None:
+        try:
+            for ad in list(self._adapters.values()):
+                try:
+                    ad.close()
+                except Exception:
+                    pass
+            self._adapters.clear()
+        except Exception:
+            pass
+        try:
+            if self._sp is not None:
+                self._sp.stop()
+        except Exception:
+            pass
+        self._sp = None
+        self._pw = None
 
     def _ensure_playwright(self) -> None:
         if self._sp is not None and self._pw is not None:
@@ -4499,17 +4525,8 @@ class Worker:
         # cleanup
         try:
             self.state.set_status("stopping")
-            for ad in list(self._adapters.values()):
-                ad.close()
-            self._adapters.clear()
+            self._cleanup_playwright_best_effort()
         finally:
-            try:
-                if self._sp is not None:
-                    self._sp.stop()
-            except Exception:
-                pass
-            self._sp = None
-            self._pw = None
             self.state.set_status("stopped")
 
     def _handle_login_open(self, action: dict[str, Any]) -> None:
@@ -4533,6 +4550,52 @@ class Worker:
             self._ensure_deepseek_dialog(page)
         ad.bring_to_front()
         self.state.set_status("idle")
+
+    def _repair_adapter_surface(self, key: str, ad: ModelAdapter, *, level: int = 1) -> bool:
+        """
+        Best-effort page recovery ladder:
+        level 1 -> reload current page
+        level 2 -> close tab and recreate one inside existing context
+        """
+        try:
+            self._ensure_playwright()
+        except Exception:
+            return False
+        try:
+            page = ad.ensure_page(self._pw)
+        except Exception:
+            return False
+        if level <= 1:
+            try:
+                page.reload(wait_until="domcontentloaded")
+                time.sleep(0.6)
+                return True
+            except Exception:
+                return False
+        # Level 2 hard reset: rebuild tab inside current context
+        try:
+            ctx = getattr(ad, "context", None)
+            old_page = getattr(ad, "page", None)
+            if old_page is not None:
+                try:
+                    old_page.close()
+                except Exception:
+                    pass
+            if ctx is not None:
+                try:
+                    new_page = ctx.new_page()
+                    ad.page = new_page
+                    try:
+                        new_page.goto(ad.meta.url, wait_until="domcontentloaded")
+                    except Exception:
+                        pass
+                    time.sleep(0.8)
+                    return True
+                except Exception:
+                    return False
+        except Exception:
+            return False
+        return False
         self._safe_reply(action, {"ok": True})
 
     def _handle_login_check(self, action: dict[str, Any]) -> None:
@@ -4589,10 +4652,8 @@ class Worker:
         self.state.set_model_runtime_state(key, "INITIALIZING", reason="manual_recover")
         page = ad.ensure_page(self._pw)
         try:
-            try:
-                page.reload(wait_until="domcontentloaded")
-            except Exception:
-                pass
+            if not self._repair_adapter_surface(key, ad, level=1):
+                self._repair_adapter_surface(key, ad, level=2)
             ok = bool(ad.is_authenticated_now())
             self.state.set_authenticated(key, ok)
             if ok:
@@ -4948,11 +5009,8 @@ class Worker:
             try:
                 self._ensure_playwright()
                 assert self._pw is not None
-                page_probe = ad.ensure_page(self._pw)
-                try:
-                    page_probe.reload(wait_until="domcontentloaded")
-                except Exception:
-                    pass
+                if not self._repair_adapter_surface(key, ad, level=1):
+                    self._repair_adapter_surface(key, ad, level=2)
                 probe_ok = False
                 try:
                     probe_ok = bool(ad.is_authenticated_now())
