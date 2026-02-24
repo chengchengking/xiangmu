@@ -3715,6 +3715,13 @@ def _looks_prompt_leak_reply(text: str) -> bool:
         )
     ):
         return True
+    if re.match(
+        r"^\s*(?:正在阅读|阅读中|读取中|正在加载|加载中)"
+        r"(?:\s*(?:正在阅读|阅读中|读取中|正在加载|加载中))*\s*$",
+        t,
+        re.I,
+    ):
+        return True
     if re.search(r"(按(?:照)?格式(?:来)?|格式已遵守|然后按格式写)\s*(?:META|PUBLIC_REPLY|PRIVATE_REPLY)?", t, re.I):
         return True
     # Task-planning / pre-action lines are not valid public chat replies.
