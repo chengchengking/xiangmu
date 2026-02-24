@@ -4448,6 +4448,26 @@ class Worker:
             return "selector_miss"
         return "unknown"
 
+    @staticmethod
+    def _runtime_gate_decision(
+        runtime_state: str,
+        cooldown_until: float,
+        *,
+        now_ts: Optional[float] = None,
+    ) -> str:
+        st = (runtime_state or "INIT").strip().upper()
+        now_v = float(time.time() if now_ts is None else now_ts)
+        cd = float(cooldown_until or 0.0)
+        if st in {"NEEDS_HUMAN", "CAPTCHA_BLOCKED"}:
+            return "BLOCK_HUMAN"
+        if st == "DEAD":
+            return "BLOCK_DEAD"
+        if st == "COOLING_DOWN":
+            if cd > now_v:
+                return "SKIP_COOLDOWN"
+            return "HALF_OPEN"
+        return "ALLOW"
+
     def _run(self) -> None:
         while not self.state.should_stop():
             try:
@@ -4907,6 +4927,52 @@ class Worker:
         if ad is None:
             self.state.add_system(f"适配器缺失: {m.name}")
             return _tr_error(TurnErrorType.ADAPTER_MISSING, msg="adapter missing")
+
+        rt_box = self.state.get_model_runtime_state(key)
+        rt_state = str((rt_box or {}).get("state") or "INIT")
+        rt_cooldown_remaining = float((rt_box or {}).get("cooldown_remaining_s") or 0.0)
+        rt_decision = self._runtime_gate_decision(
+            rt_state,
+            time.time() + rt_cooldown_remaining if rt_cooldown_remaining > 0 else 0.0,
+        )
+        if rt_decision == "BLOCK_HUMAN":
+            self.state.add_system(f"{m.name} 当前需要人工介入（验证码/风控/登录），请处理后点击恢复。")
+            return _tr_error(TurnErrorType.PROVIDER_ERROR, msg=f"runtime blocked: {rt_state}")
+        if rt_decision == "BLOCK_DEAD":
+            self.state.add_system(f"{m.name} 当前处于不可用状态（DEAD），请点击恢复或重新登录。")
+            return _tr_error(TurnErrorType.PROVIDER_ERROR, msg="runtime blocked: DEAD")
+        if rt_decision == "SKIP_COOLDOWN":
+            return _tr_error(TurnErrorType.TIMEOUT, msg=f"runtime cooling_down:{rt_cooldown_remaining:.1f}s")
+        if rt_decision == "HALF_OPEN":
+            self.state.set_model_runtime_state(key, "INITIALIZING", reason="cooldown_half_open_probe")
+            try:
+                self._ensure_playwright()
+                assert self._pw is not None
+                page_probe = ad.ensure_page(self._pw)
+                try:
+                    page_probe.reload(wait_until="domcontentloaded")
+                except Exception:
+                    pass
+                probe_ok = False
+                try:
+                    probe_ok = bool(ad.is_authenticated_now())
+                except Exception:
+                    probe_ok = False
+                if probe_ok:
+                    self.state.set_model_runtime_state(key, "IDLE", reason="cooldown_half_open_ok", reset_fail=True)
+                else:
+                    self.state.set_model_runtime_state(key, "NEEDS_HUMAN", reason="cooldown_half_open_auth_failed", fail_delta=1)
+                    return _tr_error(TurnErrorType.PROVIDER_ERROR, msg="half_open probe requires human")
+            except Exception as exc:
+                cls = self._classify_worker_failure(exc)
+                if cls == "captcha":
+                    self.state.set_model_runtime_state(key, "NEEDS_HUMAN", reason=f"half_open:{cls}", fail_delta=1)
+                else:
+                    self.state.set_model_runtime_state(key, "COOLING_DOWN", reason=f"half_open:{cls}", fail_delta=1, cooldown_s=45)
+                return _tr_error(
+                    TurnErrorType.TIMEOUT if cls == "timeout" else TurnErrorType.PARSE_FAIL,
+                    msg=f"half_open probe failed:{cls}",
+                )
 
         try:
             turn_start = time.time()

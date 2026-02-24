@@ -38,7 +38,14 @@ class WorkerStateTransitionTests(unittest.TestCase):
         self.assertEqual(webui.Worker._classify_worker_failure("timed out waiting"), "timeout")
         self.assertEqual(webui.Worker._classify_worker_failure("locator not found"), "selector_miss")
 
+    def test_runtime_gate_decision(self):
+        now = 100.0
+        self.assertEqual(webui.Worker._runtime_gate_decision("NEEDS_HUMAN", 0, now_ts=now), "BLOCK_HUMAN")
+        self.assertEqual(webui.Worker._runtime_gate_decision("DEAD", 0, now_ts=now), "BLOCK_DEAD")
+        self.assertEqual(webui.Worker._runtime_gate_decision("COOLING_DOWN", 120, now_ts=now), "SKIP_COOLDOWN")
+        self.assertEqual(webui.Worker._runtime_gate_decision("COOLING_DOWN", 90, now_ts=now), "HALF_OPEN")
+        self.assertEqual(webui.Worker._runtime_gate_decision("IDLE", 0, now_ts=now), "ALLOW")
+
 
 if __name__ == "__main__":
     unittest.main()
-
