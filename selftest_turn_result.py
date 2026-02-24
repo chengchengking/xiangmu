@@ -30,7 +30,12 @@ class TurnResultTests(unittest.TestCase):
         self.assertEqual(r.error_type, TurnErrorType.TIMEOUT)
         self.assertEqual(r.as_legacy_tuple(), (False, ""))
 
+    def test_iter_supports_legacy_unpacking(self):
+        r = TurnResult.pass_(adapter_name="Qwen", model_key="qwen")
+        ok, text = r
+        self.assertTrue(ok)
+        self.assertEqual(text, "[PASS]")
+
 
 if __name__ == "__main__":
     unittest.main()
-

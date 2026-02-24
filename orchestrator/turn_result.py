@@ -55,6 +55,11 @@ class TurnResult:
     def as_legacy_tuple(self) -> tuple[bool, str]:
         return self.ok, self.public_text
 
+    def __iter__(self):
+        ok, text = self.as_legacy_tuple()
+        yield ok
+        yield text
+
     @classmethod
     def success(
         cls,
@@ -152,4 +157,3 @@ class TurnResult:
             error_msg=error_msg or None,
             meta=meta or {},
         )
-

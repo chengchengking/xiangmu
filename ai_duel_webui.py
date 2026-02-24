@@ -46,7 +46,7 @@ from model_adapters import (
     QwenAdapter,
     default_avatar_svg,
 )
-from orchestrator import Mode, TurnContext
+from orchestrator import Mode, TurnContext, TurnErrorType, TurnResult
 from orchestrator.evidence import has_valid_evidence_hook, should_enter_evidence
 from orchestrator.receipt import Receipt, ReceiptStatus, RejectReason
 from protocol import parse_envelope
@@ -4677,19 +4677,78 @@ class Worker:
         authoritative_packet_hash: str = "",
         ack_in: str = "",
         reply_to_mid: str = "",
-    ) -> tuple[bool, str]:
+    ) -> TurnResult:
         m = self.state.get_model(key)
+        adapter_name = (m.name if m else key) or key
+        ctx: Optional[TurnContext] = None
+
+        def _tr_success(public_text: str, *, raw_reply: str = "", private_text: str = "", envelope_status: str = "", meta: Optional[dict[str, str]] = None, elapsed_s: Optional[float] = None) -> TurnResult:
+            metrics = {}
+            if elapsed_s is not None:
+                metrics["duration_s"] = float(elapsed_s)
+            return TurnResult.success(
+                adapter_name=adapter_name,
+                model_key=key,
+                parsed_content=public_text,
+                raw_reply=raw_reply,
+                private_content=private_text,
+                turn_id=(ctx.turn_id if ctx else 0),
+                mode=(ctx.mode.value if ctx else ""),
+                packet_hash=authoritative_packet_hash or "",
+                envelope_status=envelope_status,
+                metrics=metrics,
+                meta=meta or {},
+            )
+
+        def _tr_pass(*, reason: str = "", raw_reply: str = "", private_text: str = "", envelope_status: str = "", meta: Optional[dict[str, str]] = None, elapsed_s: Optional[float] = None) -> TurnResult:
+            metrics = {}
+            if elapsed_s is not None:
+                metrics["duration_s"] = float(elapsed_s)
+            return TurnResult.pass_(
+                adapter_name=adapter_name,
+                model_key=key,
+                reason=reason,
+                raw_reply=raw_reply,
+                private_content=private_text,
+                turn_id=(ctx.turn_id if ctx else 0),
+                mode=(ctx.mode.value if ctx else ""),
+                packet_hash=authoritative_packet_hash or "",
+                envelope_status=envelope_status,
+                metrics=metrics,
+                meta=meta or {},
+            )
+
+        def _tr_error(error_type: TurnErrorType, *, msg: str = "", raw_reply: str = "", parsed: str = "", private_text: str = "", envelope_status: str = "", meta: Optional[dict[str, str]] = None, elapsed_s: Optional[float] = None) -> TurnResult:
+            metrics = {}
+            if elapsed_s is not None:
+                metrics["duration_s"] = float(elapsed_s)
+            return TurnResult.error(
+                adapter_name=adapter_name,
+                model_key=key,
+                error_type=error_type,
+                error_msg=msg,
+                raw_reply=raw_reply,
+                parsed_content=parsed,
+                private_content=private_text,
+                turn_id=(ctx.turn_id if ctx else 0),
+                mode=(ctx.mode.value if ctx else ""),
+                packet_hash=authoritative_packet_hash or "",
+                envelope_status=envelope_status,
+                metrics=metrics,
+                meta=meta or {},
+            )
+
         if not m or not m.integrated:
             self.state.add_system(f"目标模型不可用: {key}")
-            return False, ""
+            return _tr_error(TurnErrorType.MODEL_UNAVAILABLE, msg="model unavailable")
         if not m.authenticated:
             self.state.add_system(f"{m.name} 未登录：请先点模型 -> 打开登录窗口 -> 重新检测")
-            return False, ""
+            return _tr_error(TurnErrorType.NOT_AUTHENTICATED, msg="not authenticated")
 
         ad = self._get_adapter(key)
         if ad is None:
             self.state.add_system(f"适配器缺失: {m.name}")
-            return False, ""
+            return _tr_error(TurnErrorType.ADAPTER_MISSING, msg="adapter missing")
 
         try:
             turn_start = time.time()
@@ -4728,7 +4787,7 @@ class Worker:
             prompt = self._compose_turn_input(instruction, hidden_reply_hint=hidden_reply_hint)
             if not prompt:
                 self.state.add_system(f"{m.name} 本轮跳过：空指令")
-                return False, ""
+                return _tr_error(TurnErrorType.EMPTY_INSTRUCTION, msg="empty instruction")
             if authoritative_packet_text:
                 prompt = f"{authoritative_packet_text}\n\n{prompt}".strip()
                 _trace_turn(
@@ -4874,7 +4933,7 @@ class Worker:
                         reply = retry_empty
                     else:
                         _trace_turn(key, "pass(empty)", "")
-                        return True, "[PASS]"
+                        return _tr_pass(reason="empty")
                 reply = "（未能提取到回复，可能仍在生成中或页面结构变化）"
 
             env = parse_envelope(reply)
@@ -4890,7 +4949,7 @@ class Worker:
                             f"expected={authoritative_packet_hash} got={meta_packet_hash}"
                         ),
                     )
-                    return True, "[PASS]"
+                    return _tr_pass(reason="packet_hash_mismatch_meta", raw_reply=reply, envelope_status=env.status, meta=env.meta)
                 public_reply = env.public
                 private_reply = env.private
                 _trace_turn(
@@ -5010,7 +5069,13 @@ class Worker:
                             sanitized_public = strict_token
                     if not sanitized_public:
                         _trace_turn(key, "pass(prompt_echo)", public_reply)
-                        return True, "[PASS]"
+                        return _tr_pass(
+                            reason="prompt_echo",
+                            raw_reply=reply,
+                            private_text=private_reply,
+                            envelope_status=(env.status if "env" in locals() else ""),
+                            meta=(env.meta if "env" in locals() else None),
+                        )
             if key == "gemini":
                 # Gemini occasionally appends nav/suggestion tails in one block.
                 # Apply the same sanitizer pass before final checks.
@@ -5040,7 +5105,13 @@ class Worker:
                                 private_reply = _strip_leading_status_noise(core.normalize_text(rg_pri))
                     if _looks_prompt_leak_reply(public_reply):
                         _trace_turn(key, "pass(gemini_prompt_echo)", public_reply)
-                        return True, "[PASS]"
+                        return _tr_pass(
+                            reason="gemini_prompt_echo",
+                            raw_reply=reply,
+                            private_text=private_reply,
+                            envelope_status=(env.status if "env" in locals() else ""),
+                            meta=(env.meta if "env" in locals() else None),
+                        )
             public_reply = _strip_group_chatter_boilerplate(public_reply) or public_reply
             public_reply = _strip_leading_status_noise(public_reply) or public_reply
             public_reply = _dedupe_public_reply(public_reply) or public_reply
@@ -5053,7 +5124,15 @@ class Worker:
             if _looks_provider_error_reply(public_reply):
                 self.state.add_system(f"{m.name} 本轮失败：网页端返回错误提示")
                 _trace_turn(key, "provider_error", public_reply)
-                return False, ""
+                return _tr_error(
+                    TurnErrorType.PROVIDER_ERROR,
+                    msg="provider error reply",
+                    raw_reply=reply,
+                    parsed=public_reply,
+                    private_text=private_reply,
+                    envelope_status=(env.status if "env" in locals() else ""),
+                    meta=(env.meta if "env" in locals() else None),
+                )
             if key == "qwen" and _QWEN_STATUS_ONLY_PAT.match(public_reply or ""):
                 # Qwen occasionally exposes "已完成思考/已经完成" status pills as text.
                 # Retry once for final answer block before giving up.
@@ -5112,7 +5191,13 @@ class Worker:
             if not core.normalize_text(public_reply):
                 if visibility == "public" and not record_reply:
                     _trace_turn(key, "pass(empty_public)", "")
-                    return True, "[PASS]"
+                    return _tr_pass(
+                        reason="empty_public",
+                        raw_reply=reply,
+                        private_text=private_reply,
+                        envelope_status=(env.status if "env" in locals() else ""),
+                        meta=(env.meta if "env" in locals() else None),
+                    )
                 public_reply = "（未能提取到有效回复）"
             if key in {"qwen", "gemini"} and visibility == "public" and not record_reply:
                 if _looks_stale_extracted_reply(public_reply, before, before_last_reply=before_last_reply):
@@ -5161,43 +5246,57 @@ class Worker:
                                         private_reply = _strip_leading_status_noise(core.normalize_text(g_pri))
                     if _looks_stale_extracted_reply(public_reply, before, before_last_reply=before_last_reply):
                         _trace_turn(key, "pass(stale_snapshot)", public_reply)
-                        return True, "[PASS]"
+                        return _tr_pass(
+                            reason="stale_snapshot",
+                            raw_reply=reply,
+                            private_text=private_reply,
+                            envelope_status=(env.status if "env" in locals() else ""),
+                            meta=(env.meta if "env" in locals() else None),
+                        )
             if key in {"doubao", "qwen"} and visibility == "public" and not record_reply:
                 if _looks_unfinished_public_reply(public_reply):
                     _trace_turn(key, "pass(unfinished)", public_reply)
-                    return True, "[PASS]"
+                    return _tr_pass(reason="unfinished", raw_reply=reply, private_text=private_reply)
                 if _TRIVIAL_PUBLIC_PAT.match(public_reply):
                     _trace_turn(key, "pass(trivial)", public_reply)
-                    return True, "[PASS]"
+                    return _tr_pass(reason="trivial", raw_reply=reply, private_text=private_reply)
                 if _looks_like_suggestion_chip_reply(public_reply):
                     _trace_turn(key, "pass(chip_reply)", public_reply)
-                    return True, "[PASS]"
+                    return _tr_pass(reason="chip_reply", raw_reply=reply, private_text=private_reply)
                 compact_len = len(_line_dedupe_key(public_reply))
                 if compact_len < 4:
                     _trace_turn(key, "pass(short)", public_reply)
-                    return True, "[PASS]"
+                    return _tr_pass(reason="short", raw_reply=reply, private_text=private_reply)
                 if key in {"doubao", "qwen"}:
                     min_klen = 12 if key == "doubao" else 10
                     if compact_len >= min_klen and _is_near_duplicate_reply(public_reply, recent_self):
                         _trace_turn(key, "pass(near_duplicate)", public_reply)
-                        return True, "[PASS]"
+                        return _tr_pass(reason="near_duplicate", raw_reply=reply, private_text=private_reply)
                 cur_key = _line_dedupe_key(public_reply)
                 if cur_key and len(cur_key) >= 14:
                     for old in recent_self:
                         if cur_key == _line_dedupe_key(old):
                             # In group mode, duplicated old text is usually stale extraction; skip this turn.
                             _trace_turn(key, "pass(history_duplicate)", public_reply)
-                            return True, "[PASS]"
+                            return _tr_pass(reason="history_duplicate", raw_reply=reply, private_text=private_reply)
             if visibility == "public" and not record_reply and _looks_protocol_placeholder_public_reply(public_reply):
                 _trace_turn(key, "pass(protocol_placeholder)", public_reply)
-                return True, "[PASS]"
+                return _tr_pass(reason="protocol_placeholder", raw_reply=reply, private_text=private_reply)
             if key == "qwen" and re.search(
                 r"(internal server error|连接到[^\\n]{0,40}出现问题|网络错误|请求失败|暂时不可用)",
                 public_reply,
                 re.I,
             ):
                 self.state.add_system(f"{m.name} 本轮失败：{_clip_text(public_reply, 140)}")
-                return False, ""
+                return _tr_error(
+                    TurnErrorType.PROVIDER_ERROR,
+                    msg="qwen provider error",
+                    raw_reply=reply,
+                    parsed=public_reply,
+                    private_text=private_reply,
+                    envelope_status=(env.status if "env" in locals() else ""),
+                    meta=(env.meta if "env" in locals() else None),
+                )
             if visibility == "public":
                 public_reply = _compact_public_reply(
                     public_reply,
@@ -5263,7 +5362,14 @@ class Worker:
                 f"turn_id={ctx.turn_id} mode={ctx.mode.value}\n{public_reply}",
                 elapsed_s=(time.time() - turn_start),
             )
-            return True, public_reply
+            return _tr_success(
+                public_reply,
+                raw_reply=reply,
+                private_text=private_reply,
+                envelope_status=(env.status if "env" in locals() else ""),
+                meta=(env.meta if "env" in locals() else None),
+                elapsed_s=(time.time() - turn_start),
+            )
         except Exception as exc:
             self.state.add_system(f"{m.name} 本轮失败：{exc}")
             try:
@@ -5281,7 +5387,8 @@ class Worker:
                         )
             except Exception:
                 pass
-            return False, ""
+            et = TurnErrorType.TIMEOUT if "timeout" in str(exc).lower() else TurnErrorType.PARSE_FAIL
+            return _tr_error(et, msg=str(exc))
 
     def _extract_target_keys_from_text(self, text: str, candidates: list[str]) -> list[str]:
         raw = core.normalize_text(text).lower()
