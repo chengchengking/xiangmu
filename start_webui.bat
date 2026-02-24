@@ -41,10 +41,13 @@ set "OUT_LOG=%TMPDIR%\webui.out.log"
 set "ERR_LOG=%TMPDIR%\webui.err.log"
 
 if not exist "%TMPDIR%" mkdir "%TMPDIR%" >nul 2>nul
+del /q "%TMPDIR%\ai_duel_webui_recovered.py" >nul 2>nul
 
 echo [INFO] Performing clean restart (stop old backend first)...
 call "%~dp0stop_webui.bat" >nul 2>nul
 powershell -NoProfile -Command "Start-Sleep -Milliseconds 700" >nul 2>nul
+rem Extra guard: if stop script missed a stale listener, kill it here to avoid opening an old UI.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try{ $pids=Get-NetTCPConnection -LocalPort %PORT% -State Listen | Select-Object -ExpandProperty OwningProcess -Unique; foreach($p in $pids){ if($p){ try{ Stop-Process -Id $p -Force -ErrorAction SilentlyContinue }catch{} } } }catch{}" >nul 2>nul
 
 echo [INFO] Starting WebUI backend (detached)...
 echo [INFO] Logs: %OUT_LOG% and %ERR_LOG%

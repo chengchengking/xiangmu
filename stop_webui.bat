@@ -13,8 +13,10 @@ chcp 65001 >nul
 set "PORT=8765"
 set "PID_FILE=%cd%\.tmp\webui.pid"
 set "TMP_RES=%TEMP%\_webui_stop_result.txt"
+set "TMPDIR=%cd%\.tmp"
 
 del /q "%TMP_RES%" >nul 2>nul
+if exist "%TMPDIR%\ai_duel_webui_recovered.py" del /q "%TMPDIR%\ai_duel_webui_recovered.py" >nul 2>nul
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference='SilentlyContinue';" ^
@@ -38,4 +40,3 @@ if /I "%RES%"=="KILLED" (
   echo [INFO] No running WebUI backend found.
 )
 exit /b 0
-

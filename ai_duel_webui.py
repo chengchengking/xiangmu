@@ -6481,6 +6481,26 @@ class Worker:
                 self.state.add_system("没有已启用模型：请先在左侧启用至少 1 个模型。")
                 self._safe_reply(action, {"ok": False, "error": "no_selected_models"})
                 return
+            # 用户经常会“已勾选但未登录”，这里单独提示，避免误以为程序坏了。
+            authed_selected = []
+            for k in keys:
+                m0 = self.state.get_model(k)
+                if m0 and bool(getattr(m0, "authenticated", False)):
+                    authed_selected.append(k)
+            if not authed_selected:
+                selected_names = []
+                for k in keys:
+                    try:
+                        mm = MODEL_METAS.get(k)
+                        selected_names.append(mm.name if mm else k)
+                    except Exception:
+                        selected_names.append(k)
+                joined = " / ".join(selected_names[:5]) if selected_names else "（未知）"
+                self.state.add_system(
+                    f"已启用但未检测到登录成功：{joined}。请先在左侧打开登录窗口并完成登录，再点【我已登录，重新检测】或 ↻ 恢复。"
+                )
+                self._safe_reply(action, {"ok": False, "error": "selected_but_not_authenticated"})
+                return
             visibility = "public"
             thread_key: Optional[str] = None
             self.state.clear_round_stop()
