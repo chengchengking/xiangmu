@@ -15,7 +15,14 @@ class PublicLeakGuardTests(unittest.TestCase):
         sample = "I think the answer is 444 because 37*12 = 444, and the arithmetic is direct."
         self.assertFalse(webui._looks_prompt_leak_reply(sample))
 
+    def test_format_parrot_is_detected_as_prompt_leak(self):
+        sample = "然后按格式写 META，PUBLIC_REPLY。"
+        self.assertTrue(webui._looks_prompt_leak_reply(sample))
+
+    def test_machine_placeholder_token_is_rejected(self):
+        sample = "<<WRITE_PUBLIC_OR_[PASS]>>"
+        self.assertTrue(webui._looks_protocol_placeholder_public_reply(sample))
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -107,7 +107,7 @@ def _protocol_wrap_instruction_suffix(
         f"{(f'packet_hash={packet_hash}\n') if packet_hash else ''}"
         "[[/META]]\n"
         "[[PUBLIC_REPLY]]\n"
-        "这里写公开发言；若不发言写 [PASS]\n"
+        f"{_PUBLIC_PLACEHOLDER_TOKEN}\n"
         "[[/PUBLIC_REPLY]]\n"
         f"{private_line}"
     )
@@ -3390,6 +3390,7 @@ _PUBLIC_WRAP_OPEN = "[[PUBLIC_REPLY]]"
 _PUBLIC_WRAP_CLOSE = "[[/PUBLIC_REPLY]]"
 _PRIVATE_WRAP_OPEN = "[[PRIVATE_REPLY]]"
 _PRIVATE_WRAP_CLOSE = "[[/PRIVATE_REPLY]]"
+_PUBLIC_PLACEHOLDER_TOKEN = "<<WRITE_PUBLIC_OR_[PASS]>>"
 # Qwen / Doubao are prone to echoing format instructions.
 # Keep wrapper parsing support for backward compatibility, but default to no wrapper hinting.
 _USE_WRAP_HINT_FOR_CN_MODELS = False
@@ -3701,7 +3702,20 @@ def _looks_prompt_leak_reply(text: str) -> bool:
     t = core.normalize_text(text)
     if not t:
         return True
-    if any(tok in t for tok in ("[[META]]", "[[/META]]", "ack_in=", "packet_hash=", "evidence_hook=")):
+    if any(
+        tok in t
+        for tok in (
+            "[[META]]",
+            "[[/META]]",
+            "ack_in=",
+            "packet_hash=",
+            "evidence_hook=",
+            "PUBLIC_REPLY",
+            "PRIVATE_REPLY",
+        )
+    ):
+        return True
+    if re.search(r"(按(?:照)?格式(?:来)?|格式已遵守|然后按格式写)\s*(?:META|PUBLIC_REPLY|PRIVATE_REPLY)?", t, re.I):
         return True
     # Hard prompt/broadcast markers: if any of these appear, treat as leaked prompt text.
     if re.search(
@@ -4230,7 +4244,11 @@ def _looks_protocol_placeholder_public_reply(text: str) -> bool:
     if not k:
         return False
     # Reject placeholder body copied from the protocol template.
-    if re.search(r"(这里写公开发言|若不发言写\s*\[?\s*PASS\s*\]?|在此填写公开回复)", t, re.I):
+    if re.search(
+        r"(这里写公开发言|若不发言写\s*\[?\s*PASS\s*\]?|在此填写公开回复|WRITE_PUBLIC_OR_)",
+        t,
+        re.I,
+    ):
         return True
     if re.search(r"(公开发言放在|请把公开发言放在).{0,40}(之间|PUBLIC_REPLY)", t, re.I):
         return True
