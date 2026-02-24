@@ -939,6 +939,55 @@ HTML_PAGE = r"""<!doctype html>
       }
       .modelBtn.on .nudgeBtn { display: grid; }
       .nudgeBtn:hover { background: rgba(0,0,0,0.28); }
+      .recoverBtn {
+        position: absolute;
+        right: 6px;
+        top: 6px;
+        width: 22px;
+        height: 22px;
+        border-radius: 9px;
+        border: 1px solid rgba(255,255,255,0.18);
+        background: rgba(127,29,29,0.30);
+        color: rgba(255,255,255,0.96);
+        display: none;
+        place-items: center;
+        font-size: 12px;
+        cursor: pointer;
+        user-select: none;
+      }
+      .recoverBtn:hover { background: rgba(127,29,29,0.45); }
+      .modelBtn.needs-human .recoverBtn,
+      .modelBtn.cooling .recoverBtn,
+      .modelBtn.stale .recoverBtn { display: grid; }
+      .runtimePill {
+        position: absolute;
+        left: 50%;
+        bottom: -8px;
+        transform: translateX(-50%);
+        min-width: 26px;
+        height: 14px;
+        padding: 0 4px;
+        border-radius: 999px;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        font-size: 9px;
+        font-weight: 900;
+        color: rgba(255,255,255,0.98);
+        border: 1px solid rgba(0,0,0,0.18);
+        background: rgba(30,41,59,0.78);
+        letter-spacing: 0.1px;
+      }
+      .runtimePill.show { display: flex; }
+      .runtimePill.idle { background: rgba(22,163,74,0.88); }
+      .runtimePill.generating { background: rgba(59,130,246,0.90); }
+      .runtimePill.cooling { background: rgba(234,88,12,0.92); }
+      .runtimePill.needs-human { background: rgba(220,38,38,0.92); }
+      .runtimePill.dead { background: rgba(71,85,105,0.94); }
+      .runtimePill.stale { background: rgba(168,85,247,0.92); }
+      .runtimePill.init { background: rgba(14,116,144,0.90); }
+      .modelBtn.needs-human { box-shadow: 0 0 0 3px rgba(239,68,68,0.16), 0 12px 22px rgba(13,43,64,0.20); }
+      .modelBtn.cooling { box-shadow: 0 0 0 3px rgba(249,115,22,0.16), 0 12px 22px rgba(13,43,64,0.20); }
       .badge {
         position: absolute;
         top: -8px;
@@ -1393,6 +1442,7 @@ HTML_PAGE = r"""<!doctype html>
 
         const st = {
           models: [],
+          workerRuntime: {},
           allMessages: [],
           lastId: 0,
           viewTarget: '',
@@ -1422,6 +1472,40 @@ HTML_PAGE = r"""<!doctype html>
             alert('请求失败: ' + e);
             return null;
           }
+        };
+
+        const getRuntimeInfo = (key) => {
+          const wr = st.workerRuntime || {};
+          return wr[String(key || '').toLowerCase()] || null;
+        };
+
+        const runtimeCssClass = (stateName) => {
+          const s = String(stateName || '').toUpperCase();
+          if (!s) return '';
+          if (s === 'IDLE') return 'idle';
+          if (s === 'GENERATING') return 'generating';
+          if (s === 'COOLING_DOWN') return 'cooling';
+          if (s === 'NEEDS_HUMAN' || s === 'CAPTCHA_BLOCKED') return 'needs-human';
+          if (s === 'DEAD') return 'dead';
+          if (s === 'STALE') return 'stale';
+          return 'init';
+        };
+
+        const runtimeShortLabel = (stateName, runtime) => {
+          const s = String(stateName || '').toUpperCase();
+          if (!s) return '';
+          if (s === 'IDLE') return 'OK';
+          if (s === 'GENERATING') return 'RUN';
+          if (s === 'COOLING_DOWN') {
+            const remain = Number(runtime && runtime.cooldown_remaining_s || 0);
+            if (Number.isFinite(remain) && remain > 0) return 'CD' + String(Math.min(99, Math.round(remain)));
+            return 'CD';
+          }
+          if (s === 'NEEDS_HUMAN') return 'HUM';
+          if (s === 'CAPTCHA_BLOCKED') return 'CAP';
+          if (s === 'DEAD') return 'DEAD';
+          if (s === 'STALE') return 'STL';
+          return 'INIT';
         };
 
         const openAuth = (key) => {
@@ -1504,10 +1588,14 @@ HTML_PAGE = r"""<!doctype html>
         const renderModels = () => {
           modelList.innerHTML = '';
           for (const m of st.models) {
+            const rt = getRuntimeInfo(m.key);
+            const rtState = String((rt && rt.state) || '').toUpperCase();
+            const rtCls = runtimeCssClass(rtState);
             const btn = document.createElement('button');
             btn.className = 'modelBtn' + (m.integrated ? (m.selected ? ' on' : ' off') : ' disabled');
             if (m.authenticated) btn.classList.add('authed');
             if (st.viewTarget === m.key) btn.classList.add('active');
+            if (rtCls) btn.classList.add(rtCls);
 
             const num = document.createElement('div');
             num.className = 'modelNum';
@@ -1538,13 +1626,42 @@ HTML_PAGE = r"""<!doctype html>
               await apiPost('/api/models/nudge', { key: m.key });
             });
 
+            const recover = document.createElement('div');
+            recover.className = 'recoverBtn';
+            recover.textContent = '↻';
+            recover.title = '恢复/探活';
+            recover.addEventListener('click', async (ev) => {
+              ev.stopPropagation();
+              const resp = await apiPost('/api/models/recover', { key: m.key });
+              await pollState();
+              await pollModels();
+              rebuildTargets();
+              if (resp && resp.ok && resp.needs_human) openAuth(m.key);
+            });
+
+            const rtPill = document.createElement('div');
+            rtPill.className = 'runtimePill';
+            const rtLabel = runtimeShortLabel(rtState, rt);
+            if (rtLabel) {
+              rtPill.classList.add('show');
+              if (rtCls) rtPill.classList.add(rtCls);
+              rtPill.textContent = rtLabel;
+            }
+
             btn.appendChild(num);
             btn.appendChild(authDot);
             btn.appendChild(lock);
             btn.appendChild(nudge);
+            btn.appendChild(recover);
+            btn.appendChild(rtPill);
 
+            const rtTitle = rt
+              ? ('\\n状态：' + String(rt.state || 'UNKNOWN') + (rt.reason ? ('\\n原因：' + rt.reason) : '')
+                  + ((rt.cooldown_remaining_s || 0) > 0 ? ('\\n冷却剩余：' + String(rt.cooldown_remaining_s) + 's') : '')
+                  + ('\\n失败计数：' + String(rt.fail_count || 0)))
+              : '';
             btn.title = m.integrated
-              ? (m.name + '\\n点击：加入/退出群聊\\n绿点：已登录\\n💬：让TA发言')
+              ? (m.name + '\\n点击：加入/退出群聊\\n绿点：已登录\\n💬：让TA发言\\n↻：恢复/探活' + rtTitle)
               : (m.name + '\\n未接入（锁定）');
 
             btn.addEventListener('click', async () => {
@@ -1673,7 +1790,8 @@ HTML_PAGE = r"""<!doctype html>
         const pollState = async () => {
           const res = await apiGet('/api/state');
           if (!res || !res.ok) return;
-          // Could render status in UI if needed.
+          st.workerRuntime = res.worker_runtime || {};
+          renderModels();
         };
 
         const toUtf8Base64 = (s) => {
