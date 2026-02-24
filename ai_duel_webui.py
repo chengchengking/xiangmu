@@ -6015,8 +6015,8 @@ class Worker:
             self._gemini_need_fresh_chat = True
 
         if target != "group":
-            ok_main, main_reply = self._run_model_turn(keys[0], text, visibility=visibility, hidden_reply_hint=False)
-            if ok_main and main_reply:
+            main_res = self._run_model_turn(keys[0], text, visibility=visibility, hidden_reply_hint=False)
+            if main_res.ok and main_res.public_text:
                 # Freeze peer targets at send-time snapshot to avoid mid-turn toggle races causing wrong sync targets.
                 peers = [k for k in selected_snapshot if k != target]
                 if visibility == "shadow" and not self._should_sync_shadow_to_peers(action_shadow_scope):
@@ -6024,7 +6024,7 @@ class Worker:
                 if peers:
                     sm = self.state.get_model(target)
                     source_name = sm.name if sm else target
-                    payload = _pick_forward_payload(main_reply) or main_reply
+                    payload = _pick_forward_payload(main_res.public_text) or main_res.public_text
                     for peer in peers:
                         # 让每个旁听模型也有同一条“用户消息”，便于后续切换到该模型时上下文完整。
                         self.state.add_message(
@@ -6036,7 +6036,7 @@ class Worker:
                             shadow_scope="shared",
                         )
                         instruction = self._build_shadow_sync_instruction(source_name, text, payload)
-                        self._run_model_turn(peer, instruction, visibility="shadow", hidden_reply_hint=True)
+                        _ = self._run_model_turn(peer, instruction, visibility="shadow", hidden_reply_hint=True)
             self.state.set_status("idle")
             self._safe_reply(action, {"ok": True})
             return
@@ -6315,7 +6315,7 @@ class Worker:
                     turn_timeout_cap += 8
                 if k == "qwen":
                     turn_timeout_cap += 4
-                ok, reply_text = self._run_model_turn(
+                turn_res = self._run_model_turn(
                     k,
                     turn_instruction,
                     visibility="public",
@@ -6325,6 +6325,8 @@ class Worker:
                     authoritative_packet_hash=authoritative_packet_hash,
                     ack_in=authoritative_ack_in,
                 )
+                ok = turn_res.ok
+                reply_text = turn_res.public_text
                 pkt_ok, pkt_expected = self._check_round_packet_hash_consistency(
                     round_packet_hash_seen, k, authoritative_packet_hash
                 )
@@ -6359,9 +6361,9 @@ class Worker:
                     group_pending_ids[k] = [
                         mid for mid in group_pending_ids.get(k, []) if int(mid) not in delivered_set
                     ]
-                turn_has_visible = bool(ok and core.normalize_text(reply_text) and (not self._is_pass_reply(reply_text)))
+                turn_has_visible = bool(turn_res.ok and core.normalize_text(turn_res.public_text) and (not self._is_pass_reply(turn_res.public_text)))
                 any_turn_ok = any_turn_ok or turn_has_visible
-                if ok and reply_text:
+                if turn_res.ok and turn_res.public_text:
                     clean_reply = _strip_private_thoughts(reply_text) or core.normalize_text(reply_text)
                     clean_reply = _strip_group_chatter_boilerplate(clean_reply) or clean_reply
                     clean_reply = _strip_instruction_echo_lines(clean_reply) or clean_reply
@@ -6484,15 +6486,15 @@ class Worker:
                                     payload,
                                     observer_mentions,
                                 )
-                                ok_obs, observer_reply = self._run_model_turn(
+                                obs_res = self._run_model_turn(
                                     observer,
                                     probe_instruction,
                                     visibility="shadow",
                                     hidden_reply_hint=True,
                                     record_reply=False,
                                 )
-                                observer_clean = _strip_private_thoughts(observer_reply)
-                                if not ok_obs or self._is_pass_reply(observer_clean):
+                                observer_clean = _strip_private_thoughts(obs_res.public_text)
+                                if not obs_res.ok or self._is_pass_reply(observer_clean):
                                     continue
 
                                 speaker = om.name if om else observer
@@ -6598,7 +6600,7 @@ class Worker:
         self.state.set_status(f"nudge:{key}")
 
         instruction = "请基于当前对话提出观点/反驳/补充，抓重点，像人聊天，尽量短，并保留关键细节。"
-        self._run_model_turn(key, instruction, visibility="public")
+        _ = self._run_model_turn(key, instruction, visibility="public")
         self.state.set_status("idle")
         self._safe_reply(action, {"ok": True})
 
