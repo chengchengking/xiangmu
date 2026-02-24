@@ -23,6 +23,10 @@ class PublicLeakGuardTests(unittest.TestCase):
         sample = "<<WRITE_PUBLIC_OR_[PASS]>>"
         self.assertTrue(webui._looks_protocol_placeholder_public_reply(sample))
 
+    def test_task_planning_line_is_detected_as_prompt_leak(self):
+        sample = "查阅项目仓库以明确产品定位与潜在问题"
+        self.assertTrue(webui._looks_prompt_leak_reply(sample))
+
 
 if __name__ == "__main__":
     unittest.main()

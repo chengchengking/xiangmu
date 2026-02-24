@@ -3717,6 +3717,15 @@ def _looks_prompt_leak_reply(text: str) -> bool:
         return True
     if re.search(r"(按(?:照)?格式(?:来)?|格式已遵守|然后按格式写)\s*(?:META|PUBLIC_REPLY|PRIVATE_REPLY)?", t, re.I):
         return True
+    # Task-planning / pre-action lines are not valid public chat replies.
+    if re.search(
+        r"^(?:查阅|查看|分析|评估|梳理|检查|定位|研究).{0,24}(?:仓库|项目).{0,24}(?:问题|定位|建议|风险|潜在问题)",
+        t,
+        re.I,
+    ):
+        return True
+    if re.search(r"^(?:检测到|发现).{0,18}(?:潜在).{0,18}(?:问题|风险)[。.]?$", t):
+        return True
     # Hard prompt/broadcast markers: if any of these appear, treat as leaked prompt text.
     if re.search(
         r"(下面是群聊广播窗口|下面是你还没处理的群聊新消息|群主最新话题：|"
