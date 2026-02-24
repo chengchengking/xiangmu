@@ -30,7 +30,19 @@ REQUIRED_METHODS = [
 
 def classify_adapter_error(exc: BaseException | str) -> str:
     text = str(exc).lower()
-    if any(x in text for x in ["launch_persistent_context", "browsertype.launch", "browser has been closed"]):
+    if any(
+        x in text
+        for x in [
+            "launch_persistent_context",
+            "browsertype.launch",
+            "target page, context or browser has been closed",
+            "user-data-dir",
+            "exitcode=21",
+            "process did exit: exitcode=21",
+        ]
+    ):
+        return "profile_locked"
+    if any(x in text for x in ["browser has been closed"]):
         return "stale"
     if any(x in text for x in ["timeout", "timed out"]):
         return "timeout"
@@ -59,7 +71,7 @@ def static_contract_check() -> dict[str, Any]:
         row = {"adapter": cls.__name__, "ok": not missing, "missing": missing}
         ok = ok and row["ok"]
         out.append(row)
-    return {"ok": ok, "mode": "static", "results": out, "failure_classes": ["selector_miss", "timeout", "captcha", "stale", "unknown"]}
+    return {"ok": ok, "mode": "static", "results": out, "failure_classes": ["selector_miss", "timeout", "captcha", "stale", "profile_locked", "unknown"]}
 
 
 def _pick_metas(keys: list[str] | None, include_disabled: bool = False) -> list[Any]:
@@ -88,7 +100,7 @@ def live_probe(
             "mode": "live",
             "error": "no_models_selected",
             "results": [],
-            "failure_classes": ["selector_miss", "timeout", "captcha", "stale", "unknown"],
+            "failure_classes": ["selector_miss", "timeout", "captcha", "stale", "profile_locked", "unknown"],
         }
 
     out: list[dict[str, Any]] = []
@@ -162,7 +174,7 @@ def live_probe(
         "ok": overall_ok,
         "mode": "live",
         "results": out,
-        "failure_classes": ["selector_miss", "timeout", "captcha", "stale", "unknown"],
+        "failure_classes": ["selector_miss", "timeout", "captcha", "stale", "profile_locked", "unknown"],
         "count": len(out),
         "elapsed_s": round(time.time() - start_ts, 3),
     }

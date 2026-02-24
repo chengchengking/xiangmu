@@ -4584,6 +4584,18 @@ class Worker:
         t = core.normalize_text(str(exc_or_text or "")).lower()
         if not t:
             return "unknown"
+        if any(
+            x in t
+            for x in [
+                "launch_persistent_context",
+                "browsertype.launch",
+                "target page, context or browser has been closed",
+                "user-data-dir",
+                "exitcode=21",
+                "process did exit: exitcode=21",
+            ]
+        ):
+            return "profile_locked"
         if any(x in t for x in ["captcha", "验证", "人机", "cloudflare", "cf", "风控", "过盾"]):
             return "captcha"
         if any(x in t for x in ["timeout", "timed out", "超时"]):
@@ -4785,6 +4797,8 @@ class Worker:
         except Exception as exc:
             cls = self._classify_worker_failure(exc)
             if cls == "captcha":
+                self.state.set_model_runtime_state(key, "NEEDS_HUMAN", reason=f"recover:{cls}", fail_delta=1)
+            elif cls == "profile_locked":
                 self.state.set_model_runtime_state(key, "NEEDS_HUMAN", reason=f"recover:{cls}", fail_delta=1)
             elif cls in {"timeout", "stale", "selector_miss"}:
                 self.state.set_model_runtime_state(key, "COOLING_DOWN", reason=f"recover:{cls}", fail_delta=1, cooldown_s=30)
@@ -5144,6 +5158,8 @@ class Worker:
             except Exception as exc:
                 cls = self._classify_worker_failure(exc)
                 if cls == "captcha":
+                    self.state.set_model_runtime_state(key, "NEEDS_HUMAN", reason=f"half_open:{cls}", fail_delta=1)
+                elif cls == "profile_locked":
                     self.state.set_model_runtime_state(key, "NEEDS_HUMAN", reason=f"half_open:{cls}", fail_delta=1)
                 else:
                     self.state.set_model_runtime_state(key, "COOLING_DOWN", reason=f"half_open:{cls}", fail_delta=1, cooldown_s=45)
@@ -5780,6 +5796,9 @@ class Worker:
             if cls == "captcha":
                 self.state.set_model_runtime_state(key, "NEEDS_HUMAN", reason=f"turn:{cls}", fail_delta=1, turn_id=(ctx.turn_id if ctx else 0))
                 self.state.add_system(f"{m.name} 触发风控/验证码：请在浏览器中手动处理后点击恢复。")
+            elif cls == "profile_locked":
+                self.state.set_model_runtime_state(key, "NEEDS_HUMAN", reason=f"turn:{cls}", fail_delta=1, turn_id=(ctx.turn_id if ctx else 0))
+                self.state.add_system(f"{m.name} 浏览器配置目录可能被占用。请关闭该模型相关浏览器窗口后点击恢复。")
             elif cls in {"timeout", "stale", "selector_miss"}:
                 self.state.set_model_runtime_state(
                     key,

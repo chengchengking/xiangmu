@@ -37,6 +37,10 @@ class WorkerStateTransitionTests(unittest.TestCase):
         self.assertEqual(webui.Worker._classify_worker_failure("captcha required"), "captcha")
         self.assertEqual(webui.Worker._classify_worker_failure("timed out waiting"), "timeout")
         self.assertEqual(webui.Worker._classify_worker_failure("locator not found"), "selector_miss")
+        self.assertEqual(
+            webui.Worker._classify_worker_failure("BrowserType.launch_persistent_context: process did exit: exitCode=21"),
+            "profile_locked",
+        )
 
     def test_runtime_gate_decision(self):
         now = 100.0
