@@ -749,6 +749,10 @@ class SharedState:
         with self._lock:
             self._stop = True
 
+    def clear_stop(self) -> None:
+        with self._lock:
+            self._stop = False
+
     def should_stop(self) -> bool:
         with self._lock:
             return self._stop
@@ -6549,6 +6553,8 @@ class Worker:
             return
 
         selected_snapshot = self.state.selected_keys()
+        # 用户点击“停止”后再次发送新消息，应恢复 worker 主循环继续工作。
+        self.state.clear_stop()
         if target == "group":
             raw_rounds = action.get("rounds", GROUP_DEFAULT_ROUNDS)
             try:
