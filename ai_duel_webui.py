@@ -3729,6 +3729,7 @@ def _looks_prompt_leak_reply(text: str) -> bool:
         for tok in (
             "[[META]]",
             "[[/META]]",
+            "【系统回执】",
             "ack_in=",
             "packet_hash=",
             "evidence_hook=",
@@ -3754,6 +3755,8 @@ def _looks_prompt_leak_reply(text: str) -> bool:
     ):
         return True
     if re.search(r"^(?:检测到|发现).{0,18}(?:潜在).{0,18}(?:问题|风险)[。.]?$", t):
+        return True
+    if re.search(r"涉嫌违反.+(?:使用规范|社区规范)|若有误判.*不喜欢", t):
         return True
     # Hard prompt/broadcast markers: if any of these appear, treat as leaked prompt text.
     if re.search(

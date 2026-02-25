@@ -31,6 +31,14 @@ class PublicLeakGuardTests(unittest.TestCase):
         sample = "正在阅读正在阅读"
         self.assertTrue(webui._looks_prompt_leak_reply(sample))
 
+    def test_system_receipt_echo_is_detected_as_prompt_leak(self):
+        sample = "【系统回执】上一轮：REJECT（turn_id=30, reason=OFF_TOPIC）。"
+        self.assertTrue(webui._looks_prompt_leak_reply(sample))
+
+    def test_doubao_policy_warning_is_detected_as_prompt_leak(self):
+        sample = "该内容涉嫌违反豆包使用规范，若有误判，请长按本条消息后点击 “不喜欢” 进行反馈。"
+        self.assertTrue(webui._looks_prompt_leak_reply(sample))
+
 
 if __name__ == "__main__":
     unittest.main()
