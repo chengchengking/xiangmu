@@ -2914,6 +2914,64 @@ def _topic_overlap_score(reply: str, topic: str) -> float:
     return max(score_term, score_char * 0.65)
 
 
+def _required_topic_anchors(topic: str) -> set[str]:
+    """
+    对仓库/群聊调试类问题，抽取一组“必须至少命中一个”的领域锚点，
+    防止模型只抓到 Repo/框架等泛词后跑偏到网络/TCP等无关方向。
+    """
+    t = core.normalize_text(topic).lower()
+    if not t:
+        return set()
+    anchors: set[str] = set()
+    pairs = [
+        ("parser", ["parser", "parse", "解析", "提取", "抽取", "爬取", "抓取"]),
+        ("broadcast", ["broadcast", "广播", "packet_hash", "一致性"]),
+        ("topic_switch", ["topic-switch", "topic switch", "切题", "话题切换", "插话", "interject", "interrupt"]),
+        ("ui", ["ui", "webui", "窗口", "界面"]),
+        ("log", ["log", "日志"]),
+    ]
+    for _k, kws in pairs:
+        if any(kw in t for kw in kws):
+            anchors.update(kws)
+    return anchors
+
+
+def _reply_hits_any_anchor(reply: str, anchors: set[str]) -> bool:
+    if not anchors:
+        return True
+    r = core.normalize_text(reply).lower()
+    if not r:
+        return False
+    return any(a and a in r for a in anchors)
+
+
+def _looks_redundant_model_repeat(reply: str, previous_public_texts: list[str]) -> bool:
+    cur = core.normalize_text(reply)
+    if not cur:
+        return False
+    cur_key = _line_dedupe_key(cur)
+    if len(cur_key) < 20:
+        return False
+    prevs = [core.normalize_text(x) for x in (previous_public_texts or []) if core.normalize_text(x)]
+    for p in prevs[-3:]:
+        pk = _line_dedupe_key(p)
+        if not pk:
+            continue
+        if cur_key == pk:
+            return True
+        # High containment = same point repeated with minor wording changes.
+        if len(cur_key) >= 24 and (cur_key in pk or pk in cur_key):
+            return True
+        # Simple overlap ratio on dedupe keys.
+        a = set(re.findall(r"[0-9a-z\u4e00-\u9fff]", cur_key))
+        b = set(re.findall(r"[0-9a-z\u4e00-\u9fff]", pk))
+        if a and b:
+            ov = len(a & b) / max(1, len(a | b))
+            if ov >= 0.88:
+                return True
+    return False
+
+
 def _looks_like_clarify_reply(text: str) -> bool:
     t = core.normalize_text(text)
     if not t:
@@ -3166,6 +3224,7 @@ def _is_reply_aligned_with_user_topic(reply: str, user_text: str, *, strict: boo
     term_overlap = len(rep_terms & top_terms)
     top_digits = set(re.findall(r"\d+(?:\.\d+)?", top))
     rep_digits = set(re.findall(r"\d+(?:\.\d+)?", rep))
+    required_anchors = _required_topic_anchors(top)
     # Hard off-topic guard: when the host switched topic, old "idiom/festival chatter"
     # should not survive if overlap is very low.
     if _IDIOM_STYLE_CHATTER_PAT.search(rep) and not _IDIOM_STYLE_CHATTER_PAT.search(top):
@@ -3177,6 +3236,8 @@ def _is_reply_aligned_with_user_topic(reply: str, user_text: str, *, strict: boo
         if _GROUP_ORCHESTRATION_PAT.search(rep) and len(_line_dedupe_key(rep)) <= 72:
             return False
         if _looks_prompt_leak_reply(rep):
+            return False
+        if required_anchors and not _reply_hits_any_anchor(rep, required_anchors):
             return False
         if expected_numeric is not None:
             # 算式题：若没给出正确数值，视为未对齐新话题。
@@ -7042,6 +7103,16 @@ class Worker:
                         _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.LOW_VALUE, "prompt_leak")
                         _mark_topic_miss_if_needed()
                         _trace_turn(k, "pass(loop_prompt_leak)", clean_reply)
+                        continue
+                    prev_same_model = [
+                        mm.text
+                        for mm in self.state.get_all_messages()[-24:]
+                        if mm.visibility == "public" and mm.role == "model" and (mm.model_key or "") == k
+                    ]
+                    if _looks_redundant_model_repeat(clean_reply, prev_same_model):
+                        _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.LOW_VALUE, "repeat_self")
+                        _mark_topic_miss_if_needed()
+                        _trace_turn(k, "pass(loop_repeat_self)", clean_reply)
                         continue
                     if k in {"qwen", "doubao"} and _looks_unfinished_public_reply(clean_reply):
                         _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.LOW_VALUE, "unfinished")
