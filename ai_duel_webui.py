@@ -3092,6 +3092,16 @@ def _extract_expected_numeric_literal_if_requested(topic: str) -> str:
     return str(val)
 
 
+def _strict_topic_consensus_threshold(active_model_count: int) -> int:
+    """
+    严格短答案题（如“只输出 323”）达到少量模型一致后即可视为收敛，
+    否则会长时间占住后续真实讨论话题。
+    """
+    n = max(1, int(active_model_count or 0))
+    # 2 模型时双方都答对；>=3 模型时收到任意 3 个一致短答即可收敛。
+    return 2 if n <= 2 else 3
+
+
 def _reply_contains_expected_number(reply: str, expected: float) -> bool:
     rep = core.normalize_text(reply)
     if not rep:
@@ -6711,6 +6721,7 @@ class Worker:
         active_user_force_rounds = _topic_lock_rounds(len(selected_snapshot))
         active_user_pending_models: set[str] = set(selected_snapshot)
         active_user_pending_attempts: dict[str, int] = {}
+        active_user_strict_ok_models: set[str] = set()
         while True:
             if self.state.should_round_stop():
                 self.state.add_system("已停止自动轮聊。")
@@ -6733,6 +6744,7 @@ class Worker:
                 active_user_force_rounds = _topic_lock_rounds(len(now_selected))
                 active_user_pending_models = set(now_selected)
                 active_user_pending_attempts = {}
+                active_user_strict_ok_models = set()
                 focus_keys = None
                 focus_idle_rounds = 0
                 self.state.add_system("群主插话已加入当前讨论。")
@@ -6810,6 +6822,7 @@ class Worker:
                     active_user_force_rounds = _topic_lock_rounds(len(current_keys))
                     active_user_pending_models = set(current_keys)
                     active_user_pending_attempts = {}
+                    active_user_strict_ok_models = set()
                     focus_keys = None
                     focus_idle_rounds = 0
                     self.state.add_system("群主插话已加入当前回合。")
@@ -7072,6 +7085,19 @@ class Worker:
                     if k in active_user_pending_models:
                         active_user_pending_models.discard(k)
                         active_user_pending_attempts.pop(k, None)
+                    if strict_exact_token:
+                        active_user_strict_ok_models.add(k)
+                        need_consensus = _strict_topic_consensus_threshold(len(current_keys))
+                        if len(active_user_strict_ok_models) >= need_consensus:
+                            self.state.add_system(
+                                f"硬约束题已收敛（{len(active_user_strict_ok_models)}个模型给出 {strict_exact_token}），解除锁定。"
+                            )
+                            active_user_instruction = None
+                            active_user_hard_literal = ""
+                            active_user_force_rounds = 0
+                            active_user_pending_models.clear()
+                            active_user_pending_attempts.clear()
+                            active_user_strict_ok_models = set()
                     targets = self._extract_target_keys_from_text(
                         clean_reply,
                         [x for x in current_keys if x != k],
