@@ -3078,6 +3078,20 @@ def _extract_expected_numeric_answer(topic: str) -> Optional[float]:
     return None
 
 
+def _extract_expected_numeric_literal_if_requested(topic: str) -> str:
+    t = core.normalize_text(topic)
+    if not t:
+        return ""
+    if not re.search(r"(number\s+only|digits?\s+only|只(?:给|回|输)?出?数字|仅(?:给|回|输)?出?数字)", t, re.I):
+        return ""
+    val = _extract_expected_numeric_answer(t)
+    if val is None:
+        return ""
+    if abs(val - int(val)) <= 1e-9:
+        return str(int(val))
+    return str(val)
+
+
 def _reply_contains_expected_number(reply: str, expected: float) -> bool:
     rep = core.normalize_text(reply)
     if not rep:
@@ -6688,6 +6702,8 @@ class Worker:
 
         active_user_instruction: Optional[str] = text
         active_user_hard_literal = _extract_expected_short_literal(active_user_instruction or "")
+        if not active_user_hard_literal:
+            active_user_hard_literal = _extract_expected_numeric_literal_if_requested(active_user_instruction or "")
         active_topic_floor_id = max(group_floor_id, int(user_mid or group_floor_id))
         active_user_force_rounds = _topic_lock_rounds(len(selected_snapshot))
         active_user_pending_models: set[str] = set(selected_snapshot)
@@ -6708,6 +6724,8 @@ class Worker:
                 _rebase_pending_for_topic(now_selected, latest_user_mid=latest_mid)
                 active_user_instruction = queued_user_msgs[-1]
                 active_user_hard_literal = _extract_expected_short_literal(active_user_instruction or "")
+                if not active_user_hard_literal:
+                    active_user_hard_literal = _extract_expected_numeric_literal_if_requested(active_user_instruction or "")
                 active_topic_floor_id = max(group_floor_id, int(latest_mid or active_topic_floor_id))
                 active_user_force_rounds = _topic_lock_rounds(len(now_selected))
                 active_user_pending_models = set(now_selected)
@@ -6783,6 +6801,8 @@ class Worker:
                     _rebase_pending_for_topic(current_keys, latest_user_mid=latest_mid)
                     active_user_instruction = mid_round_msgs[-1]
                     active_user_hard_literal = _extract_expected_short_literal(active_user_instruction or "")
+                    if not active_user_hard_literal:
+                        active_user_hard_literal = _extract_expected_numeric_literal_if_requested(active_user_instruction or "")
                     active_topic_floor_id = max(group_floor_id, int(latest_mid or active_topic_floor_id))
                     active_user_force_rounds = _topic_lock_rounds(len(current_keys))
                     active_user_pending_models = set(current_keys)
