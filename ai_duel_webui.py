@@ -2949,6 +2949,7 @@ def _extract_expected_short_literal(topic: str) -> str:
     t = core.normalize_text(topic)
     if not t:
         return ""
+    english_placeholder_tokens = {"this", "that", "it", "one", "number", "result", "answer"}
     patterns = [
         re.compile(r"(?is)\b(?:output|answer|reply)\s+only\s+([A-Za-z0-9_-]{1,24})\b"),
         re.compile(r"(?is)\b(?:output|answer|reply)\s+(?:exactly\s+)?([A-Za-z0-9_-]{1,24})\s+only\b"),
@@ -2961,6 +2962,13 @@ def _extract_expected_short_literal(topic: str) -> str:
             continue
         token = core.normalize_text(m.group(1) or "")
         token = re.sub(r"^[`'\"“”‘’\[\](){}<>]+|[`'\"“”‘’\[\](){}<>]+$", "", token)
+        token_l = token.lower()
+        if token_l in english_placeholder_tokens:
+            continue
+        # "answer only this: ..." should not lock to the word "this".
+        tail = t[m.end() : m.end() + 2]
+        if token_l.isalpha() and re.match(r"\s*[:：]", tail or ""):
+            continue
         if token:
             return token
     return ""
@@ -6179,6 +6187,21 @@ class Worker:
             return msg
         return None
 
+    def _latest_public_user_message(self) -> Optional[UiMessage]:
+        msgs = self.state.get_all_messages()
+        for msg in reversed(msgs):
+            if msg.role != "user":
+                continue
+            if msg.visibility != "public":
+                continue
+            return msg
+        return None
+
+    def _host_interjected_since(self, before_user_mid: int) -> bool:
+        latest = self._latest_public_user_message()
+        latest_id = int(latest.id) if latest else 0
+        return latest_id > int(before_user_mid or 0)
+
     def _recent_public_replies(self, key: str, limit: int = 3) -> list[str]:
         out: list[str] = []
         if not key or limit <= 0:
@@ -6894,6 +6917,8 @@ class Worker:
                     turn_timeout_cap += 8
                 if k == "qwen":
                     turn_timeout_cap += 4
+                latest_public_user_before_turn = self._latest_public_user_message()
+                latest_public_user_before_turn_id = int(latest_public_user_before_turn.id) if latest_public_user_before_turn else 0
                 turn_res = self._run_model_turn(
                     k,
                     turn_instruction,
@@ -6932,6 +6957,16 @@ class Worker:
                 turn_has_visible = bool(turn_res.ok and core.normalize_text(turn_res.public_text) and (not self._is_pass_reply(turn_res.public_text)))
                 any_turn_ok = any_turn_ok or turn_has_visible
                 if turn_res.ok and turn_res.public_text:
+                    # If the host inserted a newer public message while this model was generating,
+                    # discard the stale reply and let the next round process the newer topic first.
+                    if self._host_interjected_since(latest_public_user_before_turn_id):
+                        _finalize_turn_receipt_local(
+                            ReceiptStatus.REJECT,
+                            RejectReason.OFF_TOPIC,
+                            "stale_after_host_interject",
+                        )
+                        _trace_turn(k, "pass(loop_stale_after_host_interject)", turn_res.public_text)
+                        continue
                     clean_reply = _strip_private_thoughts(reply_text) or core.normalize_text(reply_text)
                     clean_reply = _strip_group_chatter_boilerplate(clean_reply) or clean_reply
                     clean_reply = _strip_instruction_echo_lines(clean_reply) or clean_reply
