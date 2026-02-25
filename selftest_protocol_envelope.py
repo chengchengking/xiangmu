@@ -77,6 +77,15 @@ mode=MULTI_ROUND
         self.assertEqual(env.private, "")
         self.assertEqual(env.status, "NO_TAGS")
 
+    def test_salvage_public_before_meta_when_public_close_missing(self) -> None:
+        raw = (
+            "[[PUBLIC_REPLY]]有效公开建议：先修 parser 抓取，再做广播一致性。"
+            "[[META]]\nturn_id=8\nmode=MULTI_ROUND\n[[/META]]"
+        )
+        env = parse_envelope(raw)
+        self.assertIn("MALFORMED", env.status)
+        self.assertIn("有效公开建议", env.public)
+
 
 if __name__ == "__main__":
     unittest.main()

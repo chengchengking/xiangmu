@@ -106,9 +106,7 @@ def _protocol_wrap_instruction_suffix(
         f"{(f'ack_in={ack_in}\n') if ack_in else ''}"
         f"{(f'packet_hash={packet_hash}\n') if packet_hash else ''}"
         "[[/META]]\n"
-        "[[PUBLIC_REPLY]]\n"
-        f"{_PUBLIC_PLACEHOLDER_TOKEN}\n"
-        "[[/PUBLIC_REPLY]]\n"
+        "[[PUBLIC_REPLY]]\n[[/PUBLIC_REPLY]]\n"
         f"{private_line}"
     )
 
@@ -2959,11 +2957,65 @@ def _required_topic_anchors(topic: str) -> set[str]:
         ("topic_switch", ["topic-switch", "topic switch", "切题", "话题切换", "插话", "interject", "interrupt"]),
         ("ui", ["ui", "webui", "窗口", "界面"]),
         ("log", ["log", "日志"]),
+        (
+            "runtime",
+            [
+                "timeout",
+                "超时",
+                "captcha",
+                "验证码",
+                "风控",
+                "recover",
+                "恢复",
+                "reload",
+                "worker",
+                "state",
+                "状态机",
+                "熔断",
+                "cooldown",
+                "冷却",
+            ],
+        ),
+        (
+            "quality",
+            [
+                "parser",
+                "broadcast",
+                "topic",
+                "reply",
+                "回复",
+                "抓取",
+                "解析",
+                "日志",
+                "公平",
+                "fairness",
+                "重复",
+                "刷屏",
+                "维护",
+                "架构",
+                "扩展",
+            ],
+        ),
     ]
     for _k, kws in pairs:
         if any(kw in t for kw in kws):
             anchors.update(kws)
     return anchors
+
+
+def _is_repo_debug_topic(topic: str) -> bool:
+    t = core.normalize_text(topic).lower()
+    if not t:
+        return False
+    if "github.com/" in t or "repo:" in t or "仓库" in t or "xiangmu" in t:
+        return True
+    return bool(
+        re.search(
+            r"(ai\s+groupchat|群聊产品|webui|parser|broadcast|packet_hash|topic[- ]?switch|插话|日志|captcha|验证码)",
+            t,
+            re.I,
+        )
+    )
 
 
 def _reply_hits_any_anchor(reply: str, anchors: set[str]) -> bool:
@@ -3268,13 +3320,26 @@ def _is_reply_aligned_with_user_topic(reply: str, user_text: str, *, strict: boo
         if _looks_prompt_leak_reply(rep):
             return False
         if required_anchors and not _reply_hits_any_anchor(rep, required_anchors):
-            return False
+            # Repo/debug prompts often accept diverse but still relevant engineering fixes
+            # (timeout/captcha/retry/fairness/worker-state/recover/logging) that may not
+            # overlap with the exact anchor wording in the host message.
+            if not (
+                _is_repo_debug_topic(top)
+                and re.search(
+                    r"(parser|parse|解析|提取|抓取|broadcast|广播|packet_hash|topic|切题|插话|interject|"
+                    r"log|日志|timeout|超时|captcha|验证码|风控|recover|恢复|reload|worker|state|状态|"
+                    r"cooldown|冷却|retry|重试|fair|公平|重复|刷屏|维护|架构|扩展|selector|stale)",
+                    rep,
+                    re.I,
+                )
+            ):
+                return False
         if expected_numeric is not None:
             # 算式题：若没给出正确数值，视为未对齐新话题。
             return False
         # Numeric topic: avoid hard-rejecting valid cross-language responses.
         # If host topic includes numbers, prefer "has any numeric grounding" first.
-        if top_digits:
+        if top_digits and not _is_repo_debug_topic(top):
             if not rep_digits:
                 return False
             if top_digits & rep_digits:
@@ -7181,7 +7246,7 @@ class Worker:
                                     self.state.add_system(f"{nm} 连续{tries}次未对齐新话题，已暂时跳过。")
                             # Topic-lock phase: drop off-topic content to avoid stale-thread pollution.
                             _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.OFF_TOPIC)
-                            _trace_turn(k, "pass(loop_off_topic_after_host_interject)", clean_reply)
+                            _trace_turn(k, "pass(loop_strict_topic_misaligned)", clean_reply)
                             continue
                     mcur = self.state.get_model(k)
                     speaker_name = mcur.name if mcur else k

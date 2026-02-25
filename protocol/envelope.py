@@ -55,6 +55,23 @@ def _has_malformed_tags(raw: str) -> bool:
     return False
 
 
+def _salvage_public_before_meta(raw: str) -> str:
+    """
+    Some web UIs return malformed wrappers like:
+    [[PUBLIC_REPLY]] ... [[META]] ... [[/META]]
+    without closing [[/PUBLIC_REPLY]]. Recover the public payload before META.
+    """
+    t = raw or ""
+    if "[[PUBLIC_REPLY]]" not in t:
+        return ""
+    if "[[/PUBLIC_REPLY]]" in t:
+        return ""
+    m = re.search(r"\[\[PUBLIC_REPLY\]\](.*?)(?:\[\[META\]\]|$)", t, re.DOTALL)
+    if not m:
+        return ""
+    return (m.group(1) or "").strip()
+
+
 def parse_envelope(raw_text: str) -> Envelope:
     raw = raw_text or ""
     status_flags: list[str] = []
@@ -74,6 +91,8 @@ def parse_envelope(raw_text: str) -> Envelope:
 
     meta = _parse_meta(meta_block) if meta_block is not None else {}
     public = (public_block or "").strip()
+    if not public:
+        public = _salvage_public_before_meta(raw)
     private = (private_block or "").strip()
 
     if public == "" and (meta_block is None and private_block is None):
