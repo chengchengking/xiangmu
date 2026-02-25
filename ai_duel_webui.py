@@ -2744,6 +2744,17 @@ def _clip_text(s: str, max_chars: int) -> str:
     return f"{head}…（略）…{tail}".strip()
 
 
+def _enqueue_startup_login_refresh(state: SharedState) -> int:
+    queued = 0
+    for key in state.selected_keys():
+        m = state.get_model(key)
+        if not m or not m.integrated:
+            continue
+        state.inbox.put({"kind": "login_check", "key": key})
+        queued += 1
+    return queued
+
+
 def _transport_text_score(text: str) -> float:
     t = core.normalize_text(text)
     if not t:
@@ -7404,6 +7415,9 @@ def run_webui_app(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, *, no_open
     state.add_system(f"群聊消息日志：{MESSAGE_LOG_FILE.resolve()}")
     state.add_system("请在左侧选择要启用的模型（未登录会弹出登录提示）。")
     state.add_system("底部请选择发送目标：请选择 / 群聊 / 单聊（仅已启用模型）。")
+    refreshed = _enqueue_startup_login_refresh(state)
+    if refreshed:
+        state.add_system(f"启动后正在后台自动重检 {refreshed} 个已选模型的登录态。")
 
     if not no_open:
         _open_webui_window(url)
