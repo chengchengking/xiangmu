@@ -2500,7 +2500,22 @@ class _Handler(BaseHTTPRequestHandler):
     state: SharedState  # injected
     worker: Any  # injected
 
+    def _ensure_worker_running(self) -> None:
+        w = getattr(self, "worker", None)
+        if w is None:
+            return
+        try:
+            # New user actions should resume the backend loop after /api/stop.
+            self.state.clear_stop()
+        except Exception:
+            pass
+        try:
+            w.start()
+        except Exception:
+            pass
+
     def _sync_login_check(self, key: str, *, timeout_s: float = 45.0) -> dict[str, Any]:
+        self._ensure_worker_running()
         ev = threading.Event()
         box: dict[str, Any] = {}
         self.state.inbox.put({"kind": "login_check", "key": key, "_ev": ev, "_reply": box})
@@ -2599,6 +2614,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/models/login/open":
+            self._ensure_worker_running()
             key = str(data.get("key") or "")
             ev = threading.Event()
             box: dict[str, Any] = {}
@@ -2614,12 +2630,14 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/models/nudge":
+            self._ensure_worker_running()
             key = str(data.get("key") or "")
             self.state.inbox.put({"kind": "nudge", "key": key})
             self._send_json({"ok": True})
             return
 
         if parsed.path == "/api/models/recover":
+            self._ensure_worker_running()
             key = str(data.get("key") or "")
             ev = threading.Event()
             box: dict[str, Any] = {}
@@ -2629,6 +2647,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/send":
+            self._ensure_worker_running()
             text_plain = core.normalize_text(str(data.get("text") or ""))
             text = text_plain
             text_b64 = core.normalize_text(str(data.get("text_b64") or ""))
@@ -4575,6 +4594,7 @@ class Worker:
     def __init__(self, state: SharedState) -> None:
         self.state = state
         self._thread = threading.Thread(target=self._run, name="pw-worker", daemon=True)
+        self._thread_lock = threading.Lock()
         self._pw = None
         self._sp = None
         self._adapters: dict[str, ModelAdapter] = {}
@@ -4662,7 +4682,15 @@ class Worker:
                 self._atexit_registered = True
             except Exception:
                 pass
-        self._thread.start()
+        with self._thread_lock:
+            try:
+                if self._thread.is_alive():
+                    return
+            except Exception:
+                pass
+            # Thread objects cannot be restarted after exit.
+            self._thread = threading.Thread(target=self._run, name="pw-worker", daemon=True)
+            self._thread.start()
 
     def _cleanup_playwright_best_effort(self) -> None:
         try:
