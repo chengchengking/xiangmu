@@ -111,6 +111,17 @@ def _protocol_wrap_instruction_suffix(
     )
 
 
+def _env_csv_set(name: str, default_csv: str) -> set[str]:
+    raw = (os.environ.get(name) or "").strip()
+    src = raw if raw else default_csv
+    out: set[str] = set()
+    for p in (src or "").split(","):
+        k = core.normalize_text(p).strip().lower()
+        if k:
+            out.add(k)
+    return out
+
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 MAX_MESSAGES = 1500
@@ -122,10 +133,23 @@ MODEL_REPLY_TIMEOUT_OVERRIDES: dict[str, int] = {
     "qwen": 42,
 }
 TURN_TRACE_ENABLED = os.environ.get("AI_DUEL_TURN_TRACE", "1").strip().lower() not in {"0", "false", "off", "no"}
+PROTOCOL_WRAP_MODELS = _env_csv_set(
+    "AI_DUEL_PROTOCOL_WRAP_MODELS",
+    # Doubao/Qwen often echo wrapper/template blocks; default to no hard wrapper on them.
+    "chatgpt,gemini,deepseek",
+)
 GROUP_CONTINUOUS_MAX_ROUNDS = 60
 GROUP_DEFAULT_ROUNDS = -1  # -1 means continuous rounds until manual stop/safety cap
 FOCUS_RECOVERY_ROUNDS = 4
-TOPIC_LOCK_MAX_ATTEMPTS_PER_MODEL = 2
+TOPIC_LOCK_MAX_ATTEMPTS_PER_MODEL = _env_int(
+    "AI_DUEL_TOPIC_LOCK_MAX_ATTEMPTS_PER_MODEL", 4, min_v=1, max_v=12
+)
+ENABLE_EVIDENCE_MODE = str(os.environ.get("AI_DUEL_ENABLE_EVIDENCE_MODE", "0")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 TOPIC_INTERJECT_PENDING_KEEP = _env_int("AI_DUEL_TOPIC_INTERJECT_PENDING_KEEP", 2, min_v=2, max_v=80)
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 TRACE_DIR = Path(".tmp")
@@ -142,7 +166,7 @@ SELECTED_MODELS_FILE = Path(os.environ.get("AI_DUEL_SELECTED_MODELS_FILE", str(T
 _JSONL_LOCK = threading.Lock()
 GROUP_PUBLIC_TURN_SOFT_TIMEOUT_S = {
     "qwen": _env_int("AI_DUEL_GROUP_TIMEOUT_SOFT_QWEN", 30, min_v=12, max_v=240),
-    "doubao": _env_int("AI_DUEL_GROUP_TIMEOUT_SOFT_DOUBAO", 32, min_v=12, max_v=240),
+    "doubao": _env_int("AI_DUEL_GROUP_TIMEOUT_SOFT_DOUBAO", 52, min_v=12, max_v=240),
     "default": _env_int("AI_DUEL_GROUP_TIMEOUT_SOFT_DEFAULT", 26, min_v=10, max_v=180),
 }
 GROUP_PUBLIC_ROUND_CAP_BY_COUNT = {
@@ -167,11 +191,11 @@ GROUP_TIMEOUT_CONTEXT_PER_MSG_CHAR_CAP = _env_int(
 GROUP_PUBLIC_REPLY_MAX_CHARS = _env_int("AI_DUEL_GROUP_PUBLIC_REPLY_MAX_CHARS", 420, min_v=120, max_v=2000)
 GROUP_PUBLIC_REPLY_MAX_LINES = _env_int("AI_DUEL_GROUP_PUBLIC_REPLY_MAX_LINES", 8, min_v=2, max_v=24)
 GROUP_PUBLIC_REPLY_MAX_SENTENCES = _env_int("AI_DUEL_GROUP_PUBLIC_REPLY_MAX_SENTENCES", 6, min_v=2, max_v=16)
-GROUP_BROADCAST_MAX_MSGS = _env_int("AI_DUEL_GROUP_BROADCAST_MAX_MSGS", 20, min_v=6, max_v=120)
-GROUP_BROADCAST_MAX_CHARS = _env_int("AI_DUEL_GROUP_BROADCAST_MAX_CHARS", 3600, min_v=1000, max_v=12000)
-GROUP_BROADCAST_PER_MSG_CHAR_CAP = _env_int("AI_DUEL_GROUP_BROADCAST_PER_MSG_CHAR_CAP", 320, min_v=100, max_v=2400)
-GROUP_BROADCAST_RECENT_MAX_MSGS = _env_int("AI_DUEL_GROUP_BROADCAST_RECENT_MAX_MSGS", 12, min_v=4, max_v=80)
-GROUP_BROADCAST_RECENT_MAX_CHARS = _env_int("AI_DUEL_GROUP_BROADCAST_RECENT_MAX_CHARS", 2200, min_v=600, max_v=12000)
+GROUP_BROADCAST_MAX_MSGS = _env_int("AI_DUEL_GROUP_BROADCAST_MAX_MSGS", 4, min_v=3, max_v=120)
+GROUP_BROADCAST_MAX_CHARS = _env_int("AI_DUEL_GROUP_BROADCAST_MAX_CHARS", 1000, min_v=500, max_v=12000)
+GROUP_BROADCAST_PER_MSG_CHAR_CAP = _env_int("AI_DUEL_GROUP_BROADCAST_PER_MSG_CHAR_CAP", 140, min_v=60, max_v=2400)
+GROUP_BROADCAST_RECENT_MAX_MSGS = _env_int("AI_DUEL_GROUP_BROADCAST_RECENT_MAX_MSGS", 6, min_v=3, max_v=80)
+GROUP_BROADCAST_RECENT_MAX_CHARS = _env_int("AI_DUEL_GROUP_BROADCAST_RECENT_MAX_CHARS", 900, min_v=400, max_v=12000)
 CONTEXT_MODEL_DIGEST_MAX_CHARS = _env_int("AI_DUEL_CONTEXT_MODEL_DIGEST_MAX_CHARS", 560, min_v=240, max_v=2400)
 CONTEXT_MODEL_DIGEST_MAX_LINES = _env_int("AI_DUEL_CONTEXT_MODEL_DIGEST_MAX_LINES", 10, min_v=4, max_v=28)
 CONTEXT_USER_DIGEST_MAX_CHARS = _env_int("AI_DUEL_CONTEXT_USER_DIGEST_MAX_CHARS", 420, min_v=180, max_v=1800)
@@ -3118,9 +3142,11 @@ def _extract_expected_short_literal(topic: str) -> str:
     return ""
 
 
-def _should_pass_no_public_tagged(envelope_status: str, envelope_public: str) -> bool:
+def _should_pass_no_public_tagged(envelope_status: str, envelope_public: str, *, expect_protocol_wrap: bool = True) -> bool:
     status = core.normalize_text(envelope_status).upper()
     pub = core.normalize_text(envelope_public)
+    if not expect_protocol_wrap:
+        return False
     return (not pub) and status != "NO_TAGS"
 
 
@@ -3132,6 +3158,23 @@ def _should_wait_for_login_recheck(runtime_state: str, runtime_reason: str) -> b
     if "login_check" in rs and st in {"INIT", "INITIALIZING", "IDLE"}:
         return True
     return False
+
+
+def _strip_protocol_suffix_from_instruction(instruction: str) -> str:
+    """
+    Remove protocol wrapper section from instruction for plain-text fallback retry.
+    Keeps core task context while avoiding repeated NO_PUBLIC-tag echoes.
+    """
+    t = core.normalize_text(instruction)
+    if not t:
+        return ""
+    m = re.search(r"\n\s*请按以下格式输出（不要复述本提示）[:：]?\s*\n\[\[META\]\]", t)
+    if m:
+        return core.normalize_text(t[: m.start()])
+    m2 = re.search(r"\n\s*\[\[META\]\]\s*\n", t)
+    if m2:
+        return core.normalize_text(t[: m2.start()])
+    return t
 
 
 def _extract_expected_numeric_answer(topic: str) -> Optional[float]:
@@ -3372,10 +3415,17 @@ def _is_reply_aligned_with_user_topic(reply: str, user_text: str, *, strict: boo
             return True
         if not top_terms and score >= 0.18:
             return True
-        # Cross-language or paraphrased replies can have low lexical overlap.
-        # Accept unless it clearly looks like stale/group-chatter boilerplate.
-        if len(_line_dedupe_key(rep)) >= 10:
-            return True
+        # Strict topic phase should reject generic long-but-off-topic replies.
+        if _is_repo_debug_topic(top):
+            if re.search(
+                r"(repo|github|issue|bug|fix|regression|test|parser|broadcast|packet_hash|"
+                r"topic|context|timeout|captcha|selector|adapter|orchestrator|receipt|"
+                r"日志|回归|修复|解析|抓取|广播|一致性|切题|插话|超时|验证码|风控|状态机|调度)",
+                rep,
+                re.I,
+            ):
+                return True
+            return False
         return False
     if score >= 0.14:
         return True
@@ -3426,6 +3476,7 @@ _LOW_VALUE_PROCESS_PAT = re.compile(
     r"根据(?:群主)?最新话题.*(?:给出|回应|讨论)|给出一个简洁.*核心假设|"
     r"给出.*人民币.*黄金.*价格区间.*假设|"
     r"思考问题的逻辑结构|确认计算结果无误|寻找(?:符合|满足)条件的三位数|"
+    r"读取来源已完成|来源读取已完成|source\s+read\s+complete|"
     r"请把公开发言放在.*之间|如需隐藏想法.*之间|"
     r"(?:\d{1,3}\s*字(?:左右)?|字数)(?:[，,、\s]{0,4})(?:符合要求|可|即可)|"
     r"符合要求(?:即可)?|"
@@ -3598,6 +3649,11 @@ _PUBLIC_WRAP_OPEN = "[[PUBLIC_REPLY]]"
 _PUBLIC_WRAP_CLOSE = "[[/PUBLIC_REPLY]]"
 _PRIVATE_WRAP_OPEN = "[[PRIVATE_REPLY]]"
 _PRIVATE_WRAP_CLOSE = "[[/PRIVATE_REPLY]]"
+_TRANSIENT_PROGRESS_ONLY_PAT = re.compile(
+    r"^\s*(?:正在阅读|阅读中|读取中|正在加载|加载中)"
+    r"(?:\s*(?:正在阅读|阅读中|读取中|正在加载|加载中))*\s*$",
+    re.I,
+)
 _PUBLIC_PLACEHOLDER_TOKEN = "<<WRITE_PUBLIC_OR_[PASS]>>"
 # Qwen / Doubao are prone to echoing format instructions.
 # Keep wrapper parsing support for backward compatibility, but default to no wrapper hinting.
@@ -3924,12 +3980,7 @@ def _looks_prompt_leak_reply(text: str) -> bool:
         )
     ):
         return True
-    if re.match(
-        r"^\s*(?:正在阅读|阅读中|读取中|正在加载|加载中)"
-        r"(?:\s*(?:正在阅读|阅读中|读取中|正在加载|加载中))*\s*$",
-        t,
-        re.I,
-    ):
+    if _TRANSIENT_PROGRESS_ONLY_PAT.match(t):
         return True
     if re.search(r"(按(?:照)?格式(?:来)?|格式已遵守|然后按格式写)\s*(?:META|PUBLIC_REPLY|PRIVATE_REPLY)?", t, re.I):
         return True
@@ -4409,6 +4460,13 @@ def _is_near_duplicate_reply(text: str, previous_texts: list[str]) -> bool:
     return False
 
 
+def _looks_transient_progress_only(text: str) -> bool:
+    t = core.normalize_text(text)
+    if not t:
+        return False
+    return bool(_TRANSIENT_PROGRESS_ONLY_PAT.match(t))
+
+
 def _looks_unfinished_public_reply(text: str) -> bool:
     t = core.normalize_text(text)
     if not t:
@@ -4736,7 +4794,11 @@ class Worker:
         _trace_turn(key_norm, "receipt_final", json.dumps(rec.to_dict(), ensure_ascii=False))
 
     def _build_authoritative_broadcast_packet(
-        self, *, max_items: int = 10, max_chars: int = 2400
+        self,
+        *,
+        max_items: int = 6,
+        max_chars: int = 1200,
+        floor_id: int = 0,
     ) -> tuple[str, str]:
         msgs = self.state.get_all_messages()
         pub = [
@@ -4745,15 +4807,30 @@ class Worker:
             if m.visibility == "public"
             and m.role in {"user", "model"}
             and core.normalize_text(m.text)
+            and (int(m.id) >= int(floor_id) if int(floor_id or 0) > 0 else True)
         ]
-        items = pub[-max(1, int(max_items)) :]
+        # Keep packet compact: de-duplicate by speaker-role key from tail.
+        # This avoids repeated same-speaker long blocks starving slower adapters.
+        picked_rev: list[UiMessage] = []
+        seen_keys: set[str] = set()
+        for mm in reversed(pub):
+            role = "U" if mm.role == "user" else "M"
+            speaker = core.normalize_text(mm.speaker).lower() if mm.role == "model" else "user"
+            sk = f"{role}:{speaker}"
+            if sk in seen_keys:
+                continue
+            picked_rev.append(mm)
+            seen_keys.add(sk)
+            if len(picked_rev) >= max(1, int(max_items)):
+                break
+        items = list(reversed(picked_rev))
         lines = [f"【广播包 run_id={RUN_ID}】"]
         for mm in items:
             role = "U" if mm.role == "user" else "M"
             speaker = core.normalize_text(mm.speaker)
             text = core.normalize_text(mm.text).replace("\n", " ").strip()
-            if len(text) > 220:
-                text = text[:220] + "…"
+            if len(text) > 160:
+                text = text[:160] + "…"
             lines.append(f"- {role}#{mm.id}({speaker}): {text}")
         lines.append("【广播包结束】")
         packet = "\n".join(lines)
@@ -5437,26 +5514,28 @@ class Worker:
             ctx = TurnContext(turn_id=self._turn_seq, mode=turn_mode)
             self._last_turn_ctx_by_model[(key or "").strip().lower()] = ctx
             defer_final_receipt = bool(visibility == "public" and not record_reply)
-            try:
-                if ctx.mode != Mode.EVIDENCE:
-                    msgs = self.state.get_all_messages()
-                    recent = [
-                        core.normalize_text(mm.text)
-                        for mm in msgs
-                        if mm.visibility == "public" and mm.role == "model"
-                    ]
-                    if should_enter_evidence(recent):
-                        ctx.mode = Mode.EVIDENCE
-            except Exception:
-                pass
-            try:
-                if ctx.mode == Mode.EVIDENCE:
-                    instruction = (instruction or "") + (
-                        "\n【证据模式】若你要反驳/质疑，PRIVATE_REPLY 必须包含一行："
-                        "evidence_hook=ref:M#123 或 evidence_hook=check:可验证条件。否则输出 [PASS]。\n"
-                    )
-            except Exception:
-                pass
+            if ENABLE_EVIDENCE_MODE:
+                try:
+                    if ctx.mode != Mode.EVIDENCE:
+                        msgs = self.state.get_all_messages()
+                        recent = [
+                            core.normalize_text(mm.text)
+                            for mm in msgs
+                            if mm.visibility == "public" and mm.role == "model"
+                        ]
+                        if should_enter_evidence(recent):
+                            ctx.mode = Mode.EVIDENCE
+                except Exception:
+                    pass
+                try:
+                    if ctx.mode == Mode.EVIDENCE:
+                        instruction = (instruction or "") + (
+                            "\n[EVIDENCE MODE] If you challenge/refute, PRIVATE_REPLY must include one line: "
+                            "evidence_hook=ref:M#123 or evidence_hook=check:verifiable_condition. "
+                            "Otherwise output [PASS].\n"
+                        )
+                except Exception:
+                    pass
             prompt = self._compose_turn_input(instruction, hidden_reply_hint=hidden_reply_hint)
             if not prompt:
                 self.state.add_system(f"{m.name} 本轮跳过：空指令")
@@ -5471,7 +5550,8 @@ class Worker:
                         f"ack_in={ack_in or ''}"
                     ),
                 )
-            if not strict_token:
+            use_protocol_wrap = (key or "").strip().lower() in PROTOCOL_WRAP_MODELS
+            if (not strict_token) and use_protocol_wrap:
                 prompt = (
                     prompt
                     + _protocol_wrap_instruction_suffix(
@@ -5534,17 +5614,50 @@ class Worker:
                 f"turn_id={ctx.turn_id} mode={ctx.mode.value}\n{reply}",
                 elapsed_s=(time.time() - turn_start),
             )
-            if key in {"doubao", "gemini"} and _looks_prompt_leak_reply(reply):
+            if key == "deepseek" and _looks_transient_progress_only(reply):
+                # DeepSeek occasionally yields transient progress text first.
+                # Re-poll a few short windows before classifying as leaked/low-value.
+                for _ in range(3):
+                    try:
+                        time.sleep(0.8)
+                        retry_ds = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=10))
+                    except Exception:
+                        retry_ds = ""
+                    if not retry_ds:
+                        continue
+                    if _looks_transient_progress_only(retry_ds):
+                        continue
+                    reply = retry_ds
+                    _trace_turn(
+                        key,
+                        "recover(deepseek_progress_repoll)",
+                        f"turn_id={ctx.turn_id} mode={ctx.mode.value}\n{reply}",
+                        elapsed_s=(time.time() - turn_start),
+                    )
+                    break
+            if key in {"doubao", "gemini", "deepseek"} and _looks_prompt_leak_reply(reply):
                 # Fast retry can often pick finalized assistant content
                 # instead of transient prompt-echo/nav blocks.
-                try:
-                    time.sleep(0.8)
-                    retry_timeout = 12 if key == "doubao" else 18
-                    retry = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=retry_timeout))
-                    if retry and not _looks_prompt_leak_reply(retry):
-                        reply = retry
-                except Exception:
-                    pass
+                retry_rounds = 2 if key == "doubao" else 1
+                for _ in range(retry_rounds):
+                    try:
+                        time.sleep(0.8)
+                        retry_timeout = 20 if key == "doubao" else (16 if key == "deepseek" else 18)
+                        retry = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=retry_timeout))
+                    except Exception:
+                        retry = ""
+                    if not retry:
+                        continue
+                    if _looks_prompt_leak_reply(retry):
+                        continue
+                    reply = retry
+                    _trace_turn(
+                        key,
+                        "recover(prompt_leak_repoll)",
+                        f"turn_id={ctx.turn_id} mode={ctx.mode.value}\n{reply}",
+                        elapsed_s=(time.time() - turn_start),
+                    )
+                    break
             if not reply:
                 # Last-chance rescue: some web UIs intermittently miss one polling window.
                 try:
@@ -5633,15 +5746,99 @@ class Worker:
                         f"meta={env.meta} ack_out={env.meta.get('ack_out') or env.meta.get('ack') or ''}"
                     ),
                 )
-            elif _should_pass_no_public_tagged(env.status, env.public):
-                # Protocol tags exist but public block is empty/malformed: do not fallback to raw prompt-like text.
-                # This avoids leaking wrapper/instruction echoes into public timeline.
-                _trace_turn(
-                    key,
-                    "pass(no_public_tagged)",
-                    f"turn_id={ctx.turn_id} mode={ctx.mode.value} status={env.status}",
-                )
-                return _tr_pass(reason="no_public_tagged", raw_reply=reply, envelope_status=env.status, meta=env.meta)
+            elif _should_pass_no_public_tagged(
+                env.status,
+                env.public,
+                expect_protocol_wrap=use_protocol_wrap,
+            ):
+                # Protocol tags exist but public block is empty/malformed.
+                # For noisy providers, run one plain-text fallback retry before PASS.
+                recovered = False
+                if key in {"doubao", "qwen", "deepseek"} and visibility == "public" and not record_reply:
+                    try:
+                        # First: re-poll once without resending to reduce false empty-tag captures.
+                        repoll_raw = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=12))
+                        if repoll_raw:
+                            rep_env = parse_envelope(repoll_raw)
+                            rep_pub = core.normalize_text(rep_env.public)
+                            if not rep_pub:
+                                rp_pub, _rp_pri = _split_public_private_reply(repoll_raw)
+                                rep_pub = core.normalize_text(rp_pub) or ""
+                            rep_pub = _strip_instruction_echo(rep_pub, instruction)
+                            rep_pub = _sanitize_forward_payload(rep_pub) or rep_pub
+                            rep_pub = _strip_leading_status_noise(rep_pub) or rep_pub
+                            rep_pub = _dedupe_public_reply(rep_pub) or rep_pub
+                            rep_pub = _strip_trailing_solicit_line(rep_pub) or rep_pub
+                            if key in {"doubao", "qwen"}:
+                                rep_pub = _pick_best_semantic_fragment(rep_pub) or rep_pub
+                            if (
+                                rep_pub
+                                and not _looks_prompt_leak_reply(rep_pub)
+                                and not _looks_unfinished_public_reply(rep_pub)
+                                and not _looks_like_suggestion_chip_reply(rep_pub)
+                                and not _LOW_VALUE_PROCESS_PAT.match(rep_pub)
+                            ):
+                                public_reply = rep_pub
+                                private_reply = core.normalize_text(rep_env.private)
+                                recovered = True
+                                _trace_turn(key, "recover(no_public_tagged_repoll)", rep_pub)
+                    except Exception:
+                        recovered = False
+                if (not recovered) and key in {"doubao", "qwen", "deepseek"} and visibility == "public" and not record_reply:
+                    try:
+                        fallback_instruction = _strip_protocol_suffix_from_instruction(instruction)
+                        fallback_instruction = (
+                            fallback_instruction
+                            + "\n仅输出一段最终群聊正文；不要任何标签；不要复述规则；不要输出“正在阅读/已完成思考”。"
+                        )
+                        fallback_prompt = self._compose_turn_input(
+                            fallback_instruction,
+                            hidden_reply_hint=hidden_reply_hint,
+                        )
+                        ad.send_user_text(fallback_prompt)
+                        fallback_wait_s = 20 if key == "doubao" else (18 if key == "deepseek" else 16)
+                        fallback_raw = core.normalize_text(
+                            ad.wait_reply_and_extract(before, timeout_s=fallback_wait_s)
+                        )
+                        if fallback_raw:
+                            fb_pub, fb_pri = _split_public_private_reply(fallback_raw)
+                            fb_pub = core.normalize_text(fb_pub) or fallback_raw
+                            fb_pub = _strip_instruction_echo(fb_pub, fallback_instruction)
+                            fb_pub = _sanitize_forward_payload(fb_pub) or fb_pub
+                            fb_pub = _strip_leading_status_noise(fb_pub) or fb_pub
+                            fb_pub = _dedupe_public_reply(fb_pub) or fb_pub
+                            fb_pub = _strip_trailing_solicit_line(fb_pub) or fb_pub
+                            if key in {"doubao", "qwen"}:
+                                fb_pub = _pick_best_semantic_fragment(fb_pub) or fb_pub
+                            if (
+                                fb_pub
+                                and not _looks_prompt_leak_reply(fb_pub)
+                                and not _looks_unfinished_public_reply(fb_pub)
+                                and not _looks_like_suggestion_chip_reply(fb_pub)
+                                and not _LOW_VALUE_PROCESS_PAT.match(fb_pub)
+                            ):
+                                public_reply = fb_pub
+                                private_reply = core.normalize_text(fb_pri)
+                                recovered = True
+                                _trace_turn(
+                                    key,
+                                    "recover(no_public_tagged_plain_retry)",
+                                    fb_pub,
+                                )
+                    except Exception:
+                        recovered = False
+                if not recovered:
+                    _trace_turn(
+                        key,
+                        "pass(no_public_tagged)",
+                        f"turn_id={ctx.turn_id} mode={ctx.mode.value} status={env.status}",
+                    )
+                    return _tr_pass(
+                        reason="no_public_tagged",
+                        raw_reply=reply,
+                        envelope_status=env.status,
+                        meta=env.meta,
+                    )
             else:
                 public_reply, private_reply = _split_public_private_reply(reply)
             public_reply = core.normalize_text(public_reply) or reply
@@ -7019,7 +7216,10 @@ class Worker:
             mention_switched = False
             round_interrupted_by_host = False
             round_context_chars = self._estimate_recent_public_context_chars()
-            authoritative_packet_text, authoritative_packet_hash = self._build_authoritative_broadcast_packet()
+            packet_floor_id = int(active_topic_floor_id or group_floor_id or 0)
+            authoritative_packet_text, authoritative_packet_hash = self._build_authoritative_broadcast_packet(
+                floor_id=packet_floor_id
+            )
             authoritative_ack_in = self._ack_in_from_public_timeline()
             round_packet_hash_seen: dict[str, str] = {}
             for k in talk_keys:
@@ -7282,8 +7482,23 @@ class Worker:
                         _mark_topic_miss_if_needed()
                         _trace_turn(k, "pass(loop_process_or_status)", clean_reply)
                         continue
-                    if strict_topic_phase and active_user_instruction:
-                        if not _is_reply_aligned_with_user_topic(clean_reply, active_user_instruction, strict=True):
+                    # Hard strict-topic rejection is only for explicit exact-answer tasks
+                    # (e.g., math literal / forced token). For general discussion topics,
+                    # do not drop technically relevant replies as off-topic.
+                    if strict_topic_phase and active_user_instruction and strict_exact_token:
+                        strict_aligned = _is_reply_aligned_with_user_topic(
+                            clean_reply, active_user_instruction, strict=True
+                        )
+                        # Encoding/noise tolerance: if reply has substantial English technical content
+                        # on repo/debug topics, do not hard-drop it as off-topic.
+                        if (
+                            not strict_aligned
+                            and _is_repo_debug_topic(active_user_instruction)
+                            and len(re.findall(r"[A-Za-z]{3,}", clean_reply)) >= 3
+                            and len(_line_dedupe_key(clean_reply)) >= 28
+                        ):
+                            strict_aligned = True
+                        if not strict_aligned:
                             if k in active_user_pending_models:
                                 tries = int(active_user_pending_attempts.get(k, 0)) + 1
                                 active_user_pending_attempts[k] = tries

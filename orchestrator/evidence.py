@@ -20,7 +20,13 @@ def _iter_recent_texts(recent_public: Iterable[str], *, window: int) -> list[str
     return items[-max(1, int(window)) :]
 
 
-def should_enter_evidence(recent_public: list[str], *, threshold: int = 3, window: int = 8, recent_guard: int = 3) -> bool:
+def should_enter_evidence(
+    recent_public: list[str],
+    *,
+    threshold: int = 3,
+    window: int = 8,
+    recent_guard: int = 3,
+) -> bool:
     """
     Enter evidence mode only when:
     - enough challenge signals in a wider window, AND
