@@ -3118,6 +3118,22 @@ def _extract_expected_short_literal(topic: str) -> str:
     return ""
 
 
+def _should_pass_no_public_tagged(envelope_status: str, envelope_public: str) -> bool:
+    status = core.normalize_text(envelope_status).upper()
+    pub = core.normalize_text(envelope_public)
+    return (not pub) and status != "NO_TAGS"
+
+
+def _should_wait_for_login_recheck(runtime_state: str, runtime_reason: str) -> bool:
+    st = core.normalize_text(runtime_state).upper()
+    rs = core.normalize_text(runtime_reason).lower()
+    if st in {"INITIALIZING", "AUTH_CHECKING"}:
+        return True
+    if "login_check" in rs and st in {"INIT", "INITIALIZING", "IDLE"}:
+        return True
+    return False
+
+
 def _extract_expected_numeric_answer(topic: str) -> Optional[float]:
     """
     从题目里提取算式的期望数值结果。
@@ -5617,6 +5633,15 @@ class Worker:
                         f"meta={env.meta} ack_out={env.meta.get('ack_out') or env.meta.get('ack') or ''}"
                     ),
                 )
+            elif _should_pass_no_public_tagged(env.status, env.public):
+                # Protocol tags exist but public block is empty/malformed: do not fallback to raw prompt-like text.
+                # This avoids leaking wrapper/instruction echoes into public timeline.
+                _trace_turn(
+                    key,
+                    "pass(no_public_tagged)",
+                    f"turn_id={ctx.turn_id} mode={ctx.mode.value} status={env.status}",
+                )
+                return _tr_pass(reason="no_public_tagged", raw_reply=reply, envelope_status=env.status, meta=env.meta)
             else:
                 public_reply, private_reply = _split_public_private_reply(reply)
             public_reply = core.normalize_text(public_reply) or reply
@@ -6742,6 +6767,30 @@ class Worker:
                 m0 = self.state.get_model(k)
                 if m0 and bool(getattr(m0, "authenticated", False)):
                     authed_selected.append(k)
+            if not authed_selected:
+                # If startup/login recheck is still running, wait briefly for the fresh auth snapshot.
+                # Avoid false "all unauthenticated" right after restart.
+                wait_deadline = time.time() + 12.0
+                while time.time() < wait_deadline and not authed_selected:
+                    waiting = False
+                    for k in keys:
+                        m0 = self.state.get_model(k)
+                        if not m0:
+                            continue
+                        if _should_wait_for_login_recheck(
+                            str(getattr(m0, "runtime_state", "")),
+                            str(getattr(m0, "runtime_reason", "")),
+                        ):
+                            waiting = True
+                            break
+                    if not waiting:
+                        break
+                    time.sleep(1.0)
+                    authed_selected = []
+                    for k in keys:
+                        m0 = self.state.get_model(k)
+                        if m0 and bool(getattr(m0, "authenticated", False)):
+                            authed_selected.append(k)
             if not authed_selected:
                 selected_names = []
                 for k in keys:

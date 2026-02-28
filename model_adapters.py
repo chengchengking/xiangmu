@@ -2572,6 +2572,8 @@ class DoubaoAdapter(GenericWebChatAdapter):
             if any(
                 h in s
                 for h in (
+                    "[[META]]",
+                    "[[/META]]",
                     "<<<PUBLIC_REPLY>>>",
                     "<<<END_PUBLIC_REPLY>>>",
                     "<<<PRIVATE_REPLY>>>",
@@ -2583,7 +2585,12 @@ class DoubaoAdapter(GenericWebChatAdapter):
                 )
             ):
                 continue
-            if re.search(r"(请把公开发言放在|公开发言放在|如需隐藏想法|暂不支持该消息类型)", s):
+            if re.search(
+                r"(请把公开发言放在|公开发言放在|请按以下格式输出|不要复述本提示|输出格式|如需隐藏想法|暂不支持该消息类型)",
+                s,
+            ):
+                continue
+            if re.match(r"^(turn_id|mode|ack(?:_in|_out)?|packet_hash|reply_to)\s*=", s, re.I):
                 continue
             if self._is_chip_line(s):
                 continue
