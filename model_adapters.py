@@ -1460,6 +1460,12 @@ class QwenAdapter(GenericWebChatAdapter):
         r"[。.!！~～]?\s*$",
         re.I,
     )
+    _QWEN_SUMMARY_TITLE_PAT = re.compile(
+        r"^\s*(?:构建|建立|设计|优化|完善|增强|提升|引入|实现|重构|修复|改进|强化)"
+        r".{0,36}(?:机制|系统|流程|框架|能力|鲁棒性|稳定性|可靠性|一致性|准确性|效率|质量)"
+        r"[。.!！~～]?\s*$",
+        re.I,
+    )
 
     def __init__(self, meta: ModelMeta) -> None:
         super().__init__(meta)
@@ -1471,6 +1477,13 @@ class QwenAdapter(GenericWebChatAdapter):
         if not t:
             return False
         if self._QWEN_LOW_VALUE_PROCESS_PAT.match(t) or self._QWEN_PROCESS_LABEL_PAT.match(t):
+            return True
+        if (
+            "\n" not in t
+            and len(self._line_dedupe_key(t)) <= 36
+            and self._QWEN_SUMMARY_TITLE_PAT.match(t)
+            and not re.search(r"(我|你|他|她|我们|建议|同意|反对|认为|可以|应该|因为|所以)", t)
+        ):
             return True
         if (
             "\n" not in t
