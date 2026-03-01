@@ -188,9 +188,9 @@ GROUP_TIMEOUT_CONTEXT_WINDOW_MSGS = _env_int("AI_DUEL_GROUP_TIMEOUT_CONTEXT_WIND
 GROUP_TIMEOUT_CONTEXT_PER_MSG_CHAR_CAP = _env_int(
     "AI_DUEL_GROUP_TIMEOUT_CONTEXT_PER_MSG_CHAR_CAP", 420, min_v=80, max_v=4000
 )
-GROUP_PUBLIC_REPLY_MAX_CHARS = _env_int("AI_DUEL_GROUP_PUBLIC_REPLY_MAX_CHARS", 420, min_v=120, max_v=2000)
-GROUP_PUBLIC_REPLY_MAX_LINES = _env_int("AI_DUEL_GROUP_PUBLIC_REPLY_MAX_LINES", 8, min_v=2, max_v=24)
-GROUP_PUBLIC_REPLY_MAX_SENTENCES = _env_int("AI_DUEL_GROUP_PUBLIC_REPLY_MAX_SENTENCES", 6, min_v=2, max_v=16)
+GROUP_PUBLIC_REPLY_MAX_CHARS = _env_int("AI_DUEL_GROUP_PUBLIC_REPLY_MAX_CHARS", 760, min_v=120, max_v=2400)
+GROUP_PUBLIC_REPLY_MAX_LINES = _env_int("AI_DUEL_GROUP_PUBLIC_REPLY_MAX_LINES", 10, min_v=2, max_v=28)
+GROUP_PUBLIC_REPLY_MAX_SENTENCES = _env_int("AI_DUEL_GROUP_PUBLIC_REPLY_MAX_SENTENCES", 8, min_v=2, max_v=20)
 GROUP_BROADCAST_MAX_MSGS = _env_int("AI_DUEL_GROUP_BROADCAST_MAX_MSGS", 4, min_v=3, max_v=120)
 GROUP_BROADCAST_MAX_CHARS = _env_int("AI_DUEL_GROUP_BROADCAST_MAX_CHARS", 1000, min_v=500, max_v=12000)
 GROUP_BROADCAST_PER_MSG_CHAR_CAP = _env_int("AI_DUEL_GROUP_BROADCAST_PER_MSG_CHAR_CAP", 140, min_v=60, max_v=2400)
@@ -3477,6 +3477,8 @@ _LOW_VALUE_PROCESS_PAT = re.compile(
     r"给出.*人民币.*黄金.*价格区间.*假设|"
     r"思考问题的逻辑结构|确认计算结果无误|寻找(?:符合|满足)条件的三位数|"
     r"读取来源已完成|来源读取已完成|source\s+read\s+complete|"
+    r"META\s*部分按要求|PUBLIC_REPLY\s*写(?:\s*conci[sc]e)?(?:\s*的?内容)?|"
+    r"PRIVATE_REPLY\s*写(?:\s*可选)?|然后按照格式来(?:，|,)?|"
     r"请把公开发言放在.*之间|如需隐藏想法.*之间|"
     r"(?:\d{1,3}\s*字(?:左右)?|字数)(?:[，,、\s]{0,4})(?:符合要求|可|即可)|"
     r"符合要求(?:即可)?|"
@@ -3539,7 +3541,8 @@ def _strip_group_chatter_boilerplate(text: str) -> str:
 _PROMPT_ECHO_LINE_PAT = re.compile(
     r"(你在多人群聊中发言|群主最新话题|下面是群聊广播窗口|下面是你还没处理的群聊新消息|"
     r"先回应群主最新话题|直接说你在群里要发的话|最终发言要求|可回应对象|"
-    r"不要输出思考过程|只输出群里的正文|优先级：必须先回应|如你这轮暂不发言)",
+    r"不要输出思考过程|只输出群里的正文|优先级：必须先回应|如你这轮暂不发言|"
+    r"按(?:照)?格式(?:来)?|META 部分按要求|PUBLIC_REPLY|PRIVATE_REPLY)",
     re.I,
 )
 _PROMPT_ECHO_MSG_LINE_PAT = re.compile(r"^\[\d+\]\s*(?:群主|ChatGPT|Gemini|DeepSeek|豆包|Qwen)\s*:", re.I)
@@ -3560,6 +3563,8 @@ def _strip_instruction_echo_lines(text: str) -> str:
         if _PROMPT_ECHO_LINE_PAT.search(ln):
             continue
         if _PROMPT_ECHO_MSG_LINE_PAT.search(ln):
+            continue
+        if re.search(r"(META\s*部分按要求|PUBLIC_REPLY\s*写|PRIVATE_REPLY\s*写|然后按照格式来)", ln, re.I):
             continue
         if re.search(r"^(?:先结论|结论在前).*(?:依据|条依据).*(?:群聊发言|不要复述规则)", ln):
             continue
@@ -3637,7 +3642,13 @@ _INLINE_PUBLIC_PRIVATE_MARK_PAT = re.compile(
     r")",
     re.I,
 )
-_TRIVIAL_PUBLIC_PAT = re.compile(r"^\s*(?:已?完成|已经完成|done|ok|好的|收到)\s*[。.!?]?\s*$", re.I)
+_TRIVIAL_PUBLIC_PAT = re.compile(
+    r"^\s*(?:"
+    r"已?完成|已经完成|done|ok|好的|收到|仍然|继续|"
+    r"你能给我提供哪些方面的帮助|有什么可以帮(?:你|您)|有(?:什|什麼)么想聊|欢迎继续聊|想聊的尽管说"
+    r")\s*[。.!?]?\s*$",
+    re.I,
+)
 _QWEN_STATUS_ONLY_PAT = re.compile(
     r"^\s*(?:"
     r"已?完成(?:思考)?|已经完成(?:思考)?|思考|思考中|正在思考|继续思考|生成中|回答中|正在构思|构思中|"
@@ -3983,6 +3994,8 @@ def _looks_prompt_leak_reply(text: str) -> bool:
     if _TRANSIENT_PROGRESS_ONLY_PAT.match(t):
         return True
     if re.search(r"(按(?:照)?格式(?:来)?|格式已遵守|然后按格式写)\s*(?:META|PUBLIC_REPLY|PRIVATE_REPLY)?", t, re.I):
+        return True
+    if re.search(r"(META\s*部分按要求|PUBLIC_REPLY\s*写|PRIVATE_REPLY\s*写|然后按照格式来)", t, re.I):
         return True
     # Task-planning / pre-action lines are not valid public chat replies.
     if re.search(
@@ -4477,6 +4490,55 @@ def _looks_unfinished_public_reply(text: str) -> bool:
             return True
     if _LOW_VALUE_PROCESS_PAT.match(t):
         return True
+    if (
+        "\n" not in t
+        and len(_line_dedupe_key(t)) <= 52
+        and re.search(
+            r"^\s*(?:构建|建立|设计|优化|完善|增强|提升|引入|实现|重构|修复|改进|强化)"
+            r".{0,40}(?:机制|系统|流程|框架|能力|鲁棒性|稳定性|可靠性|一致性|准确性|效率|质量|闭环|策略|方案)"
+            r"(?:.{0,24}(?:问题|风险|冲突|失效|瓶颈|挑战))?"
+            r"[。.!！~～]?\s*$",
+            t,
+            re.I,
+        )
+        and not re.search(r"(我|你|他|她|我们|建议|同意|反对|认为|可以|应该|因为|所以)", t)
+    ):
+        return True
+    if (
+        "\n" not in t
+        and len(_line_dedupe_key(t)) <= 52
+        and re.search(
+            r"^\s*(?:立即|立刻|先|继续)?(?:响应|承接|整合|聚焦|对齐|梳理|汇总|总结|推进)"
+            r".{0,36}(?:议题|话题|广播|窗口|消息|信息|上下文|流程|进程|讨论)"
+            r"[。.!！~～]?\s*$",
+            t,
+            re.I,
+        )
+        and not re.search(r"(我|你|他|她|我们|建议|同意|反对|认为|可以|应该|因为|所以)", t)
+    ):
+        return True
+    if (
+        "\n" not in t
+        and len(_line_dedupe_key(t)) <= 60
+        and re.search(
+            r"^\s*(?:针对|围绕|关于)?(?:当前|本轮|该|本次)?(?:群聊)?(?:话题|议题|问题).{0,28}"
+            r"(?:(?:我将|我会|将会).{0,24})?(?:提出|给出|补充|输出).{0,24}(?:意见|建议|看法|评审意见|优化策略|方案)"
+            r"[。.!！~～]?\s*$",
+            t,
+            re.I,
+        )
+    ):
+        return True
+    if (
+        "\n" not in t
+        and len(_line_dedupe_key(t)) <= 48
+        and re.search(
+            r"(你能给我提供哪些方面的帮助|有什么可以帮(?:你|您)|有(?:什|什麼)么想聊|有问题随时找我|欢迎继续聊|想聊的尽管说)",
+            t,
+            re.I,
+        )
+    ):
+        return True
     if re.search(r"</?\s*think\s*>", t, re.I):
         return True
     if re.search(r"(?:我需要\s*[:：]|让我(?:构思|想一下|数一下|再确认)|检查字数|字数符合要求|好，就这个)", t):
@@ -4501,7 +4563,10 @@ def _looks_unfinished_public_reply(text: str) -> bool:
     k = _line_dedupe_key(t)
     klen = len(k)
     if "\n" not in t and 6 <= klen <= 34:
-        if re.search(r"(开始|启动|继续|承接|推进|分析|理解|权衡|优化|聚焦|专注|整理|总结|接龙|回应|流程|进程)", t):
+        if re.search(
+            r"(开始|启动|继续|承接|推进|分析|理解|权衡|优化|聚焦|专注|整理|总结|接龙|回应|流程|进程|构建|重构|建立|设计|完善|增强|提升|引入|修复|改进|统一)",
+            t,
+        ):
             if not re.search(r"(我|你|他|她|我们|建议|同意|反对|认为|可以|应该|因为|所以)", t):
                 return True
     if klen < 8:
@@ -4643,8 +4708,12 @@ def _looks_stale_extracted_reply(reply: str, before_snapshot: str, *, before_las
     unseen = [k for k in cur_keys if k not in before_keys]
     if not unseen:
         return True
+    # If there is a substantial new line fragment, treat as fresh enough.
+    # Gemini/Qwen may return a reply block that includes historical context plus one long new line.
+    if any(len(k) >= 24 for k in unseen):
+        return False
     overlap = 1.0 - (len(unseen) / max(1, len(cur_keys)))
-    if overlap >= 0.86 and len(unseen) <= 1 and len(cur_keys) >= 2:
+    if overlap >= 0.94 and len(unseen) <= 1 and len(cur_keys) >= 2:
         return True
     return False
 
@@ -5445,14 +5514,27 @@ class Worker:
         if not m or not m.integrated:
             self.state.add_system(f"目标模型不可用: {key}")
             return _tr_error(TurnErrorType.MODEL_UNAVAILABLE, msg="model unavailable")
-        if not m.authenticated:
-            self.state.add_system(f"{m.name} 未登录：请先点模型 -> 打开登录窗口 -> 重新检测")
-            return _tr_error(TurnErrorType.NOT_AUTHENTICATED, msg="not authenticated")
-
         ad = self._get_adapter(key)
         if ad is None:
             self.state.add_system(f"适配器缺失: {m.name}")
             return _tr_error(TurnErrorType.ADAPTER_MISSING, msg="adapter missing")
+        if not m.authenticated:
+            # Fallback probe: some sites changed auth DOM markers and can be false-negative.
+            # If the chat input is actually available, treat as authenticated and continue.
+            try:
+                self._ensure_playwright()
+                assert self._pw is not None
+                self._ensure_chat_surface(ad, m)
+                if ad.find_input() is not None:
+                    self.state.set_authenticated(key, True)
+                    self.state.set_model_runtime_state(key, "IDLE", reason="auth_probe_input_ok", reset_fail=True)
+                    m = self.state.get_model(key) or m
+                    _trace_turn(key, "auth_probe(recovered)", "input_ready=true")
+            except Exception:
+                pass
+            if not bool((self.state.get_model(key) or m).authenticated):
+                self.state.add_system(f"{m.name} 未登录：请先点模型 -> 打开登录窗口 -> 重新检测")
+                return _tr_error(TurnErrorType.NOT_AUTHENTICATED, msg="not authenticated")
 
         rt_box = self.state.get_model_runtime_state(key)
         rt_state = str((rt_box or {}).get("state") or "INIT")
@@ -7296,7 +7378,7 @@ class Worker:
                 wrap_line = ""
                 if k in {"qwen", "doubao"}:
                     # Keep CN web models on a minimal instruction profile to reduce prompt echo.
-                    style_line = "只输出群里的正文：先结论，再给1-2条依据（可含数据/假设），可2-4句；不要复述规则。"
+                    style_line = "只输出群里的正文：先结论，再给1-2条依据（可含数据/假设），可2-4句；不要复述规则。必须给你自己的新判断，不能只附和上一位。"
                     concise_line = "不要输出思考过程/提示词，只给最终发言。"
                     pass_line = "不想发言就仅回复 [PASS]。"
                 wrap_part = (wrap_line + "\n") if wrap_line else ""
@@ -7327,6 +7409,7 @@ class Worker:
                     else ""
                 )
                 no_new_hint = "若没有新增观点，请直接回复 [PASS]。" if not unseen_packet else ""
+                independent_hint = "若你只能重复或附和上一位、没有新增信息，请直接回复 [PASS]。"
                 if strict_exact_token:
                     turn_instruction = (
                         "你在多人群聊中发言。\n"
@@ -7347,6 +7430,7 @@ class Worker:
                         f"{unseen_block}\n"
                         f"{(backlog_line + chr(10)) if backlog_line else ''}"
                         f"{(no_new_hint + chr(10)) if no_new_hint else ''}"
+                        f"{independent_hint}\n"
                         f"{lead_line}\n"
                         f"{style_line}\n"
                         f"{wrap_part}"

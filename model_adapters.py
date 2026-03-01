@@ -1462,7 +1462,20 @@ class QwenAdapter(GenericWebChatAdapter):
     )
     _QWEN_SUMMARY_TITLE_PAT = re.compile(
         r"^\s*(?:构建|建立|设计|优化|完善|增强|提升|引入|实现|重构|修复|改进|强化)"
-        r".{0,36}(?:机制|系统|流程|框架|能力|鲁棒性|稳定性|可靠性|一致性|准确性|效率|质量)"
+        r".{0,40}(?:机制|系统|流程|框架|能力|鲁棒性|稳定性|可靠性|一致性|准确性|效率|质量|闭环|策略|方案)"
+        r"(?:.{0,24}(?:问题|风险|冲突|失效|瓶颈|挑战))?"
+        r"[。.!！~～]?\s*$",
+        re.I,
+    )
+    _QWEN_ROUTING_TITLE_PAT = re.compile(
+        r"^\s*(?:立即|立刻|先|继续)?(?:响应|承接|整合|聚焦|对齐|梳理|汇总|总结|推进)"
+        r".{0,36}(?:议题|话题|广播|窗口|消息|信息|上下文|流程|进程|讨论)"
+        r"[。.!！~～]?\s*$",
+        re.I,
+    )
+    _QWEN_VAGUE_STANCE_PAT = re.compile(
+        r"^\s*(?:针对|围绕|关于)?(?:当前|本轮|该|本次)?(?:群聊)?(?:话题|议题|问题).{0,28}"
+        r"(?:(?:我将|我会|将会).{0,24})?(?:提出|给出|补充|输出).{0,24}(?:意见|建议|看法|评审意见|优化策略|方案)"
         r"[。.!！~～]?\s*$",
         re.I,
     )
@@ -1480,10 +1493,19 @@ class QwenAdapter(GenericWebChatAdapter):
             return True
         if (
             "\n" not in t
-            and len(self._line_dedupe_key(t)) <= 36
+            and len(self._line_dedupe_key(t)) <= 52
             and self._QWEN_SUMMARY_TITLE_PAT.match(t)
             and not re.search(r"(我|你|他|她|我们|建议|同意|反对|认为|可以|应该|因为|所以)", t)
         ):
+            return True
+        if (
+            "\n" not in t
+            and len(self._line_dedupe_key(t)) <= 52
+            and self._QWEN_ROUTING_TITLE_PAT.match(t)
+            and not re.search(r"(我|你|他|她|我们|建议|同意|反对|认为|可以|应该|因为|所以)", t)
+        ):
+            return True
+        if "\n" not in t and len(self._line_dedupe_key(t)) <= 60 and self._QWEN_VAGUE_STANCE_PAT.match(t):
             return True
         if (
             "\n" not in t
@@ -1498,7 +1520,10 @@ class QwenAdapter(GenericWebChatAdapter):
         klen = len(self._line_dedupe_key(t))
         if klen < 6 or klen > 34:
             return False
-        if not re.search(r"(开始|启动|继续|承接|推进|分析|理解|权衡|优化|聚焦|专注|整理|总结|接龙|回应|流程|进程)", t):
+        if not re.search(
+            r"(开始|启动|继续|承接|推进|分析|理解|权衡|优化|聚焦|专注|整理|总结|接龙|回应|流程|进程|构建|重构|建立|设计|完善|增强|提升|引入|修复|改进|统一)",
+            t,
+        ):
             return False
         if re.search(r"(我|你|他|她|我们|建议|同意|反对|认为|可以|应该|因为|所以)", t):
             return False
