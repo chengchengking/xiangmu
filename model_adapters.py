@@ -1458,6 +1458,8 @@ class QwenAdapter(GenericWebChatAdapter):
         r"评估(?:人民币计价)?黄金价格走势|评估.*(?:走势|区间|情境|语境|话题)|"
         r"(?:预测|推演)(?:人民币计价)?黄金价格(?:走势|趋势|区间)|(?:预测|推演).*(?:走势|趋势|区间|情境|语境|话题)|"
         r"开始成语接龙游戏|启动成语接龙游戏|接龙游戏正酣.*|"
+        r"(?:正在)?尝试(?:获取|检索|查阅|读取|分析).{0,28}(?:更详细|更多)?(?:的)?(?:.{0,16})?(?:文档|资料|信息|内容).{0,36}|"
+        r"(?:推动|推进|继续推进)(?:群聊|议题|话题|讨论).{0,20}(?:向前发展|继续)|"
         r"我需要[:：].*|让我(?:构思|想一下|数一下|再确认)|检查字数|数一下|好，就这个)\s*[。.!！~～]*\s*$",
         re.I,
     )
@@ -1518,7 +1520,10 @@ class QwenAdapter(GenericWebChatAdapter):
             and len(self._line_dedupe_key(t)) <= 52
             and self._QWEN_SUMMARY_TITLE_PAT.match(t)
         ):
-            return True
+            # Keep one-line actionable statements; reject only when it really looks like a pure title/process stub.
+            if not re.search(r"(因为|依据|例如|风险|步骤|建议|结论|我认为|我建议|具体|实现|通过|采用|以|并|将|可|可以)", t):
+                if not re.search(r"[，,。！？?!]", t) or len(self._line_dedupe_key(t)) <= 28:
+                    return True
         if (
             "\n" not in t
             and len(self._line_dedupe_key(t)) <= 52
@@ -1533,10 +1538,26 @@ class QwenAdapter(GenericWebChatAdapter):
             return True
         if (
             "\n" not in t
+            and 8 <= len(self._line_dedupe_key(t)) <= 56
+            and re.search(r"(查阅|阅读|浏览|审阅|分析|评估|审查)", t)
+            and re.search(r"(项目|架构|系统|方案|可行性|稳定性|合理性)", t)
+            and not re.search(r"(因为|依据|例如|风险|步骤|建议|结论|我认为|我建议|具体|实现)", t)
+        ):
+            return True
+        if (
+            "\n" not in t
             and len(self._line_dedupe_key(t)) <= 26
             and not re.search(r"[。！？?!,，；;:：]", t)
             and re.search(r"(?:评估|预测|推演|判断|分析|权衡|理解|整理|总结)", t)
             and re.search(r"(?:趋势|走势|区间|情境|语境|语义|流程|进程|脉络|回应|回复)", t)
+        ):
+            return True
+        if (
+            "\n" not in t
+            and 8 <= len(self._line_dedupe_key(t)) <= 44
+            and re.search(r"(识别|处理|校验|过滤|拦截|抽取|提取|修复|增强|优化)", t)
+            and re.search(r"(结构化|标记|干扰|噪声|标题|流程|摘要|截断|误抓|回声)", t)
+            and not re.search(r"(因为|依据|例如|风险|步骤|建议|结论|我认为|我建议)", t)
         ):
             return True
         if "\n" in t:
@@ -1550,6 +1571,11 @@ class QwenAdapter(GenericWebChatAdapter):
         ):
             return False
         if re.search(r"(我|你|他|她|我们|建议|同意|反对|认为|可以|应该|因为|所以)", t):
+            return False
+        if re.search(r"[，,。！？?!]", t) and re.search(
+            r"(通过|采用|阈值|日志|校验|回退|重试|隔离|一致性|步骤|指标|补丁|实现|风险|假设)",
+            t,
+        ):
             return False
         return True
 
@@ -1642,6 +1668,9 @@ class QwenAdapter(GenericWebChatAdapter):
             s = ln.strip()
             if not s:
                 continue
+            if re.match(r"^\[\d+\]\s", s):
+                # Leaked packet/history line, not assistant final reply.
+                continue
             if self._QWEN_STATUS_PAT.match(s):
                 continue
             if (
@@ -1706,7 +1735,12 @@ class QwenAdapter(GenericWebChatAdapter):
             return ""
         if self._is_process_title_line(out):
             return ""
-        if self._prompt_echo_overlap_ratio(out) >= 0.5:
+        overlap = self._prompt_echo_overlap_ratio(out)
+        # Qwen may naturally reuse topic terms from the broadcast packet.
+        # Only treat as echo when overlap is very high, or high+prompt-like.
+        if overlap >= 0.78:
+            return ""
+        if overlap >= 0.58 and self._prompt_like_penalty(out) >= 1:
             return ""
         if self._prompt_like_penalty(out) >= 2:
             return ""
@@ -1725,11 +1759,14 @@ class QwenAdapter(GenericWebChatAdapter):
             s = core.normalize_text(ln)
             if not s:
                 continue
+            # Do not use per-message broadcast lines as echo baseline; they are real context and
+            # would incorrectly suppress legitimate replies as "prompt echo".
+            if re.match(r"^\[\d+\]\s", s):
+                continue
             k = self._line_dedupe_key(s)
             if k:
                 keys.add(k)
-            # Keep the payload tail as an echo-key too:
-            # "用户：xxx" / "上一位发言（Qwen）：xxx" should remember "xxx".
+            # Keep short instruction payload tails, but skip long context tails.
             for sep in ("：", ":"):
                 if sep not in s:
                     continue
@@ -1738,8 +1775,10 @@ class QwenAdapter(GenericWebChatAdapter):
                 tk = self._line_dedupe_key(tail)
                 if not tk:
                     continue
-                if len(hk) <= 16 or re.search(
-                    r"(用户|群主|上一位发言|user|assistant|model|chatgpt|gemini|deepseek|qwen|doubao|kimi|豆包|千问|通义|Gemini|ChatGPT|DeepSeek|Qwen|Kimi)",
+                if len(tk) > 40:
+                    continue
+                if len(hk) <= 12 and re.search(
+                    r"(规则|要求|提示|protocol|meta|public|private|pass|输出)",
                     head,
                     re.I,
                 ):
@@ -2156,6 +2195,17 @@ class QwenAdapter(GenericWebChatAdapter):
                 return False
             return len(self._line_dedupe_key(t)) < 42
 
+        def _ready_for_quick_return(reply: str) -> bool:
+            t = core.normalize_text(reply)
+            if not t:
+                return False
+            klen = len(self._line_dedupe_key(t))
+            # Avoid committing too early on Qwen one-line fragments:
+            # wait for a fuller block unless timeout branch is reached.
+            if "\n" not in t and klen < 72:
+                return False
+            return True
+
         best = ""
         best_at = 0.0
         last_change_at = 0.0
@@ -2177,7 +2227,13 @@ class QwenAdapter(GenericWebChatAdapter):
                     last_change_at = now
 
                 # Fast path: if candidate stays unchanged for a short window, return early.
-                if best and len(best) >= 8 and (now - last_change_at) >= 0.65 and not _looks_incomplete(best):
+                if (
+                    best
+                    and len(best) >= 8
+                    and (now - last_change_at) >= 0.65
+                    and not _looks_incomplete(best)
+                    and _ready_for_quick_return(best)
+                ):
                     if _looks_partial(best) and (self._is_qwen_generating() or (now - best_at) < 2.2):
                         pass
                     else:
@@ -2198,7 +2254,12 @@ class QwenAdapter(GenericWebChatAdapter):
                         best = stable
                         best_at = time.time()
                         last_change_at = best_at
-                    if best and time.time() - best_at >= 0.18 and not _looks_incomplete(best):
+                    if (
+                        best
+                        and time.time() - best_at >= 0.18
+                        and not _looks_incomplete(best)
+                        and _ready_for_quick_return(best)
+                    ):
                         if _looks_partial(best) and (time.time() - best_at) < 2.2:
                             pass
                         else:
@@ -2229,7 +2290,13 @@ class QwenAdapter(GenericWebChatAdapter):
                             best_at = now2
                             last_change_at = now2
                         # Fast return from main-diff when stable briefly.
-                        if best and len(best) >= 8 and (now2 - last_change_at) >= 0.5 and not _looks_incomplete(best):
+                        if (
+                            best
+                            and len(best) >= 8
+                            and (now2 - last_change_at) >= 0.5
+                            and not _looks_incomplete(best)
+                            and _ready_for_quick_return(best)
+                        ):
                             if _looks_partial(best) and (self._is_qwen_generating() or (now2 - best_at) < 2.2):
                                 pass
                             else:
@@ -2240,6 +2307,7 @@ class QwenAdapter(GenericWebChatAdapter):
                 and not self._is_qwen_generating()
                 and (time.time() - best_at) >= 0.45
                 and not _looks_incomplete(best)
+                and _ready_for_quick_return(best)
             ):
                 if _looks_partial(best) and (time.time() - best_at) < 2.2:
                     pass

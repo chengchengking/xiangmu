@@ -3475,6 +3475,8 @@ _LOW_VALUE_PROCESS_PAT = re.compile(
     r"基于当前信息提出预测与假设|先给区间和假设|首先[，,]先给区间和假设|"
     r"根据(?:群主)?最新话题.*(?:给出|回应|讨论)|给出一个简洁.*核心假设|"
     r"给出.*人民币.*黄金.*价格区间.*假设|"
+    r"(?:正在)?尝试(?:获取|检索|查阅|读取|分析).{0,28}(?:更详细|更多)?(?:的)?(?:.{0,16})?(?:文档|资料|信息|内容).{0,36}|"
+    r"(?:推动|推进|继续推进)(?:群聊|议题|话题|讨论).{0,20}(?:向前发展|继续)|"
     r"思考问题的逻辑结构|确认计算结果无误|寻找(?:符合|满足)条件的三位数|"
     r"读取来源已完成|来源读取已完成|source\s+read\s+complete|"
     r"META\s*部分按要求|PUBLIC_REPLY\s*写(?:\s*conci[sc]e)?(?:\s*的?内容)?|"
@@ -3950,6 +3952,31 @@ def _strip_leading_status_noise(text: str) -> str:
         if _QWEN_STATUS_ONLY_PAT.match(s2):
             continue
         out.append(s2)
+    return core.normalize_text("\n".join(out))
+
+
+def _strip_structured_prefix_labels(text: str) -> str:
+    """
+    去掉模型常见的模板化前缀标签，避免公开消息里充斥“立场：/补丁：/依据：”。
+    只去前缀，不改正文语义。
+    """
+    t = core.normalize_text(text)
+    if not t:
+        return ""
+    out: list[str] = []
+    for ln in t.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        s = re.sub(
+            r"^\s*(?:立场|补丁|结论|依据|观点|推论|Patch|Reason|Rationale|Take)\s*[：:]\s*",
+            "",
+            s,
+            flags=re.I,
+        )
+        s = core.normalize_text(s) or ""
+        if s:
+            out.append(s)
     return core.normalize_text("\n".join(out))
 
 
@@ -4502,7 +4529,10 @@ def _looks_unfinished_public_reply(text: str) -> bool:
             re.I,
         )
     ):
-        return True
+        # Keep actionable one-liners (often valid final replies), reject only pure title-like stubs.
+        if not re.search(r"(因为|依据|例如|风险|步骤|建议|结论|我认为|我建议|具体|实现|通过|采用|以|并|将|可|可以)", t):
+            if not re.search(r"[，,。！？?!]", t) or len(_line_dedupe_key(t)) <= 28:
+                return True
     if (
         "\n" not in t
         and len(_line_dedupe_key(t)) <= 52
@@ -4552,6 +4582,14 @@ def _looks_unfinished_public_reply(text: str) -> bool:
         return True
     if (
         "\n" not in t
+        and 8 <= len(_line_dedupe_key(t)) <= 56
+        and re.search(r"(查阅|阅读|浏览|审阅|分析|评估|审查)", t)
+        and re.search(r"(项目|架构|系统|方案|可行性|稳定性|合理性)", t)
+        and not re.search(r"(因为|依据|例如|风险|步骤|建议|结论|我认为|我建议|具体|实现)", t)
+    ):
+        return True
+    if (
+        "\n" not in t
         and len(_line_dedupe_key(t)) <= 48
         and re.search(
             r"(你能给我提供哪些方面的帮助|有什么可以帮(?:你|您)|有(?:什|什麼)么想聊|有问题随时找我|欢迎继续聊|想聊的尽管说)",
@@ -4589,7 +4627,20 @@ def _looks_unfinished_public_reply(text: str) -> bool:
             t,
         ):
             if not re.search(r"(我|你|他|她|我们|建议|同意|反对|认为|可以|应该|因为|所以)", t):
-                return True
+                if re.search(r"[，,。！？?!]", t) and re.search(
+                    r"(通过|采用|阈值|日志|校验|回退|重试|隔离|一致性|步骤|指标|补丁|实现|风险|假设)",
+                    t,
+                ):
+                    pass
+                else:
+                    return True
+    if "\n" not in t and 8 <= klen <= 44:
+        if (
+            re.search(r"(识别|处理|校验|过滤|拦截|抽取|提取|修复|增强|优化)", t)
+            and re.search(r"(结构化|标记|干扰|噪声|标题|流程|摘要|截断|误抓|回声)", t)
+            and not re.search(r"(因为|依据|例如|风险|步骤|建议|结论|我认为|我建议)", t)
+        ):
+            return True
     if klen < 8:
         return True
     if any(h in t for h in ("正在构思", "构思中", "先想一下", "先整理一下", "组织语言")):
@@ -4609,6 +4660,32 @@ def _looks_unfinished_public_reply(text: str) -> bool:
     if "\n" not in t and klen < 18 and not re.search(r"[。？！?!]", t):
         return True
     return False
+
+
+def _is_unfinished_public_reply_for_model(model_key: str, text: str) -> bool:
+    """
+    unfinished 统一判定 + 模型差异化兜底：
+    - Qwen 仍保持严格，避免“标题句/路由句”误采纳；
+    - 豆包对“短但完整的技术补丁句”放宽，减少误判为 unfinished。
+    """
+    if not _looks_unfinished_public_reply(text):
+        return False
+    key = (model_key or "").strip().lower()
+    if key == "doubao":
+        t = core.normalize_text(text)
+        klen = len(_line_dedupe_key(t))
+        if (
+            "\n" not in t
+            and klen >= 24
+            and re.search(r"[。！？?!]", t)
+            and re.search(
+                r"(补丁|建议|依据|阈值|日志|校验|回退|重试|隔离|一致性|风险|结论|方案|实现|步骤|监控|超时|内存|截断|去重)",
+                t,
+                re.I,
+            )
+        ):
+            return False
+    return True
 
 
 def _looks_protocol_placeholder_public_reply(text: str) -> bool:
@@ -4663,6 +4740,59 @@ def _looks_like_suggestion_chip_reply(text: str) -> bool:
             chip_like += 1
             continue
     return chip_like >= max(2, int(len(parts) * 0.65))
+
+
+def _looks_low_independence_reply(text: str) -> bool:
+    t = core.normalize_text(text)
+    if not t:
+        return False
+    klen = len(_line_dedupe_key(t))
+    if klen <= 0:
+        return False
+    if _looks_unfinished_public_reply(t):
+        return False
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    head = lines[0] if lines else t
+    agree_head = bool(
+        re.match(
+            r"^\s*(?:我)?(?:同意|赞同|支持|认同|基本同意|完全同意|我同意|我赞同|我支持|我认同|确实|说得对|有道理)",
+            head,
+            re.I,
+        )
+    )
+    if not agree_head:
+        return False
+    if klen >= 120:
+        return False
+    novelty_signals = [
+        "依据",
+        "数据",
+        "假设",
+        "风险",
+        "边界",
+        "代价",
+        "取舍",
+        "阈值",
+        "实现",
+        "补丁",
+        "代码",
+        "日志",
+        "指标",
+        "步骤",
+        "具体",
+        "例如",
+        "但是",
+        "不过",
+        "然而",
+        "同时",
+    ]
+    novelty_hits = sum(1 for s in novelty_signals if s in t)
+    if novelty_hits <= 0:
+        return True
+    # Very short agreement lines are still low-value even with one weak signal.
+    if klen < 52 and novelty_hits <= 1:
+        return True
+    return False
 
 
 def _strip_trailing_solicit_line(text: str) -> str:
@@ -4747,6 +4877,17 @@ def _pick_best_semantic_fragment(text: str) -> str:
     t = core.normalize_text(text)
     if not t:
         return ""
+    # Prefer coherent full block. Fragment-picking is mainly for noisy mixed blocks.
+    full_klen = len(_line_dedupe_key(t))
+    full_lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if (
+        len(full_lines) >= 2
+        and full_klen >= 72
+        and not _looks_prompt_leak_reply(t)
+        and not _looks_like_suggestion_chip_reply(t)
+        and not _looks_unfinished_public_reply(t)
+    ):
+        return t
     segments: list[tuple[int, str]] = []
     for idx_line, ln in enumerate(t.splitlines()):
         s = ln.strip()
@@ -4890,10 +5031,10 @@ class Worker:
     def _build_authoritative_broadcast_packet(
         self,
         *,
-        max_items: int = 6,
+        max_items: int = 10,
         max_chars: int = 1200,
         floor_id: int = 0,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, list[int]]:
         msgs = self.state.get_all_messages()
         pub = [
             m
@@ -4903,22 +5044,11 @@ class Worker:
             and core.normalize_text(m.text)
             and (int(m.id) >= int(floor_id) if int(floor_id or 0) > 0 else True)
         ]
-        # Keep packet compact: de-duplicate by speaker-role key from tail.
-        # This avoids repeated same-speaker long blocks starving slower adapters.
-        picked_rev: list[UiMessage] = []
-        seen_keys: set[str] = set()
-        for mm in reversed(pub):
-            role = "U" if mm.role == "user" else "M"
-            speaker = core.normalize_text(mm.speaker).lower() if mm.role == "model" else "user"
-            sk = f"{role}:{speaker}"
-            if sk in seen_keys:
-                continue
-            picked_rev.append(mm)
-            seen_keys.add(sk)
-            if len(picked_rev) >= max(1, int(max_items)):
-                break
-        items = list(reversed(picked_rev))
+        # Keep authoritative packet by timeline order (tail window), do not dedupe by speaker.
+        # Dedupe-by-speaker hides turns and causes context drift between models.
+        items = pub[-max(1, int(max_items)) :]
         lines = [f"【广播包 run_id={RUN_ID}】"]
+        included_ids: list[int] = []
         for mm in items:
             role = "U" if mm.role == "user" else "M"
             speaker = core.normalize_text(mm.speaker)
@@ -4926,12 +5056,13 @@ class Worker:
             if len(text) > 160:
                 text = text[:160] + "…"
             lines.append(f"- {role}#{mm.id}({speaker}): {text}")
+            included_ids.append(int(mm.id))
         lines.append("【广播包结束】")
         packet = "\n".join(lines)
         if len(packet) > max_chars:
             packet = packet[:max_chars] + "\n【广播包截断】"
         h = hashlib.sha1(packet.encode("utf-8")).hexdigest()[:12]
-        return packet, h
+        return packet, h, included_ids
 
     def _ack_in_from_public_timeline(self) -> str:
         msgs = self.state.get_all_messages()
@@ -5621,6 +5752,10 @@ class Worker:
             ctx = TurnContext(turn_id=self._turn_seq, mode=turn_mode)
             self._last_turn_ctx_by_model[(key or "").strip().lower()] = ctx
             defer_final_receipt = bool(visibility == "public" and not record_reply)
+            allow_prompt_resend = _allow_prompt_resend_same_turn(
+                visibility=visibility,
+                record_reply=record_reply,
+            )
             if ENABLE_EVIDENCE_MODE:
                 try:
                     if ctx.mode != Mode.EVIDENCE:
@@ -5806,11 +5941,12 @@ class Worker:
                         diff_full = _sanitize_forward_payload(diff_full) or diff_full
                         diff_full = _strip_leading_status_noise(diff_full) or diff_full
                         diff_full = _dedupe_public_reply(diff_full) or diff_full
-                        diff_full = _pick_best_semantic_fragment(diff_full) or diff_full
+                        if key == "doubao":
+                            diff_full = _pick_best_semantic_fragment(diff_full) or diff_full
                         if (
                             diff_full
                             and not _looks_prompt_leak_reply(diff_full)
-                            and not _looks_unfinished_public_reply(diff_full)
+                                and not _is_unfinished_public_reply_for_model(key, diff_full)
                             and not _looks_like_suggestion_chip_reply(diff_full)
                         ):
                             reply = diff_full
@@ -5876,12 +6012,12 @@ class Worker:
                             rep_pub = _strip_leading_status_noise(rep_pub) or rep_pub
                             rep_pub = _dedupe_public_reply(rep_pub) or rep_pub
                             rep_pub = _strip_trailing_solicit_line(rep_pub) or rep_pub
-                            if key in {"doubao", "qwen"}:
+                            if key == "doubao":
                                 rep_pub = _pick_best_semantic_fragment(rep_pub) or rep_pub
                             if (
                                 rep_pub
                                 and not _looks_prompt_leak_reply(rep_pub)
-                                and not _looks_unfinished_public_reply(rep_pub)
+                                and not _is_unfinished_public_reply_for_model(key, rep_pub)
                                 and not _looks_like_suggestion_chip_reply(rep_pub)
                                 and not _LOW_VALUE_PROCESS_PAT.match(rep_pub)
                             ):
@@ -5891,7 +6027,13 @@ class Worker:
                                 _trace_turn(key, "recover(no_public_tagged_repoll)", rep_pub)
                     except Exception:
                         recovered = False
-                if (not recovered) and key in {"doubao", "qwen", "deepseek"} and visibility == "public" and not record_reply:
+                if (
+                    (not recovered)
+                    and allow_prompt_resend
+                    and key in {"doubao", "qwen", "deepseek"}
+                    and visibility == "public"
+                    and not record_reply
+                ):
                     try:
                         fallback_instruction = _strip_protocol_suffix_from_instruction(instruction)
                         fallback_instruction = (
@@ -5915,12 +6057,12 @@ class Worker:
                             fb_pub = _strip_leading_status_noise(fb_pub) or fb_pub
                             fb_pub = _dedupe_public_reply(fb_pub) or fb_pub
                             fb_pub = _strip_trailing_solicit_line(fb_pub) or fb_pub
-                            if key in {"doubao", "qwen"}:
+                            if key == "doubao":
                                 fb_pub = _pick_best_semantic_fragment(fb_pub) or fb_pub
                             if (
                                 fb_pub
                                 and not _looks_prompt_leak_reply(fb_pub)
-                                and not _looks_unfinished_public_reply(fb_pub)
+                                and not _is_unfinished_public_reply_for_model(key, fb_pub)
                                 and not _looks_like_suggestion_chip_reply(fb_pub)
                                 and not _LOW_VALUE_PROCESS_PAT.match(fb_pub)
                             ):
@@ -5952,6 +6094,8 @@ class Worker:
             private_reply = core.normalize_text(private_reply)
             public_reply = _strip_leading_status_noise(public_reply) or public_reply
             private_reply = _strip_leading_status_noise(private_reply) or private_reply
+            public_reply = _strip_structured_prefix_labels(public_reply) or public_reply
+            private_reply = _strip_structured_prefix_labels(private_reply) or private_reply
             pub_key_len = len(re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", public_reply.lower()))
             pri_key_len = len(re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", private_reply.lower()))
             if private_reply and pri_key_len >= 28 and (pub_key_len < 10 or _TRIVIAL_PUBLIC_PAT.match(public_reply)):
@@ -5994,7 +6138,7 @@ class Worker:
                             if (
                                 r2_pub
                                 and not _looks_prompt_leak_reply(r2_pub)
-                                and not _looks_unfinished_public_reply(r2_pub)
+                                and not _is_unfinished_public_reply_for_model(key, r2_pub)
                                 and not _looks_like_suggestion_chip_reply(r2_pub)
                             ):
                                 public_reply = r2_pub
@@ -6012,17 +6156,17 @@ class Worker:
                             raw_last = _strip_leading_status_noise(raw_last) or raw_last
                             raw_last = _dedupe_public_reply(raw_last) or raw_last
                             raw_last = _strip_trailing_solicit_line(raw_last) or raw_last
-                            if key in {"qwen", "doubao"}:
+                            if key == "doubao":
                                 raw_last = _pick_best_semantic_fragment(raw_last) or raw_last
                             if (
                                 raw_last
                                 and not _looks_prompt_leak_reply(raw_last)
-                                and not _looks_unfinished_public_reply(raw_last)
+                                and not _is_unfinished_public_reply_for_model(key, raw_last)
                                 and not _looks_like_suggestion_chip_reply(raw_last)
                             ):
                                 public_reply = raw_last
                                 sanitized_public = raw_last
-                    if not sanitized_public and key == "doubao":
+                    if not sanitized_public and key == "doubao" and allow_prompt_resend:
                         # Doubao may briefly return control-text first; resend once to obtain final block.
                         try:
                             ad.send_user_text(prompt)
@@ -6041,7 +6185,7 @@ class Worker:
                             if (
                                 r3_pub
                                 and not _looks_prompt_leak_reply(r3_pub)
-                                and not _looks_unfinished_public_reply(r3_pub)
+                                and not _is_unfinished_public_reply_for_model(key, r3_pub)
                                 and not _looks_like_suggestion_chip_reply(r3_pub)
                             ):
                                 public_reply = r3_pub
@@ -6100,11 +6244,12 @@ class Worker:
                         )
             public_reply = _strip_group_chatter_boilerplate(public_reply) or public_reply
             public_reply = _strip_leading_status_noise(public_reply) or public_reply
+            public_reply = _strip_structured_prefix_labels(public_reply) or public_reply
             public_reply = _dedupe_public_reply(public_reply) or public_reply
             public_reply = _strip_trailing_solicit_line(public_reply) or public_reply
-            if key in {"qwen", "doubao"}:
-                # Aggressive fragment picking is mainly needed for noisy web UIs.
-                # For Gemini/ChatGPT/DeepSeek, keep full public semantic blocks.
+            if key == "doubao":
+                # Aggressive fragment picking is currently only enabled for Doubao.
+                # Qwen keeps full blocks to avoid one-line truncation.
                 public_reply = _pick_best_semantic_fragment(public_reply) or public_reply
             public_reply = _strip_trailing_solicit_line(public_reply) or public_reply
             if _looks_provider_error_reply(public_reply):
@@ -6135,7 +6280,8 @@ class Worker:
                     retry_pub = _sanitize_forward_payload(retry_pub) or retry_pub
                     retry_pub = _strip_leading_status_noise(retry_pub) or retry_pub
                     retry_pub = _dedupe_public_reply(retry_pub) or retry_pub
-                    retry_pub = _pick_best_semantic_fragment(retry_pub) or retry_pub
+                    if key == "doubao":
+                        retry_pub = _pick_best_semantic_fragment(retry_pub) or retry_pub
                     if retry_pub and not _QWEN_STATUS_ONLY_PAT.match(retry_pub):
                         public_reply = retry_pub
                         if retry_pri:
@@ -6149,7 +6295,7 @@ class Worker:
                     else:
                         public_reply = "（未能提取到有效回复）"
             if key in {"qwen", "doubao"} and visibility == "public" and not record_reply:
-                if _LOW_VALUE_PROCESS_PAT.match(public_reply or "") or _looks_unfinished_public_reply(public_reply):
+                if _LOW_VALUE_PROCESS_PAT.match(public_reply or "") or _is_unfinished_public_reply_for_model(key, public_reply):
                     retry_timeout2 = 18 if key == "qwen" else 16
                     try:
                         retry_lv = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=retry_timeout2))
@@ -6163,12 +6309,12 @@ class Worker:
                         r_pub = _sanitize_forward_payload(r_pub) or r_pub
                         r_pub = _dedupe_public_reply(r_pub) or r_pub
                         r_pub = _strip_trailing_solicit_line(r_pub) or r_pub
-                        if key in {"qwen", "doubao"}:
+                        if key == "doubao":
                             r_pub = _pick_best_semantic_fragment(r_pub) or r_pub
                         if (
                             r_pub
                             and not _LOW_VALUE_PROCESS_PAT.match(r_pub)
-                            and not _looks_unfinished_public_reply(r_pub)
+                            and not _is_unfinished_public_reply_for_model(key, r_pub)
                             and not _looks_prompt_leak_reply(r_pub)
                         ):
                             public_reply = r_pub
@@ -6212,6 +6358,8 @@ class Worker:
                             # One resend fallback for Gemini stale snapshots.
                             # Trade a bit more token usage for much better first-turn reliability.
                             try:
+                                if not allow_prompt_resend:
+                                    raise RuntimeError("prompt_resend_disabled_in_group")
                                 ad.send_user_text(prompt)
                                 resend_g = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=22))
                             except Exception:
@@ -6230,6 +6378,54 @@ class Worker:
                                     public_reply = g_pub
                                     if g_pri:
                                         private_reply = _strip_leading_status_noise(core.normalize_text(g_pri))
+                    elif key == "qwen":
+                        # Qwen may occasionally expose a stale previous block first.
+                        # Repoll once, then optionally resend once before final stale PASS.
+                        retry_stale_q = ""
+                        try:
+                            retry_stale_q = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=16))
+                        except Exception:
+                            retry_stale_q = ""
+                        if retry_stale_q:
+                            rq_pub, rq_pri = _split_public_private_reply(retry_stale_q)
+                            rq_pub = core.normalize_text(rq_pub) or retry_stale_q
+                            rq_pub = _strip_instruction_echo(rq_pub, instruction)
+                            rq_pub = _sanitize_forward_payload(rq_pub) or rq_pub
+                            rq_pub = _strip_leading_status_noise(rq_pub) or rq_pub
+                            rq_pub = _dedupe_public_reply(rq_pub) or rq_pub
+                            rq_pub = _strip_trailing_solicit_line(rq_pub) or rq_pub
+                            if key == "doubao":
+                                rq_pub = _pick_best_semantic_fragment(rq_pub) or rq_pub
+                            if rq_pub and not _looks_stale_extracted_reply(
+                                rq_pub, before, before_last_reply=before_last_reply
+                            ):
+                                public_reply = rq_pub
+                                if rq_pri:
+                                    private_reply = _strip_leading_status_noise(core.normalize_text(rq_pri))
+                        if _looks_stale_extracted_reply(public_reply, before, before_last_reply=before_last_reply):
+                            try:
+                                if not allow_prompt_resend:
+                                    raise RuntimeError("prompt_resend_disabled_in_group")
+                                ad.send_user_text(prompt)
+                                resend_q = core.normalize_text(ad.wait_reply_and_extract(before, timeout_s=20))
+                            except Exception:
+                                resend_q = ""
+                            if resend_q:
+                                q_pub, q_pri = _split_public_private_reply(resend_q)
+                                q_pub = core.normalize_text(q_pub) or resend_q
+                                q_pub = _strip_instruction_echo(q_pub, instruction)
+                                q_pub = _sanitize_forward_payload(q_pub) or q_pub
+                                q_pub = _strip_leading_status_noise(q_pub) or q_pub
+                                q_pub = _dedupe_public_reply(q_pub) or q_pub
+                                q_pub = _strip_trailing_solicit_line(q_pub) or q_pub
+                                if key == "doubao":
+                                    q_pub = _pick_best_semantic_fragment(q_pub) or q_pub
+                                if q_pub and not _looks_stale_extracted_reply(
+                                    q_pub, before, before_last_reply=before_last_reply
+                                ):
+                                    public_reply = q_pub
+                                    if q_pri:
+                                        private_reply = _strip_leading_status_noise(core.normalize_text(q_pri))
                     if _looks_stale_extracted_reply(public_reply, before, before_last_reply=before_last_reply):
                         _trace_turn(key, "pass(stale_snapshot)", public_reply)
                         return _tr_pass(
@@ -6240,7 +6436,7 @@ class Worker:
                             meta=(env.meta if "env" in locals() else None),
                         )
             if key in {"doubao", "qwen"} and visibility == "public" and not record_reply:
-                if _looks_unfinished_public_reply(public_reply):
+                if _is_unfinished_public_reply_for_model(key, public_reply):
                     _trace_turn(key, "pass(unfinished)", public_reply)
                     return _tr_pass(reason="unfinished", raw_reply=reply, private_text=private_reply)
                 if _TRIVIAL_PUBLIC_PAT.match(public_reply):
@@ -6874,6 +7070,10 @@ class Worker:
         if not pending_ids:
             return "", [], 0
 
+        pending_ids = _dedupe_int_ids_preserve_order(pending_ids)
+        if not pending_ids:
+            return "", [], 0
+
         key_norm = (model_key or "").strip().lower()
         msg_map: dict[int, UiMessage] = {}
         for msg in self.state.get_all_messages():
@@ -7324,10 +7524,11 @@ class Worker:
             round_interrupted_by_host = False
             round_context_chars = self._estimate_recent_public_context_chars()
             packet_floor_id = int(active_topic_floor_id or group_floor_id or 0)
-            authoritative_packet_text, authoritative_packet_hash = self._build_authoritative_broadcast_packet(
+            authoritative_packet_text, authoritative_packet_hash, authoritative_packet_ids = self._build_authoritative_broadcast_packet(
                 floor_id=packet_floor_id
             )
             authoritative_ack_in = self._ack_in_from_public_timeline()
+            packet_id_set = {int(x) for x in authoritative_packet_ids}
             round_packet_hash_seen: dict[str, str] = {}
             for k in talk_keys:
                 if self.state.should_round_stop():
@@ -7369,10 +7570,25 @@ class Worker:
                 if strict_topic_phase and active_topic_floor_id > 0:
                     pending_for_k = [mid for mid in pending_for_k if int(mid) >= int(active_topic_floor_id)]
                     group_pending_ids[k] = list(pending_for_k)
+                packet_covered_ids: list[int] = []
+                if packet_id_set and pending_for_k:
+                    packet_covered_ids = [int(mid) for mid in pending_for_k if int(mid) in packet_id_set]
+                    pending_for_k = [int(mid) for mid in pending_for_k if int(mid) not in packet_id_set]
                 unseen_packet, delivered_ids, unseen_remaining = self._build_group_pending_packet(
                     model_key=k,
                     pending_ids=pending_for_k,
                 )
+                if packet_covered_ids:
+                    merged: list[int] = []
+                    seen_mid: set[int] = set()
+                    for mid in packet_covered_ids + delivered_ids:
+                        im = int(mid)
+                        if im in seen_mid:
+                            continue
+                        seen_mid.add(im)
+                        merged.append(im)
+                    delivered_ids = merged
+                    unseen_remaining = max(0, len(group_pending_ids.get(k, [])) - len(delivered_ids))
                 recent_floor_id = int(active_topic_floor_id) if strict_topic_phase else int(group_floor_id)
                 recent_packet = self._build_group_recent_packet(
                     floor_id=recent_floor_id,
@@ -7398,13 +7614,13 @@ class Worker:
                     mention_line = ""
                 mention_part = (mention_line + "\n") if mention_line else ""
                 pass_line = "如你这轮暂不发言，仅回复 [PASS]。"
-                concise_line = "最终发言要求：建议2-5句，80-260字；复杂议题可到400字，优先给依据/数据/假设。"
-                style_line = "直接说你在群里要发的话：先给立场，再给关键依据（可含数据/假设），不要复述规则。"
+                concise_line = "最终发言要求：建议3-6句，120-360字；复杂议题可到520字，给出观点与理由。"
+                style_line = "直接输出你在群里的自然发言：先观点、后理由（可含数据/假设），不要复述规则；不要写“立场：/补丁：/依据：/结论：”标签。"
                 wrap_line = ""
                 if k in {"qwen", "doubao"}:
                     # Keep CN web models on a minimal instruction profile to reduce prompt echo.
-                    style_line = "只输出群里的正文：先结论，再给1-2条依据（可含数据/假设），可2-4句；不要复述规则。必须给你自己的新判断，不能只附和上一位。"
-                    concise_line = "不要输出思考过程/提示词，只给最终发言。"
+                    style_line = "只输出群里的自然正文：给出你的独立观点与理由（建议3-6句）；不要复述规则；不要写“立场：/补丁：/依据：/结论：”标签。若没有新增信息，仅回复 [PASS]。"
+                    concise_line = "不要输出思考过程/提示词，只给最终发言；不要只附和上一位。"
                     pass_line = "不想发言就仅回复 [PASS]。"
                 wrap_part = (wrap_line + "\n") if wrap_line else ""
                 topic_lock_line = (
@@ -7428,6 +7644,7 @@ class Worker:
                 user_line = _clip_text(active_user_instruction or "", 420)
                 unseen_block = unseen_packet if unseen_packet else "（当前没有未读新消息）"
                 recent_block = recent_packet if recent_packet else "（最近窗口为空）"
+                use_authoritative_packet = bool(authoritative_packet_text)
                 backlog_line = (
                     f"还有 {unseen_remaining} 条未读消息将在后续轮次继续同步。"
                     if unseen_remaining > 0
@@ -7445,12 +7662,15 @@ class Worker:
                         "无法执行就回复 [PASS]。"
                     )
                 else:
+                    recent_section = _format_group_recent_section(
+                        recent_block,
+                        use_authoritative_packet=use_authoritative_packet,
+                    )
                     turn_instruction = (
                         "你在多人群聊中发言。\n"
                         f"{(f'群主最新话题：{user_line}\\n') if user_line else ''}"
                         f"{topic_lock_part}"
-                        "下面是群聊广播窗口（最近公开消息，可能含已读）：\n"
-                        f"{recent_block}\n"
+                        f"{recent_section}"
                         "下面是你还没处理的群聊新消息（按时间顺序）：\n"
                         f"{unseen_block}\n"
                         f"{(backlog_line + chr(10)) if backlog_line else ''}"
@@ -7538,7 +7758,7 @@ class Worker:
                     clean_reply = _sanitize_forward_payload(clean_reply) or clean_reply
                     clean_reply = _dedupe_public_reply(clean_reply) or clean_reply
                     clean_reply = _strip_trailing_solicit_line(clean_reply) or clean_reply
-                    if k in {"qwen", "doubao"} or _looks_prompt_leak_reply(clean_reply):
+                    if k == "doubao" or (k != "qwen" and _looks_prompt_leak_reply(clean_reply)):
                         clean_reply = _pick_best_semantic_fragment(clean_reply) or clean_reply
                     clean_reply = _strip_trailing_solicit_line(clean_reply) or clean_reply
                     clean_reply = _compact_public_reply(
@@ -7564,6 +7784,7 @@ class Worker:
                     if _looks_prompt_leak_reply(clean_reply):
                         _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.LOW_VALUE, "prompt_leak")
                         _mark_topic_miss_if_needed()
+                        _mark_delivered(delivered_ids)
                         _trace_turn(k, "pass(loop_prompt_leak)", clean_reply)
                         continue
                     prev_same_model = [
@@ -7574,21 +7795,31 @@ class Worker:
                     if _looks_redundant_model_repeat(clean_reply, prev_same_model):
                         _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.LOW_VALUE, "repeat_self")
                         _mark_topic_miss_if_needed()
+                        _mark_delivered(delivered_ids)
                         _trace_turn(k, "pass(loop_repeat_self)", clean_reply)
                         continue
-                    if k in {"qwen", "doubao"} and _looks_unfinished_public_reply(clean_reply):
+                    if k in {"qwen", "doubao"} and _is_unfinished_public_reply_for_model(k, clean_reply):
                         _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.LOW_VALUE, "unfinished")
                         _mark_topic_miss_if_needed()
+                        _mark_delivered(delivered_ids)
                         _trace_turn(k, "pass(loop_unfinished)", clean_reply)
                         continue
                     if k in {"qwen", "doubao"} and _looks_like_suggestion_chip_reply(clean_reply):
                         _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.LOW_VALUE, "chip_reply")
                         _mark_topic_miss_if_needed()
+                        _mark_delivered(delivered_ids)
                         _trace_turn(k, "pass(loop_chip)", clean_reply)
+                        continue
+                    if k == "qwen" and _looks_low_independence_reply(clean_reply):
+                        _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.LOW_VALUE, "low_independence")
+                        _mark_topic_miss_if_needed()
+                        _mark_delivered(delivered_ids)
+                        _trace_turn(k, "pass(loop_low_independence)", clean_reply)
                         continue
                     if _LOW_VALUE_PROCESS_PAT.match(clean_reply) or _QWEN_STATUS_ONLY_PAT.match(clean_reply):
                         _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.LOW_VALUE, "process_or_status")
                         _mark_topic_miss_if_needed()
+                        _mark_delivered(delivered_ids)
                         _trace_turn(k, "pass(loop_process_or_status)", clean_reply)
                         continue
                     # Hard strict-topic rejection is only for explicit exact-answer tasks
@@ -7619,6 +7850,7 @@ class Worker:
                                     self.state.add_system(f"{nm} 连续{tries}次未对齐新话题，已暂时跳过。")
                             # Topic-lock phase: drop off-topic content to avoid stale-thread pollution.
                             _finalize_turn_receipt_local(ReceiptStatus.REJECT, RejectReason.OFF_TOPIC)
+                            _mark_delivered(delivered_ids)
                             _trace_turn(k, "pass(loop_strict_topic_misaligned)", clean_reply)
                             continue
                     mcur = self.state.get_model(k)
@@ -7889,6 +8121,7 @@ def _format_user(text: str) -> str:
 def _sanitize_forward_payload(text: str) -> str:
     t = _strip_group_chatter_boilerplate(text)
     t = _strip_instruction_echo_lines(t) or t
+    t = _strip_structured_prefix_labels(t) or t
     t = core.normalize_text(t)
     if not t:
         return ""
@@ -8035,6 +8268,43 @@ def _pick_forward_payload(full_reply: str) -> str:
     if not text:
         return ""
     return _clip_text(text, FORWARD_MAX_CHARS)
+
+
+def _format_group_recent_section(recent_block: str, *, use_authoritative_packet: bool) -> str:
+    """
+    构造群聊提示中的“最近消息”片段：
+    - 已注入 authoritative packet 时，不重复塞 recent_block；
+    - 未注入时，保留 recent_block 作为兜底上下文。
+    """
+    if use_authoritative_packet:
+        return "最近公开消息请以上方“广播包”为准，不再重复粘贴。\n"
+    return (
+        "下面是群聊广播窗口（最近公开消息，可能含已读）：\n"
+        f"{recent_block}\n"
+    )
+
+
+def _allow_prompt_resend_same_turn(*, visibility: str, record_reply: bool) -> bool:
+    """
+    群聊公共轮（visibility=public 且 record_reply=False）禁止同轮再次 send_user_text，
+    避免在网页端产生紧邻重复系统消息，增加上下文与 token 负担。
+    """
+    return not (visibility == "public" and not record_reply)
+
+
+def _dedupe_int_ids_preserve_order(ids: list[int]) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for raw in ids:
+        try:
+            mid = int(raw)
+        except Exception:
+            continue
+        if mid in seen:
+            continue
+        seen.add(mid)
+        out.append(mid)
+    return out
 
 
 def _strip_forward_summary(full_reply: str) -> str:
