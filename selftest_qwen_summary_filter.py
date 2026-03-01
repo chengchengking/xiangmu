@@ -23,8 +23,15 @@ class TestQwenSummaryFilter(unittest.TestCase):
         self.ad = QwenAdapter(_meta())
 
     def test_reject_summary_title_like_sentence(self) -> None:
-        # Typical wrong extraction from Qwen thought/sidebar summary.
         bad = "构建多层级容错机制以增强对话系统的鲁棒性。"
+        self.assertEqual(self.ad._clean_candidate_text(bad), "")
+
+    def test_reject_focus_confirmation_sentence(self) -> None:
+        bad = "确认当前讨论焦点为Qwen标题提取的异常问题。"
+        self.assertEqual(self.ad._clean_candidate_text(bad), "")
+
+    def test_reject_repo_action_sentence(self) -> None:
+        bad = "查阅项目仓库以明确产品定位与潜在问题。"
         self.assertEqual(self.ad._clean_candidate_text(bad), "")
 
     def test_keep_real_argument_sentence(self) -> None:
@@ -34,4 +41,3 @@ class TestQwenSummaryFilter(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

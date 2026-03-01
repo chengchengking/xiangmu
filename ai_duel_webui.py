@@ -4501,7 +4501,6 @@ def _looks_unfinished_public_reply(text: str) -> bool:
             t,
             re.I,
         )
-        and not re.search(r"(我|你|他|她|我们|建议|同意|反对|认为|可以|应该|因为|所以)", t)
     ):
         return True
     if (
@@ -4514,7 +4513,6 @@ def _looks_unfinished_public_reply(text: str) -> bool:
             t,
             re.I,
         )
-        and not re.search(r"(我|你|他|她|我们|建议|同意|反对|认为|可以|应该|因为|所以)", t)
     ):
         return True
     if (
@@ -4523,6 +4521,29 @@ def _looks_unfinished_public_reply(text: str) -> bool:
         and re.search(
             r"^\s*(?:针对|围绕|关于)?(?:当前|本轮|该|本次)?(?:群聊)?(?:话题|议题|问题).{0,28}"
             r"(?:(?:我将|我会|将会).{0,24})?(?:提出|给出|补充|输出).{0,24}(?:意见|建议|看法|评审意见|优化策略|方案)"
+            r"[。.!！~～]?\s*$",
+            t,
+            re.I,
+        )
+    ):
+        return True
+    if (
+        "\n" not in t
+        and len(_line_dedupe_key(t)) <= 60
+        and re.search(
+            r"^\s*(?:确认|已确认|再次确认|当前确认).{0,24}(?:焦点|话题|议题|主题).{0,32}(?:问题|异常|修复|讨论|方向)?"
+            r"[。.!！~～]?\s*$",
+            t,
+            re.I,
+        )
+    ):
+        return True
+    if (
+        "\n" not in t
+        and len(_line_dedupe_key(t)) <= 64
+        and re.search(
+            r"^\s*(?:查阅|阅读|浏览|审阅|分析|评估).{0,24}(?:仓库|项目|代码|文档).{0,24}"
+            r"(?:明确|识别|定位|梳理|发现).{0,24}(?:问题|风险|建议|方向)"
             r"[。.!！~～]?\s*$",
             t,
             re.I,
@@ -4578,6 +4599,10 @@ def _looks_unfinished_public_reply(text: str) -> bool:
     if any(h in t for h in ("不要复述提示词", "不要复述题目", "实质内容", "附一个追问", "直接发你在群里的这条回复")):
         return True
     if t.endswith(("...", "…")) and klen < 64:
+        return True
+    if re.search(r"[，,、；;：:\-—]\s*$", t):
+        return True
+    if re.search(r"(?:且|并|并且|并且可|并可|以及|同时|然后|再|并在|并将|并把|并通过|否则|因此|所以|但是|但)\s*$", t):
         return True
     if re.search(r"[A-Za-z]$", t) and klen < 120:
         return True

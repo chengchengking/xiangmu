@@ -1362,8 +1362,19 @@ class QwenAdapter(GenericWebChatAdapter):
         ".qwen-chat-status-card-title",
         ".qwen-chat-status-card-title-animate",
         ".chat-response-message-right",
+        ".chat-response-message-reasoning",
+        ".chat-response-message-thinking",
         "[class*='status-card' i]",
         "[class*='status-title' i]",
+        "[class*='reasoning' i]",
+        "[class*='thinking' i]",
+        "[class*='thought' i]",
+        "[class*='outline' i]",
+        "[class*='summary' i]",
+        "[class*='process' i]",
+        "[class*='mind' i]",
+        "[aria-label*='思考' i]",
+        "[aria-label*='thinking' i]",
         ".qwen-chat-status-card-answer-now",
         "button",
         "[role='button']",
@@ -1479,6 +1490,17 @@ class QwenAdapter(GenericWebChatAdapter):
         r"[。.!！~～]?\s*$",
         re.I,
     )
+    _QWEN_FOCUS_CONFIRM_PAT = re.compile(
+        r"^\s*(?:确认|已确认|再次确认|当前确认).{0,24}(?:焦点|话题|议题|主题).{0,32}(?:问题|异常|修复|讨论|方向)?"
+        r"[。.!！~～]?\s*$",
+        re.I,
+    )
+    _QWEN_REPO_ACTION_PAT = re.compile(
+        r"^\s*(?:查阅|阅读|浏览|审阅|分析|评估).{0,24}(?:仓库|项目|代码|文档).{0,24}"
+        r"(?:明确|识别|定位|梳理|发现).{0,24}(?:问题|风险|建议|方向)"
+        r"[。.!！~～]?\s*$",
+        re.I,
+    )
 
     def __init__(self, meta: ModelMeta) -> None:
         super().__init__(meta)
@@ -1495,17 +1517,19 @@ class QwenAdapter(GenericWebChatAdapter):
             "\n" not in t
             and len(self._line_dedupe_key(t)) <= 52
             and self._QWEN_SUMMARY_TITLE_PAT.match(t)
-            and not re.search(r"(我|你|他|她|我们|建议|同意|反对|认为|可以|应该|因为|所以)", t)
         ):
             return True
         if (
             "\n" not in t
             and len(self._line_dedupe_key(t)) <= 52
             and self._QWEN_ROUTING_TITLE_PAT.match(t)
-            and not re.search(r"(我|你|他|她|我们|建议|同意|反对|认为|可以|应该|因为|所以)", t)
         ):
             return True
         if "\n" not in t and len(self._line_dedupe_key(t)) <= 60 and self._QWEN_VAGUE_STANCE_PAT.match(t):
+            return True
+        if "\n" not in t and len(self._line_dedupe_key(t)) <= 60 and self._QWEN_FOCUS_CONFIRM_PAT.match(t):
+            return True
+        if "\n" not in t and len(self._line_dedupe_key(t)) <= 64 and self._QWEN_REPO_ACTION_PAT.match(t):
             return True
         if (
             "\n" not in t
@@ -2109,6 +2133,10 @@ class QwenAdapter(GenericWebChatAdapter):
                 return True
             if self._is_process_title_line(t):
                 return True
+            if re.search(r"[，,、；;：:\-—]\s*$", t):
+                return True
+            if re.search(r"(?:且|并|并且|并且可|并可|以及|同时|然后|再|并在|并将|并把|并通过|否则|因此|所以|但是|但)\s*$", t):
+                return True
             return False
 
         def _looks_partial(reply: str) -> bool:
@@ -2119,6 +2147,10 @@ class QwenAdapter(GenericWebChatAdapter):
                 return False
             if t.endswith(("。", "！", "？", "!", "?", "…", "）", ")", "】", "]", '"', "'")):
                 return False
+            if re.search(r"(?:且|并|并且|并且可|并可|以及|同时|然后|再|并在|并将|并把|并通过|否则|因此|所以|但是|但)\s*$", t):
+                return True
+            if re.search(r"[，,、；;：:\-—]\s*$", t):
+                return True
             lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
             if len(lines) >= 2 and any(ln.endswith(("。", "！", "？", "!", "?", "…")) for ln in lines[-2:]):
                 return False
@@ -2174,7 +2206,10 @@ class QwenAdapter(GenericWebChatAdapter):
 
                 # Fallback against false-positive generating state.
                 if best and len(best) >= 24 and time.time() - best_at >= force_return_after:
-                    return _commit(best)
+                    if _looks_incomplete(best) or _looks_partial(best):
+                        pass
+                    else:
+                        return _commit(best)
 
             # Fallback: selector may miss transiently on some Qwen UI versions.
             if before_main:

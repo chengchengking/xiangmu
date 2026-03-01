@@ -7,7 +7,7 @@ from ai_duel_webui import _looks_unfinished_public_reply
 
 class QwenUnfinishedGuardTest(unittest.TestCase):
     def test_rejects_summary_title_like_sentence(self) -> None:
-        txt = "构建基于动态反馈的解析校验闭环"
+        txt = "构建基于动态反馈的解析校验闭环。"
         self.assertTrue(_looks_unfinished_public_reply(txt))
 
     def test_rejects_short_mechanism_problem_title(self) -> None:
@@ -26,8 +26,20 @@ class QwenUnfinishedGuardTest(unittest.TestCase):
         txt = "你能给我提供哪些方面的帮助？"
         self.assertTrue(_looks_unfinished_public_reply(txt))
 
+    def test_rejects_focus_confirmation_line(self) -> None:
+        txt = "确认当前讨论焦点为Qwen标题提取的异常问题。"
+        self.assertTrue(_looks_unfinished_public_reply(txt))
+
+    def test_rejects_repo_action_line(self) -> None:
+        txt = "查阅项目仓库以明确产品定位与潜在问题。"
+        self.assertTrue(_looks_unfinished_public_reply(txt))
+
+    def test_rejects_trailing_conjunction_fragment(self) -> None:
+        txt = "在extractor入口加MutationObserver监听目标区域，连续200ms无子节点变化再执行抽取，超时1s强制fallback，零侵入核心逻辑且"
+        self.assertTrue(_looks_unfinished_public_reply(txt))
+
     def test_keeps_real_argument(self) -> None:
-        txt = "我建议引入消息去重与幂等校验，并把失败包隔离到 shadow，先止血再重试。"
+        txt = "我建议引入消息去重与幂等校验，并把失败包隔离到shadow，先止血再重试。"
         self.assertFalse(_looks_unfinished_public_reply(txt))
 
 
